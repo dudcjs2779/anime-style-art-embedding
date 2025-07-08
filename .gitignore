@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+mytest
+train_sample
+test_sample
+datasets
+logs
+command.txt
+.gitignore
