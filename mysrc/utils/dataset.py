@@ -215,7 +215,7 @@ def make_mse_dataset(args, autodtype, device, set_df=False):
 
     return train_loader, valid_loader
 
-def make_mse_dataset02(args, autodtype, device, set_df=False):
+def make_mse_dataset02(args, device, set_df=False):
     df = pd.read_parquet(args.train)
 
     args.min_mos = args.mos_range[0]
@@ -234,7 +234,7 @@ def make_mse_dataset02(args, autodtype, device, set_df=False):
         bin_weights = 1.0 / (bin_counts)
         bin_weights = bin_weights ** args.cw_alpha
         bin_weights = bin_weights / bin_weights.mean()
-        args.count_weights = bin_weights.to(dtype=autodtype, device=device)
+        args.count_weights = bin_weights.to(device=device)
 
         print("## Count Weights")
         print("Bin counts:", bin_counts)
@@ -264,18 +264,16 @@ def make_mse_dataset02(args, autodtype, device, set_df=False):
     valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
 
     # train_df[args.target_key].tolist() 이 코드가 여러개의 np.array로 이루어진 list인데 이걸 먼저 np로 합쳐준뒤 tensor로 변환해야 빠른 변환이 가능하다고 함. 수정필요. 
-    train_labels = torch.tensor(train_df[args.target_key].tolist(), dtype=autodtype)
+    train_labels = torch.tensor(train_df[args.target_key].tolist(), dtype=torch.float32)
     train_labels = (train_labels - args.min_mos) / (args.max_mos - args.min_mos)
-    train_labels = train_labels.to(dtype=autodtype)
 
     train_dataset = MSEDataset(train_df[args.image_key].tolist(), train_labels, transforms, train_df if set_df else None)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
-    valid_labels = torch.tensor(valid_df[args.target_key].tolist(), dtype=autodtype)
+    valid_labels = torch.tensor(valid_df[args.target_key].tolist(), dtype=torch.float32)
     valid_labels = (valid_labels - args.min_mos) / (args.max_mos - args.min_mos)
-    valid_labels = valid_labels.to(dtype=autodtype)
     
     valid_dataset = MSEDataset(valid_df[args.image_key].tolist(), valid_labels, valid_trans, valid_df if set_df else None)
     valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)

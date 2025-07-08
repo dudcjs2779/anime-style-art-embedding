@@ -10,10 +10,16 @@ def setup_parser():
         default=None,
         help="Name of the vision backbone to use.",
     )
+    # parser.add_argument(
+    #     "--precision",
+    #     choices= ["amp", "amp_bf16", "amp_bfloat16", "bf16", "fp16", "pure_bf16", "pure_fp16", "fp32"],
+    #     default='amp',
+    #     help="Floating point precision."
+    # )
     parser.add_argument(
         "--precision",
-        choices= ["amp", "amp_bf16", "amp_bfloat16", "bf16", "fp16", "pure_bf16", "pure_fp16", "fp32"],
-        default='amp',
+        choices= ["fp16", "bf16"],
+        default=None,
         help="Floating point precision."
     )
     parser.add_argument(

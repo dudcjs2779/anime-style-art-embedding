@@ -97,9 +97,9 @@ def calc_range_accn(preds, labels, split_times, acc_range=0.05):
     return bins_dict
 
 
-def train_one_epoch(model, device, dataloader, mse_loss, nin_loss, epoch, optimizer, scaler, scheduler, args):
-    autocast = get_autocast(args.precision)
-    input_dtype = get_input_dtype(args.precision)
+def train_one_epoch(model, device, dataloader, accelerator, mse_loss, nin_loss, epoch, optimizer, scheduler, args):
+    # autocast = get_autocast(args.precision)
+    # input_dtype = get_input_dtype(args.precision)
 
     model.train()
     num_batches_per_epoch = len(dataloader)
@@ -119,14 +119,13 @@ def train_one_epoch(model, device, dataloader, mse_loss, nin_loss, epoch, optimi
             scheduler(step)
 
         images, labels = batch
-        images = images.to(device, dtype=input_dtype, non_blocking=True)
+        images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-
         data_time_m.update(time.time() - end)
-        optimizer.zero_grad()
 
-        with autocast():
+        # with autocast():
+        with accelerator.accumulate(model):
             outputs = model(images)
 
             if args.count_weight:
@@ -139,29 +138,32 @@ def train_one_epoch(model, device, dataloader, mse_loss, nin_loss, epoch, optimi
                 # mse_los = mse_cl_weight * mse_loss(outputs, labels)
                 mse_los = mse_loss(outputs, labels)
 
-        # nin_los = nin_loss(outputs, labels)
-        total_loss = mse_los.mean()
-        # total_loss = nin_los
-        # total_loss = args.mse_weight * mse_los.mean() + args.nin_weight * nin_los
+            # nin_los = nin_loss(outputs, labels)
+            total_loss = mse_los.mean()
+            # total_loss = nin_los
+            # total_loss = args.mse_weight * mse_los.mean() + args.nin_weight * nin_los
 
 
-        # if i == 0:
-        #     for j in range(5):
-        #         save_path = f"./train_sample/train_{j}.png"
-        #         tensor_to_pil_image(images[j].to('cpu')).save(save_path)
-        #         print(save_path)
-        #         print(f"output({j}): {outputs[j].round(decimals=4)}")
-        #         print(f"labels({j}): {labels[j].round(decimals=4)}")
-        #         print(f"loss({j}): {mse_los[j].round(decimals=4)}")
-        #         print()
+            # if i == 0:
+            #     for j in range(5):
+            #         save_path = f"./train_sample/train_{j}.png"
+            #         tensor_to_pil_image(images[j].to('cpu')).save(save_path)
+            #         print(save_path)
+            #         print(f"output({j}): {outputs[j].round(decimals=4)}")
+            #         print(f"labels({j}): {labels[j].round(decimals=4)}")
+            #         print(f"loss({j}): {mse_los[j].round(decimals=4)}")
+            #         print()
 
-        backward(total_loss, scaler)
+            accelerator.backward(total_loss)
+            # backward(total_loss, scaler)
 
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+            # if accelerator is None and scaler is not None:
+            #     scaler.step(optimizer)
+            #     scaler.update()
+            # else:
             optimizer.step()
+            optimizer.zero_grad()
+
 
         batch_time_m.update(time.time() - end)
 
@@ -199,9 +201,9 @@ def train_one_epoch(model, device, dataloader, mse_loss, nin_loss, epoch, optimi
         pbar.update(1)
     pbar.close()
 
-def evaluate(model, device, valid_loader, mse_loss, nin_loss, epoch, step, args):
-    autocast = get_autocast(args.precision)
-    input_dtype = get_input_dtype(args.precision)
+def evaluate(model, device, valid_loader, accelerator, mse_loss, nin_loss, epoch, step, args):
+    # autocast = get_autocast(args.precision)
+    # input_dtype = get_input_dtype(args.precision)
 
     model.eval()
     mse_m = AverageMeter()
@@ -214,16 +216,17 @@ def evaluate(model, device, valid_loader, mse_loss, nin_loss, epoch, step, args)
         pbar = tqdm(total=len(valid_loader), desc=f"Validation Current Epoch:{epoch}")
         for i, batch in enumerate(valid_loader):
             images, labels = batch
-            images = images.to(device, dtype=input_dtype, non_blocking=True)
+            images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with autocast():
+            # with autocast():
+            with torch.inference_mode(), accelerator.autocast(): 
                 outputs = model(images)
 
-            mse_los = mse_loss(outputs, labels)
-            # nin_los = nin_loss(outputs, labels)
-            total_loss = mse_los.mean()
-            # total_loss = mse_los.mean() + nin_los
+                mse_los = mse_loss(outputs, labels)
+                # nin_los = nin_loss(outputs, labels)
+                total_loss = mse_los.mean()
+                # total_loss = mse_los.mean() + nin_los
             
             # if i == 0:
             #     for j in range(5):
@@ -291,15 +294,15 @@ def main(args):
     if args.config: shutil.copy(args.config, os.path.join(output_path, os.path.basename(args.config)))
 
     random_seed(args.seed)
-    autodtype = get_cast_dtype(args.precision)
+    # autodtype = get_cast_dtype(args.precision)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     print("## Load Dataset")
-    train_loader, valid_loader = make_mse_dataset02(args, autodtype, device)
+    train_loader, valid_loader = make_mse_dataset02(args, device)
 
     print("## Model Create\n")
     model = timm.create_model(args.model_name, pretrained=True, num_classes=args.num_classes, img_size=(args.image_size), drop_path_rate=args.drop_path)
-    model.to(device=device, dtype=autodtype)
+    model.to(device=device)
 
     if args.pretrain is not None:
         checkpoint = pt_load(args.pretrain, map_location='cpu')
@@ -335,7 +338,7 @@ def main(args):
 
     mse_loss = MSELoss(reduction='none')
     nin_loss = NiNLoss(loss_weight=1.0, p=1, q=2)
-    scaler = GradScaler() if args.precision == "amp" else None
+    # scaler = GradScaler() if args.precision == "amp" else None
 
     total_steps = (train_loader.num_batches) * args.epochs
 
@@ -364,15 +367,15 @@ def main(args):
             model.load_state_dict(checkpoint["state_dict"])
             if optimizer is not None:
                 optimizer.load_state_dict(checkpoint["optimizer"])
-            if scaler is not None and 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
+            # if scaler is not None and 'scaler' in checkpoint:
+            #     scaler.load_state_dict(checkpoint['scaler'])
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
 
 
-    # accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="fp16")
-    # model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    accelerator = Accelerator(gradient_accumulation_steps=args.accum_freq, mixed_precision=args.precision)
+    model, optimizer, train_loader, valid_loader = accelerator.prepare(model, optimizer, train_loader, valid_loader)
 
     print("\n## Config info:")
     for k, v in vars(args).items(): print(f"{k}: {v}")
@@ -390,10 +393,10 @@ def main(args):
     )
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(model, device, train_loader, mse_loss, nin_loss, epoch, optimizer, scaler, scheduler, args)
+        train_one_epoch(model, device, train_loader, accelerator, mse_loss, nin_loss, epoch, optimizer, scheduler, args)
         completed_epoch = epoch + 1
         # args.step = 1
-        evaluate(model, device, valid_loader, mse_loss, nin_loss, completed_epoch, args.step, args)
+        evaluate(model, device, valid_loader, accelerator, mse_loss, nin_loss, completed_epoch, args.step, args)
 
         checkpoint_dict = {
             "epoch": completed_epoch,
@@ -406,8 +409,8 @@ def main(args):
             'random_state': random.getstate()
         }
 
-        if scaler is not None:
-            checkpoint_dict["scaler"] = scaler.state_dict()
+        # if scaler is not None:
+        #     checkpoint_dict["scaler"] = scaler.state_dict()
 
         if completed_epoch == args.epochs or (
             args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
