@@ -371,8 +371,8 @@ def main(args):
             model.load_state_dict(checkpoint)
 
 
-    # accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="fp16")
-    # model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="fp16")
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
     print("\n## Config info:")
     for k, v in vars(args).items(): print(f"{k}: {v}")
