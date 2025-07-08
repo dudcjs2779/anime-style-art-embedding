@@ -1,0 +1,63 @@
+[model]
+model_name = "002_CFANet_Res50_koniq"
+precision = 'fp16'  # amp
+# resume = 'logs/25-02-12_00-17-45_eva02_base_patch14_448/checkpoint/epoch_13.pt'
+save_frequency = 1
+# max_save_count = 10
+
+[network]
+type = 'CFANet'
+use_ref = false
+pretrained = true
+num_crop = 1 
+num_attn_layers = 1
+crop_size = 448
+semantic_model_name = "resnet50"
+block_pool = 'weighted_avg'
+
+[train]
+seed = 42
+epochs = 30
+batch_size = 24
+# accum_freq = 4
+# drop_path = 0.1
+mse_cl_weight = 0.0
+mse_weight = 1.0
+nin_weight = 1.0
+
+[validation]
+valid = true
+valid_batch_size = 32
+valid_size = 0.3
+
+[logger]
+report_to = 'wandb'    # tensorboard, wandb
+wandb_project_name = 'quality'  # nkoma-greyscale
+# run_id = 'wi2vd2ce'
+
+[optimizer]
+lr = 1e-5
+warmup = 300
+wd = 1e-5
+beta1 = 0.9
+beta2 = 0.999
+esp = 1e-6
+lr_decay = 1.0  # 0.7, 0.8
+
+[data]
+train = 'datasets/quality04_processed02/train_mse_quality_mid06.parquet'
+image_key = 'image'
+target_key = 'mse_label'
+label_json = ''
+workers = 0
+mos_range = [0, 100]    # [0, 100]  [25, 75]
+balanced_sample = false   
+
+[dataset]
+image_size = [448, 448]
+patch_size = 8
+train_aug = "train_preset01"
+valid_aug = "long_max_pad_valid"
+
+[debug]
+debug = false

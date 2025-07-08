@@ -1,0 +1,56 @@
+[model]
+name = "MANIQA"
+precision = 'fp16'  # amp
+# resume = 'logs/25-02-12_00-17-45_eva02_base_patch14_448/checkpoint/epoch_13.pt'
+save_frequency = 1
+# max_save_count = 10
+
+[network]
+type = 'MANIQA'
+pretrained = true
+train_dataset = 'koniq'
+scale = 0.8
+
+[train]
+seed = 42
+epochs = 30
+batch_size = 16
+# accum_freq = 4
+# drop_path = 0.1
+mse_weight = 0.0
+nin_weight = 0.0
+
+[validation]
+valid = true
+valid_batch_size = 24
+valid_size = 0.3
+
+[logger]
+report_to = 'wandb'    # tensorboard, wandb
+wandb_project_name = 'quality'  # nkoma-greyscale
+# run_id = 'wi2vd2ce'
+
+[optimizer]
+lr = 1e-5
+warmup = 200
+wd = 1e-5
+beta1 = 0.9
+beta2 = 0.999
+esp = 1e-6
+lr_decay = 1.0  # 0.7, 0.8
+
+[data]
+train = 'datasets/quality04_short_always_224/train_mse.parquet'
+image_key = 'image'
+target_key = 'mse_label'
+label_json = ''
+workers = 0
+
+[dataset]
+image_size = [224, 224]
+patch_size = 14
+train_aug = "rancrop_rot"
+valid_aug = "simple_center_crop"
+
+[debug]
+debug = false
