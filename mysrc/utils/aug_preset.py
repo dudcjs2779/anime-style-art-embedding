@@ -2,7 +2,21 @@ import random
 import cv2
 import albumentations as A
 import numpy as np
+import math
+from typing import Any, Annotated
+from pydantic import AfterValidator
 from albumentations.pytorch import ToTensorV2
+from albumentations.augmentations.geometric import functional as fgeometric
+from albumentations.augmentations.crops import functional as fcrops
+from albumentations.core.pydantic import BorderModeType
+from albumentations.core.type_definitions import ColorType
+from albumentations.core.transforms_interface import BaseTransformInitSchema
+from albumentations.core.pydantic import (
+    BorderModeType,
+    InterpolationType,
+    check_range_bounds,
+    nondecreasing,
+)
 
 preset_list =["simple_center_crop", "art_style_aug1"]
 
@@ -21,6 +35,167 @@ class MyXYMasking(A.XYMasking):
         self.fill = (val, val, val)
         return super().apply(img, fill_value=self.fill, **params)
     
+
+class AutoPad(A.PadIfNeeded):
+    def get_params_dependent_on_data(
+        self,
+        params: dict[str, Any],
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        long_side = max(params["shape"][:2])
+        h_pad_top, h_pad_bottom, w_pad_left, w_pad_right = fgeometric.get_padding_params(
+            image_shape=params["shape"][:2],
+            min_height=long_side,
+            min_width=long_side,
+            pad_height_divisor=self.pad_height_divisor,
+            pad_width_divisor=self.pad_width_divisor,
+        )
+
+        h_pad_top, h_pad_bottom, w_pad_left, w_pad_right = fgeometric.adjust_padding_by_position(
+            h_top=h_pad_top,
+            h_bottom=h_pad_bottom,
+            w_left=w_pad_left,
+            w_right=w_pad_right,
+            position=self.position,
+            py_random=self.py_random,
+        )
+
+        return {
+            "pad_top": h_pad_top,
+            "pad_bottom": h_pad_bottom,
+            "pad_left": w_pad_left,
+            "pad_right": w_pad_right,
+        }
+    
+class RandomResizedCropWithPad(A.RandomResizedCrop):
+    class InitSchema(BaseTransformInitSchema):  # 스키마가 없으니까 padding이 빨간색으로 표시되는 버그가 발생함.
+        scale: Annotated[tuple[float, float], AfterValidator(check_range_bounds(0, 1)), AfterValidator(nondecreasing)]
+        ratio: Annotated[
+            tuple[float, float],
+            AfterValidator(check_range_bounds(0, None)),
+            AfterValidator(nondecreasing),
+        ]
+        size: Annotated[tuple[int, int], AfterValidator(check_range_bounds(1, None))]
+        interpolation: InterpolationType
+        mask_interpolation: InterpolationType
+        fill: ColorType
+        fill_mask: ColorType
+        border_mode: BorderModeType
+
+    def __init__(
+        self,
+        size: tuple[int, int],
+        scale: tuple[float, float] = (0.08, 1.0),
+        ratio: tuple[float, float] = (0.75, 1.3333333333333333),
+        interpolation: int = cv2.INTER_LINEAR,
+        mask_interpolation: int = cv2.INTER_NEAREST,
+        fill: ColorType = 0,
+        fill_mask: ColorType = 0,
+        border_mode: BorderModeType = cv2.BORDER_CONSTANT,
+        p: float = 1.0,
+    ):
+        super().__init__(
+            size=size,
+            interpolation=interpolation,
+            mask_interpolation=mask_interpolation,
+            p=p,
+        )
+        self.scale = scale
+        self.ratio = ratio
+        self.fill = fill
+        self.fill_mask = fill_mask
+        self.border_mode = border_mode
+
+    def get_params_dependent_on_data(
+        self,
+        params: dict[str, Any],
+        data: dict[str, Any],
+    ) -> dict[str, tuple[int, int, int, int]]:
+        image_shape = params["shape"][:2]
+        image_height, image_width = image_shape
+
+        area = image_height * image_width
+
+        for _ in range(5):
+            scale = self.py_random.uniform(*self.scale)
+            target_area = scale * area
+            log_ratio = (math.log(self.ratio[0]), math.log(self.ratio[1]))
+            aspect_ratio = math.exp(self.py_random.uniform(*log_ratio))
+
+            width = int(round(math.sqrt(target_area * aspect_ratio)))
+            height = int(round(math.sqrt(target_area / aspect_ratio)))
+
+            left_right_pad = 0
+            top_bottom_pad = 0
+            pad_image_width = image_width
+            pad_image_height = image_height
+
+            if image_width < width:
+                width_diff = width - image_width
+                left_right_pad = (width_diff + 1) // 2
+                pad_image_width = image_width + left_right_pad * 2
+
+            if image_height < height:
+                height_diff = height - image_height
+                top_bottom_pad = (height_diff + 1) // 2
+                pad_image_height = image_height + top_bottom_pad * 2 
+
+            pad_image_shape = (pad_image_height, pad_image_width)
+
+            if 0 < width <= pad_image_width and 0 < height <= pad_image_height:
+                i = self.py_random.randint(0, pad_image_height - height)
+                j = self.py_random.randint(0, pad_image_width - width)
+
+                h_start = i * 1.0 / (pad_image_height - height + 1e-10)
+                w_start = j * 1.0 / (pad_image_width - width + 1e-10)
+
+                crop_shape = (height, width)
+
+                crop_coords = fcrops.get_crop_coords(pad_image_shape, crop_shape, h_start, w_start)
+
+                return {"crop_coords": crop_coords, 'pad_top': top_bottom_pad, 'pad_bottom': top_bottom_pad, 'pad_left': left_right_pad, 'pad_right': left_right_pad}
+
+        # Fallback to central crop
+        in_ratio = image_width / image_height
+        if in_ratio < min(self.ratio):
+            width = image_width
+            height = int(round(image_width / min(self.ratio)))
+        elif in_ratio > max(self.ratio):
+            height = image_height
+            width = int(round(height * max(self.ratio)))
+        else:  # whole image
+            width = image_width
+            height = image_height
+
+        i = (image_height - height) // 2
+        j = (image_width - width) // 2
+
+        h_start = i * 1.0 / (image_height - height + 1e-10)
+        w_start = j * 1.0 / (image_width - width + 1e-10)
+
+        crop_shape = (height, width)
+
+        crop_coords = fcrops.get_crop_coords(image_shape, crop_shape, h_start, w_start)
+
+        print("skiped")
+        return {"crop_coords": crop_coords, 'pad_top': top_bottom_pad, 'pad_bottom': top_bottom_pad, 'pad_left': left_right_pad, 'pad_right': left_right_pad}
+    
+    def apply(
+        self,
+        img: np.ndarray,
+        crop_coords: tuple[int, int, int, int],
+        pad_top: int,
+        pad_bottom: int,
+        pad_left: int,
+        pad_right: int,
+        **params: Any,
+    ) -> np.ndarray:
+        img = fgeometric.pad_with_params(img, pad_top, pad_bottom, pad_left, pad_right, border_mode=self.border_mode, value=self.fill)
+        crop = fcrops.crop(img, *crop_coords)
+        resize = fgeometric.resize(crop, self.size, self.interpolation)
+        return resize
+
+
 def list_preset():
     return preset_list
 
@@ -725,7 +900,6 @@ def get_preset(preset_name, image_size=[448, 448]):
                             p=0.5),
                     ], p=0.3),
 
-
                     A.Posterize(
                         num_bits=[4, 7],
                         p=0.3),
@@ -807,7 +981,7 @@ def get_preset(preset_name, image_size=[448, 448]):
                         p=0.4,
                     ),
 
-                    A.ToGray(p=0.25),
+                    A.ToGray(p=0.2),
                 ], p=0.5),
             ], p=0.8),
 
@@ -942,14 +1116,48 @@ def get_preset(preset_name, image_size=[448, 448]):
             ToTensorV2(),
         ], p=1.0)
 
-    
-
-
 
 
     elif preset_name == "rancrop":
         transforms = A.Compose([
             A.RandomCrop(h, w, border_mode=cv2.BORDER_CONSTANT, p=1.0),
+            A.Normalize(mean=mean, std=std, max_pixel_value=255),
+            ToTensorV2(),
+        ], p=1.0)
+
+    elif preset_name == "pretrain_base":
+        transforms = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.1),
+
+            A.OneOf([
+                RandomResizedCropWithPad(
+                    size=[h, w],
+                    scale=[0.05, 1.0],
+                    ratio=[0.75, 1.3333333333333333],
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=255,
+                    p=0.6),
+
+                A.Compose([
+                    AutoPad(border_mode=cv2.BORDER_CONSTANT, fill=255),
+                    A.RandomResizedCrop(
+                        size=[h, w],
+                        scale=[0.33, 1.0],
+                        ratio=[0.75, 1.3333333333333333],
+                        interpolation=cv2.INTER_CUBIC,
+                        p=1.0),
+                ], p=0.4),
+            ], p=1.0),
+
+             A.OneOf([
+                A.RandomRotate90(p=0.3),
+                A.Rotate(limit=(-180, 180), p=0.7, border_mode=cv2.BORDER_CONSTANT, fill=[255, 255, 255]),
+            ], p=0.7),
+           
+            A.ToGray(p=0.1),
+
             A.Normalize(mean=mean, std=std, max_pixel_value=255),
             ToTensorV2(),
         ], p=1.0)

@@ -228,6 +228,12 @@ def setup_parser():
         help="Type of leanring rate scheduler."
     )
     parser.add_argument(
+        "--min_lr",
+        type=float,
+        default='1e-8',
+        help="minimum learning rate for scheduler. If not set, it is set to 1e-8."
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=200,

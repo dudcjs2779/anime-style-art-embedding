@@ -85,3 +85,15 @@ def read_config_ipynb(parser, config_path):
             setattr(args, key, value)
     
     return args
+
+
+def print_nested_dict(d, indent=0):
+    """
+    dict 계층구조를 탐색하며 구조를 출력하는 코드
+    """
+    for key, value in d.items():
+        if isinstance(value, dict):
+            print("    " * indent + f"- {key}")
+            print_nested_dict(value, indent + 1)
+        else:
+            print("    " * indent + f"- {key}: {value}")

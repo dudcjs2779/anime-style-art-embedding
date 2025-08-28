@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +10,7 @@ import timm
 from timm.models.vision_transformer import Block
 import random
 from tqdm import tqdm
+
 
 from mysrc.utils.pos_embed import get_2d_sincos_pos_embed
 
@@ -221,8 +224,9 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 # ViT backbone
-vit = timm.create_model('vit_base_patch16_224', pretrained=False)
-mae = MAE(vit, norm_pix_loss=False).to(device)
+eva = timm.create_model('eva02_base_patch14_224', pretrained=False)
+# mae = MAE(vit, norm_pix_loss=True).to(device)
+mae = MAE(eva, norm_pix_loss=True).to('cpu')
 
 # Data
 transform = transforms.Compose([
@@ -236,6 +240,22 @@ dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=4)
 optimizer = torch.optim.AdamW(mae.parameters(), lr=5e-4, weight_decay=0.05)
 
 # Train
-for epoch in range(10):
+for epoch in range(1):
     loss = train_one_epoch(epoch, mae, dataloader, optimizer, device)
     print(f"Epoch {epoch}, Loss: {loss:.4f}")
+
+checkpoint_dict = {
+    "epoch": epoch+1,
+    "name": "vit_base_patch16_224",
+    "state_dict": mae.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    'torch_rng_state': torch.random.get_rng_state(),
+    'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+    'numpy_rng_state': np.random.get_state(),
+    'random_state': random.getstate()
+}
+
+torch.save(
+    checkpoint_dict,
+    os.path.join("TestOutput/", f"epoch_{epoch}.pt"),
+)

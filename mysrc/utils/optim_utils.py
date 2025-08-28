@@ -53,3 +53,59 @@ def make_lwld_params_group(model, base_lr, decay, weight_decay):
     param_groups = bind_group(all_params, base_lr, weight_decay)
 
     return param_groups
+
+
+def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, block_depth=12):
+    depthness = block_depth + 1
+    if (
+        "pos_embed" in name
+        or "patch_embed" in name
+        or "mask_token" in name
+        or "cls_token" in name
+        or "reg_token" in name
+    ):
+        depthness = 0
+    elif "blocks." in name and "residual." not in name:
+        depthness = int(name[name.find("blocks.") :].split(".")[1]) + 1
+
+    return lr_decay_rate ** (block_depth + 1 - depthness)
+
+def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier")):
+    fused_params_groups = defaultdict(lambda: {"params": []})
+    for d in all_params_groups:
+        identifier = ""
+        for k in keys:
+            identifier += k + str(d[k]) + "_"
+
+        for k in keys:
+            fused_params_groups[identifier][k] = d[k]
+        fused_params_groups[identifier]["params"].append(d["params"])
+
+    return fused_params_groups.values()
+
+
+def make_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
+    param_groups = []
+    block_depth = len(model.visual.blocks)
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        decay_rate = get_vit_lr_decay_rate(name, lr_decay_rate, block_depth)
+
+        d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
+
+        if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+            d.update({"wd_multiplier": 0.0})
+
+        if "patch_embed" in name:
+            d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+        
+        param_groups.append(d)
+
+    param_groups = fuse_params_groups(param_groups)
+    for g in param_groups:
+        g["foreach"] = True
+
+    return list(param_groups)

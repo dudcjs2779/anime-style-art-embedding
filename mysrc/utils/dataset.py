@@ -56,6 +56,25 @@ def balanced_sampleing(df, target_key):
 
     return df_balanced
 
+def make_pretrain_dataset(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
+    
+    train_dataset = PretrainDataset(train_df.image.tolist(), train_df.target.tolist(), transforms)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
+    train_loader.num_samples = len(train_dataset)
+    train_loader.num_batches = len(train_loader)
+
+    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_df.target.tolist(), transforms, valid_trans)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_loader.num_samples = len(valid_dataset)
+    valid_loader.num_batches = len(valid_loader)
+
+    return train_loader, valid_loader
 
 
 def make_dataset(args):
@@ -70,8 +89,8 @@ def make_dataset(args):
 
     args.num_classes = df['target'].nunique()
 
-    transforms = get_preset("art_style_aug1")
-    valid_trans = get_preset("simple_center_crop")
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
     
     train_dataset = TrainDataset(train_df.image.tolist(), train_df.target.tolist(), transforms)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
@@ -525,7 +544,6 @@ class MSEDataset(Dataset):
 
         return Image.fromarray(image)
     
-    
 class MLMSEDataset(Dataset):
     def __init__(self, images, labels, mse_labels, transforms, df=None):
         self.df = df
@@ -560,12 +578,65 @@ class MLMSEDataset(Dataset):
 
         return image
     
+class PretrainDataset(Dataset):
+    def __init__(self, images, labels, transforms, df=None):
+        self.df = df
+        self.images = images
+        self.labels = labels
+        self.transforms = transforms
+        self.test_transforms = exclude_norm_totensor(transforms)
+
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image1 = self.transforms(image=image)['image']
+        image2 = self.transforms(image=image)['image']
+
+        label = self.labels[idx]
+
+        return image1, image2, label
+    
+    def get_pil(self, idx, pixels=None):
+        image =Image.open(self.images[idx])
+        if pixels:
+            width, height = image.size
+
+            aspect_ratio = width / height
+            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
+            resize_w = math.ceil(resize_h * aspect_ratio)
+
+            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
+
+        return image
+    
     def get_trnasformed(self, idx):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = self.test_transforms(image=image)['image']
 
         return Image.fromarray(image)
+    
+class PretrainValidDataset(PretrainDataset):
+    def __init__(self, images, labels, transforms, valid_transforms, df=None):
+        super().__init__(images, labels, transforms, df)
+        self.valid_transforms = valid_transforms
+
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image1 = self.transforms(image=image)['image']
+        image2 = self.transforms(image=image)['image']
+        image3 = self.valid_transforms(image=image)['image']
+
+        label = self.labels[idx]
+
+        return image1, image2, image3, label
+    
     
 class InferDataset(Dataset):
     def __init__(self, images, transforms, df=None):
@@ -603,3 +674,4 @@ class InferDataset(Dataset):
         image = self.test_transforms(image=image)['image']
 
         return Image.fromarray(image)
+    

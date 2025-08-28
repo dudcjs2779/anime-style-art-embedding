@@ -119,6 +119,8 @@ def train_one_epoch(model, device, dataloader, accelerator, mse_loss, nin_loss, 
             scheduler(step)
 
         images, labels = batch
+        # images = images.to(device, non_blocking=True, dtype= torch.float16)
+        # labels = labels.to(device, non_blocking=True, dtype= torch.float16)
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -126,6 +128,7 @@ def train_one_epoch(model, device, dataloader, accelerator, mse_loss, nin_loss, 
 
         # with autocast():
         with accelerator.accumulate(model):
+            # breakpoint()
             outputs = model(images)
 
             if args.count_weight:
@@ -303,6 +306,7 @@ def main(args):
     print("## Model Create\n")
     model = timm.create_model(args.model_name, pretrained=True, num_classes=args.num_classes, img_size=(args.image_size), drop_path_rate=args.drop_path)
     model.to(device=device)
+    # breakpoint()
 
     if args.pretrain is not None:
         checkpoint = pt_load(args.pretrain, map_location='cpu')
@@ -335,7 +339,7 @@ def main(args):
         optimizer = Prodigy(params_group, lr=1., weight_decay=args.wd, slice_p=11)
 
     print(f"## Selected Opimizer: {args.opt_name}\n")
-
+    
     mse_loss = MSELoss(reduction='none')
     nin_loss = NiNLoss(loss_weight=1.0, p=1, q=2)
     # scaler = GradScaler() if args.precision == "amp" else None
@@ -349,12 +353,12 @@ def main(args):
     else:
         if args.sch_name == "cos":
             warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
-            scheduler = GroupCosineLR(optimizer, args.lr, warmup_steps, total_steps)
+            scheduler = GroupCosineLR(optimizer, args.lr, args.min_lr, warmup_steps, total_steps)
             print(f"## Using GroupCosineLR \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
         elif args.sch_name == "cos_restart":
             cycle_step =  total_steps // args.cycles
             warmup_steps = int(total_steps // args.cycles * args.warmup_ratio) if args.warmup_ratio is not None else args.warmup
-            scheduler = CosineAnnealingWarmUpRestarts(optimizer, cycle_step=cycle_step, cy_mult=args.cycle_multiplier, lr_max=args.lr, lr_min=args.esp,  warmup=warmup_steps, gamma=args.re_g)
+            scheduler = CosineAnnealingWarmUpRestarts(optimizer, cycle_step=cycle_step, cy_mult=args.cycle_multiplier, lr_max=args.lr, lr_min=args.min_lr,  warmup=warmup_steps, gamma=args.re_g)
             print(f"## Using CosineAnnealingWarmUpRestarts \nwarmup steps: {warmup_steps} \ncycle_steps: {cycle_step} \ntotal steps: {total_steps} \ncycles: {args.cycles} \ncycle_multiplier: {args.cycle_multiplier}, \nre_g: {args.re_g}")
         
     start_epoch = 0
@@ -373,7 +377,7 @@ def main(args):
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
 
-
+    # breakpoint()
     accelerator = Accelerator(gradient_accumulation_steps=args.accum_freq, mixed_precision=args.precision)
     model, optimizer, train_loader, valid_loader = accelerator.prepare(model, optimizer, train_loader, valid_loader)
 
