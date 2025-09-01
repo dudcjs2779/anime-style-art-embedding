@@ -64,17 +64,20 @@ def make_pretrain_dataset(args):
     transforms = get_preset(args.train_aug, image_size=args.image_size)
     valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
     
-    train_dataset = PretrainDataset(train_df.image.tolist(), train_df.target.tolist(), transforms)
+    train_dataset = PretrainDataset(train_df.image.tolist(), train_df.target.tolist(), transforms, times=train_df.years_passed.tolist())
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
-    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_df.target.tolist(), transforms, valid_trans)
+    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_df.target.tolist(), transforms, valid_trans, times=train_df.years_passed.tolist())
     valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
     valid_loader.num_samples = len(valid_dataset)
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
+
+def collate_pretrain(samples_list, mask_ratio_tuple, mask_probability, dtype, n_tokens=None, mask_generator=None):
+    pass
 
 
 def make_dataset(args):
@@ -579,10 +582,12 @@ class MLMSEDataset(Dataset):
         return image
     
 class PretrainDataset(Dataset):
-    def __init__(self, images, labels, transforms, df=None):
+    def __init__(self, images, labels, transforms, times=None, df=None):
         self.df = df
         self.images = images
         self.labels = labels
+        if times is not None:
+            self.times = times
         self.transforms = transforms
         self.test_transforms = exclude_norm_totensor(transforms)
 
@@ -597,8 +602,9 @@ class PretrainDataset(Dataset):
         image2 = self.transforms(image=image)['image']
 
         label = self.labels[idx]
+        times = self.times[idx]
 
-        return image1, image2, label
+        return image1, image2, label, times
     
     def get_pil(self, idx, pixels=None):
         image =Image.open(self.images[idx])
@@ -621,8 +627,8 @@ class PretrainDataset(Dataset):
         return Image.fromarray(image)
     
 class PretrainValidDataset(PretrainDataset):
-    def __init__(self, images, labels, transforms, valid_transforms, df=None):
-        super().__init__(images, labels, transforms, df)
+    def __init__(self, images, labels, transforms, valid_transforms, times=None, df=None):
+        super().__init__(images, labels, transforms, times, df)
         self.valid_transforms = valid_transforms
 
     def __getitem__(self, idx):
@@ -634,8 +640,9 @@ class PretrainValidDataset(PretrainDataset):
         image3 = self.valid_transforms(image=image)['image']
 
         label = self.labels[idx]
+        times = self.times[idx]
 
-        return image1, image2, image3, label
+        return image1, image2, image3, label, times
     
     
 class InferDataset(Dataset):

@@ -1,14 +1,14 @@
 [model]
 model_name = 'eva02_base_patch14_224.mim_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 precision = 'amp'  # amp, float16
-# resume = 'logs/25-07-28_23-32-50_eva02_base_patch14_448.mim_in22k_ft_in22k_in1k/checkpoint/epoch_16.pt'
+# resume = 'logs/25-09-01_00-35-08_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_12.pt'
 # pretrain = 'logs/25-06-26_13-40-05_eva02_base_patch14_448.mim_in22k_ft_in22k_in1k_hngfx670/checkpoint/epoch_1.pt'
 save_frequency = 1
-# max_save_count = 10
+max_save_count = 10
 
 [model_type]
 embed_dim = 0
-global_pool = 'map'    # avg, map
+global_pool = 'avg'    # avg, map
 
 [distributed]
 horovod = false
@@ -16,16 +16,12 @@ horovod = false
 [train]
 seed = 42
 epochs = 30
-batch_size = 8
-accum_freq = 4
+batch_size = 16
+accum_freq = 8
 # drop_path = 0.1
-mcw_by_score = 0.0
-mse_weight = 1.0
-nin_weight = 0.0
-count_weight = false
-cw_bins = 11
-cw_alpha = 0.3
 # grad_clip_norm = null
+time_range = 10 # n years
+time_weight = 0.3
 
 [loss]
 same_class_weight = 0.9
@@ -57,14 +53,10 @@ warmup_ratio = 0
 loss_dist_impl = 'bidir'
 
 [data]
-train = 'datasets/pretrain_test640/train01_test.parquet'
-valid = 'datasets/pretrain_test640/valid01_test.parquet'
+train = 'datasets/pretrain_test640/train01.parquet'
+valid = 'datasets/pretrain_test640/valid01.parquet'
 image_key = 'image'
-target_key = 'mse_label'
-label_json = ''
-workers = 0
-mos_range = [0, 100]    # [0, 100]  [25, 75]
-balanced_sample = false
+workers = 8
 
 [dataset]
 image_size = [224, 224]
@@ -73,9 +65,9 @@ train_aug = "pretrain_base"
 valid_aug = "long_max_pad_valid"
 
 [logger]
-report_to = 'tensorboard'    # tensorboard, wandb
-wandb_project_name = 'quality'  # nkoma-greyscale
-# run_id = 'a79wd8e1'
+report_to = 'wandb'    # tensorboard, wandb
+wandb_project_name = 'pretrain_quality'  # nkoma-greyscale
+# run_id = '7nooabg2'
 log_every_n_steps = 10
 log_local = false
 

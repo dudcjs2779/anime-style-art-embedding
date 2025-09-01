@@ -81,8 +81,9 @@ def read_config_ipynb(parser, config_path):
             config_dict[key] = value
 
     for key, value in config_dict.items():
-        if hasattr(args, key):
-            setattr(args, key, value)
+        setattr(args, key, value)
+        # if hasattr(args, key):
+        #     setattr(args, key, value)
     
     return args
 

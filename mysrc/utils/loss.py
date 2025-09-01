@@ -4,6 +4,21 @@ import torch.nn as nn
 
 from torch.nn import functional as F
 
+def growth_function(x, midpoint=0.5, steepness=10, max_y=0.5):
+    """
+    Logistic growth-like function.
+
+    Parameters:
+        x (float or np.ndarray): 입력 값 (0 ~ 1 권장)
+        midpoint (float): y=0.5가 되는 x값 (기본 0.5)
+        steepness (float): 곡선의 가파른 정도 (값이 클수록 급격히 변함)
+        max_y (float): x=1.0 일때의 y값
+    Returns:
+        float or np.ndarray: y값 (0 ~ 1)
+    """
+    return  2 * max_y / (1 + torch.exp(-steepness * (x - midpoint))) 
+    # return 1 / (1 + np.exp(-steepness * (x - midpoint)))
+
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):
     tensor_recv = torch.zeros_like(tensor)
     send_op = torch.distributed.P2POp(
@@ -114,13 +129,26 @@ class SigLipLoss(nn.Module):
         self.prev_num_logits = 0
         self.labels = {}
 
-    def get_ground_truth(self, device, dtype, num_logits, classes, same_class_weight=1.0, negative_only=False) -> torch.Tensor:
+
+    def get_ground_truth(self, device, dtype, num_logits, classes, same_class_weight=1.0, 
+                         times=None, time_range=10, time_weight=0.3, 
+                         negative_only=False) -> torch.Tensor:
+        
         if same_class_weight != 1.0:
-            labels = (classes.unsqueeze(0) == classes.unsqueeze(1)).float()
-            eye = torch.eye(num_logits, dtype=torch.bool, device=classes.device)
-            labels[labels.bool() & ~eye] = same_class_weight
+            labels = (classes[:, None] == classes[None, :]).float()
+            if times is not None:
+                time_diff = torch.cdist(times[:, None], times[:, None], p=1.0)
+                time_weights = growth_function(torch.clamp(time_diff, max=time_range) / time_range,
+                                            midpoint=1.0, steepness=6, max_y=time_weight)
+                
+                labels = labels * (same_class_weight - time_weights)
+                labels.fill_diagonal_(1.0)
+            else:
+                eye = torch.eye(num_logits, dtype=torch.bool, device=classes.device)
+                labels[labels.bool() & ~eye] = same_class_weight
+
         else:
-            labels = (classes.unsqueeze(0) == classes.unsqueeze(1))
+            labels = (classes[:, None] == classes[None, :]).float()
 
         labels = labels.to(device=device, dtype=dtype)
 
@@ -135,7 +163,8 @@ class SigLipLoss(nn.Module):
             logits += logit_bias
         return logits
 
-    def _loss(self, image_features1, image_features2, classes, logit_scale, logit_bias=None, same_class_weight=1.0, negative_only=False):
+    def _loss(self, image_features1, image_features2, classes, logit_scale, logit_bias=None, same_class_weight=1.0, 
+              times=None, time_range=10, time_weight=0.3, negative_only=False):
         logits = self.get_logits(image_features1, image_features2, logit_scale, logit_bias)
         labels = self.get_ground_truth(
             image_features1.device,
@@ -143,14 +172,17 @@ class SigLipLoss(nn.Module):
             image_features1.shape[0],
             classes,
             same_class_weight,
+            times=times, time_range=time_range, time_weight=time_weight,
             negative_only=negative_only,
         )
         # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
         loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
         return loss
 
-    def forward(self, image_features1, image_features2, logit_scale, logit_bias, classes, same_class_weight=1.0, output_dict=False):
-        loss = self._loss(image_features1, image_features2, classes, logit_scale, logit_bias, same_class_weight)
+    def forward(self, image_features1, image_features2, logit_scale, logit_bias, classes, same_class_weight=1.0, 
+                times=None, time_range=10, time_weight=0.3,
+                output_dict=False):
+        loss = self._loss(image_features1, image_features2, classes, logit_scale, logit_bias, same_class_weight, times, time_range, time_weight)
 
         if self.world_size > 1:
             if self.dist_impl == 'bidir':

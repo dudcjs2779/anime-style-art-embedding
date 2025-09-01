@@ -94,7 +94,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
-        accum_images1, accum_images2, accum_classes, accum_features = [], [], [], {}
+        accum_images1, accum_images2, accum_classes, accum_times, accum_features = [], [], [], [], {}
 
     losses_m = {}
     # total_m = AverageMeter()
@@ -122,7 +122,9 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             with autocast():
                 model_out = model(images1, images2)
                 logit_scale = model_out["logit_scale"]
-                losses = clip_loss(**model_out, classes=classes, same_class_weight=args.same_class_weight, times=times, output_dict=True)
+                losses = clip_loss(**model_out, classes=classes, same_class_weight=args.same_class_weight, 
+                                   times=times, time_range=args.time_range, time_weight=args.time_weight,
+                                   output_dict=True)
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
@@ -146,6 +148,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                 accum_images1.append(images1)
                 accum_images2.append(images2)
                 accum_classes.append(classes)
+                accum_times.append(times)
 
             # If (i + 1) % accum_freq is not zero, move on to the next batch.
             if ((i + 1) % args.accum_freq) > 0:
@@ -157,6 +160,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             # Call backwards each time, but only step optimizer at the end.
             optimizer.zero_grad()
             accum_classes = torch.concat(accum_classes, dim=-1)
+            accum_times = torch.concat(accum_times, dim=-1)
             for j in range(args.accum_freq):
                 images1 = accum_images1[j]
                 images2 = accum_images2[j]
@@ -173,7 +177,9 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                         accumulated = accum_features[key]
                         inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
 
-                    losses = clip_loss(**inputs, **inputs_no_accum, classes=accum_classes, same_class_weight=args.same_class_weight, times=times, output_dict=True)
+                    losses = clip_loss(**inputs, **inputs_no_accum, classes=accum_classes, same_class_weight=args.same_class_weight, 
+                                       times=accum_times, time_range=args.time_range, time_weight=args.time_weight,
+                                       output_dict=True)
 
                     del inputs
                     del inputs_no_accum
@@ -205,7 +211,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
 
         # reset gradient accum, if enabled
         if args.accum_freq > 1:
-            accum_images1, accum_images2, accum_classes, accum_features = [], [], [], {}
+            accum_images1, accum_images2, accum_classes, accum_times, accum_features = [], [], [], [], {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -251,9 +257,10 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                 "samples_per_second": samples_per_second,
                 "samples_per_second_per_gpu": samples_per_second_per_gpu,
                 "scale": logit_scale_scalar,
-                "lr": optimizer.param_groups[0]["lr"]
+                "lr": optimizer.param_groups[0]["lr"],
             }            
-            log_data.update({name:val.val for name,val in losses_m.items()})
+            log_data.update({name:val.val for name, val in losses_m.items()})
+            log_data.update({name:val.avg for name, val in losses_m.items()})
 
             log_data = {"train/" + name: val for name, val in log_data.items()}
 
@@ -287,11 +294,12 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args)
         all_image_features, all_classes = [], []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images1, images2, images3, classes = batch
+                images1, images2, images3, classes, times = batch
                 images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)   # aug1
                 images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)   # aug2
                 images3 = images3.to(device=device, dtype=input_dtype, non_blocking=True)   # non aug
                 classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
+                times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
                 with autocast():
                     model_out = model.evaluate(images1, images2, images3)
@@ -308,6 +316,7 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args)
                         logit_scale=model_out["logit_scale"], 
                         logit_bias=model_out.get('logit_bias', None), 
                         classes=classes, 
+                        times=times, time_range=args.time_range, time_weight=args.time_weight,
                         same_class_weight=args.same_class_weight, 
                     )
 
@@ -361,9 +370,10 @@ def get_clip_metrics(image_features, classes, logit_scale, logit_bias=None):
     metrics = {}
 
     ## 분류 accuracy
-    logits_image = (logit_scale * image_features @ image_features.t()).detach().cpu()
-    if logit_bias:
-        logits_image += logit_bias
+    # logits_image = (logit_scale * image_features @ image_features.t()).detach().cpu()
+    logits_image = (image_features @ image_features.t()).detach().cpu()
+    # if logit_bias:
+    #     logits_image += logit_bias
 
     ground_truth = (classes.unsqueeze(0) == classes.unsqueeze(1)).int()
     N = logits_image.size(0)
@@ -404,17 +414,27 @@ def get_clip_metrics(image_features, classes, logit_scale, logit_bias=None):
     metrics[f"accuracy_x3"] = accuracy_x3
     metrics[f"accuracy_x10"] = accuracy_x10
 
-    ## 분산
+    ## 클래스별 평균 유사도 및 표준편차
     image_features = image_features.numpy()
     classes = classes.numpy()
     unique_classes = np.unique(classes)
-    class_std = {}
-    for c in unique_classes:
-        mask = (classes == c)
-        feats = image_features[mask]  # 해당 클래스의 벡터들
-        class_std[c] = np.std(feats)
 
-    metrics[f"class_std_mean"] = np.mean([v for k, v in class_std.items()])
+    mean_list = []
+    std_list = []
+    for i in unique_classes:
+        class_features = image_features[classes == i]
+        class_sims = class_features @ class_features.T
+        np.fill_diagonal(class_sims, np.nan)
+
+        sims_mean = np.nanmean(class_sims)
+        mean_list.append(sims_mean)
+
+        stds = np.nanstd(class_sims, axis=-1)
+        stds_mean = np.nanmean(stds)
+        std_list.append(stds_mean)
+
+    metrics[f"sim_mean_by_class"] = np.mean(mean_list)
+    metrics[f"sim_stu_mean_by_class"] = np.mean(std_list)
 
     ## silhouette_score
     metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
