@@ -33,8 +33,9 @@ class CustomVisual(nn.Module):
     def inference(
             self,
             image: Optional[torch.Tensor] = None,
+            normalize: bool = True,
     ):
-        image_features = self.encode_image(image, normalize=True) if image is not None else None
+        image_features = self.encode_image(image, normalize=normalize) if image is not None else None
 
         if self.output_dict:
             out_dict = {
