@@ -1,4 +1,5 @@
 import json
+import re
 import toml
 import logging
 import os
@@ -10,11 +11,15 @@ import torch
 import numpy as np
 import random
 import copy
+import wandb
 
 import torch.utils.tensorboard as tensorboard
 
 from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object
 from open_clip_train.logger import setup_logging
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
@@ -104,10 +109,11 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
         lr = scheduler[step]
         apply_optim_scheduler(optimizer, lr)
 
-        images1, images2, classes = batch
+        images1, images2, classes, times = batch
         images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)
         images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)
         classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
+        times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
@@ -116,7 +122,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             with autocast():
                 model_out = model(images1, images2)
                 logit_scale = model_out["logit_scale"]
-                losses = clip_loss(**model_out, classes=classes, same_class_weight=args.same_class_weight, output_dict=True)
+                losses = clip_loss(**model_out, classes=classes, same_class_weight=args.same_class_weight, times=times, output_dict=True)
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
@@ -167,7 +173,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                         accumulated = accum_features[key]
                         inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
 
-                    losses = clip_loss(**inputs, **inputs_no_accum, classes=accum_classes, same_class_weight=args.same_class_weight, output_dict=True)
+                    losses = clip_loss(**inputs, **inputs_no_accum, classes=accum_classes, same_class_weight=args.same_class_weight, times=times, output_dict=True)
 
                     del inputs
                     del inputs_no_accum
@@ -255,10 +261,11 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                 for name, val in log_data.items():
                     tb_writer.add_scalar(name, val, step)
             
-            # if args.wandb:
-            #     assert wandb is not None, 'Please install wandb.'
-            #     log_data['step'] = step  # for backwards compatibility
-            #     wandb.log(log_data, step=step)
+            if args.wandb:
+                assert wandb is not None, 'Please install wandb.'
+                log_data['step'] = step  # for backwards compatibility
+                args.step = step
+                wandb.log(log_data, step=step)
             
             # resetting batch / data time meters per log window
             batch_time_m.reset()
@@ -266,7 +273,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
     # end for
 
 
-def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, args):
+def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args):
     metrics = {}
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
@@ -342,22 +349,18 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, args):
             f.write(json.dumps(metrics))
             f.write("\n")
 
-    # if args.wandb:
-    #     assert wandb is not None, 'Please install wandb.'
-    #     if 'train' in data:
-    #         dataloader = data['train'].dataloader
-    #         num_batches_per_epoch = dataloader.num_batches // args.accum_freq
-    #         step = num_batches_per_epoch * epoch
-    #     else:
-    #         step = None
-    #     log_data['epoch'] = epoch
-    #     wandb.log(log_data, step=step)
+    if args.wandb:
+        assert wandb is not None, 'Please install wandb.'
+        log_data['epoch'] = epoch
+        wandb.log(log_data, step=step)
 
     return metrics
        
             
 def get_clip_metrics(image_features, classes, logit_scale, logit_bias=None):
     metrics = {}
+
+    ## 분류 accuracy
     logits_image = (logit_scale * image_features @ image_features.t()).detach().cpu()
     if logit_bias:
         logits_image += logit_bias
@@ -379,22 +382,46 @@ def get_clip_metrics(image_features, classes, logit_scale, logit_bias=None):
     rank_range = (ranks < num_gt_per_row.unsqueeze(1)) # (존재하는 클래스 갯수 만큼 앞부분을 True)
     rank_range_x1_5 = (ranks < (num_gt_per_row * 1.5).to(dtype=int).unsqueeze(1))
     rank_range_x3 = (ranks < (num_gt_per_row * 3).to(dtype=int).unsqueeze(1))
+    rank_range_x10 = (ranks < (num_gt_per_row * 10).to(dtype=int).unsqueeze(1))
 
     acc_per_row = rank_range & (gt_mask.bool()) # (측정 랭킹 구간) & (sim이 높은 순으로 정렬한 gt_mask)
     acc_per_row_x1_5 = rank_range_x1_5 & (gt_mask.bool())
     acc_per_row_x3 = rank_range_x3 & (gt_mask.bool())
+    acc_per_row_x10 = rank_range_x10 & (gt_mask.bool())
 
     accuracy = acc_per_row.float().sum(dim=1) / num_gt_per_row
     accuracy_x1_5 = acc_per_row_x1_5.float().sum(dim=1) / num_gt_per_row
     accuracy_x3 = acc_per_row_x3.float().sum(dim=1) / num_gt_per_row
+    accuracy_x10 = acc_per_row_x10.float().sum(dim=1) / num_gt_per_row
 
     accuracy = accuracy.mean().item()
     accuracy_x1_5 = accuracy_x1_5.mean().item()
     accuracy_x3 = accuracy_x3.mean().item()
+    accuracy_x10 = accuracy_x10.mean().item()
 
     metrics[f"accuracy"] = accuracy
     metrics[f"accuracy_x1_5"] = accuracy_x1_5
     metrics[f"accuracy_x3"] = accuracy_x3
+    metrics[f"accuracy_x10"] = accuracy_x10
+
+    ## 분산
+    image_features = image_features.numpy()
+    classes = classes.numpy()
+    unique_classes = np.unique(classes)
+    class_std = {}
+    for c in unique_classes:
+        mask = (classes == c)
+        feats = image_features[mask]  # 해당 클래스의 벡터들
+        class_std[c] = np.std(feats)
+
+    metrics[f"class_std_mean"] = np.mean([v for k, v in class_std.items()])
+
+    ## silhouette_score
+    metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
+
+    kmeans = KMeans(n_clusters=len(unique_classes), random_state=42)
+    labels = kmeans.fit_predict(image_features)
+    metrics[f"silhouette_score_kmeans"] = silhouette_score(image_features, labels, metric='cosine')
 
     return metrics
 
@@ -432,7 +459,9 @@ def main(args):
     args.log_level = logging.DEBUG if args.debug else logging.INFO
     setup_logging(args.log_path, args.log_level)
     
+    args.wandb = 'wandb' in args.report_to or 'all' in args.report_to
     args.tensorboard = 'tensorboard' in args.report_to or 'all' in args.report_to
+    writer = None
     if is_master(args):
         args.tensorboard_path = os.path.join(args.output_path, "tensorboard") if args.tensorboard else ''
         for dirname in [args.tensorboard_path, args.checkpoint_path]:
@@ -440,9 +469,6 @@ def main(args):
                 os.makedirs(dirname, exist_ok=True)
     else:
         args.tensorboard_path = ''
-
-    assert tensorboard is not None, "Please install tensorboard."
-    writer = tensorboard.SummaryWriter(args.tensorboard_path)
 
     random_seed(args.seed)
     # autodtype = get_cast_dtype(args.precision)
@@ -506,11 +532,36 @@ def main(args):
             model.load_state_dict(checkpoint["state_dict"])
             if optimizer is not None:
                 optimizer.load_state_dict(checkpoint["optimizer"])
-            # if scaler is not None and 'scaler' in checkpoint:
-            #     scaler.load_state_dict(checkpoint['scaler'])
+            if scaler is not None and 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
+
+
+    if args.tensorboard:
+        assert tensorboard is not None, "Please install tensorboard."
+        writer = tensorboard.SummaryWriter(args.tensorboard_path)
+
+    if args.wandb and is_master(args):
+        assert wandb is not None, 'Please install wandb.'
+        logging.debug('Starting wandb.')
+
+        wandb.init(
+            dir="logs",
+            project=args.wandb_project_name,
+            name=None,
+            id=args.run_id,
+            notes=None,
+            tags=[],
+            resume='must' if args.resume or args.run_id else None,
+            config=vars(args),
+        )
+        if args.debug:
+            wandb.watch(model, log='all')
+
+        wandb.save(args.config_path)
+        logging.debug('Finished loading wandb.')
 
 
     total_steps = (train_loader.num_batches // args.accum_freq) * args.epochs
@@ -518,11 +569,11 @@ def main(args):
     warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
     scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
     print(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
-    
+
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(model, device, train_loader, clip_loss, epoch, optimizer, scaler, scheduler, writer, args)
         completed_epoch = epoch + 1
-        evaluate(model, device, valid_loader, clip_loss, epoch, writer, args)
+        metrics = evaluate(model, device, valid_loader, clip_loss, completed_epoch, writer, args.step, args)
 
         checkpoint_dict = {
             "epoch": completed_epoch,
@@ -534,14 +585,32 @@ def main(args):
             'numpy_rng_state': np.random.get_state(),
             'random_state': random.getstate()
         }
+        if scaler is not None:
+            checkpoint_dict["scaler"] = scaler.state_dict()
 
         if completed_epoch == args.epochs or (
             args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
         ):
+            model_save_path = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt")
+            
             torch.save(
                 checkpoint_dict,
-                os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
+                model_save_path,
             )
+
+            saved_models = [os.path.join(args.checkpoint_path, file) for file in os.listdir(args.checkpoint_path) if file.endswith(".pt")]
+            saved_models.sort(key=lambda x: int(re.search(r"epoch_(\d+).pt", os.path.basename(x)).group(1)))
+            if len(saved_models) > args.max_save_count:
+                remove_paths = saved_models[:-args.max_save_count]
+                for remove_path in remove_paths:
+                    if os.path.exists(remove_path):
+                        os.remove(remove_path)
+            
+    
+    if args.wandb and is_master(args):
+        wandb.finish()
+
+    logging.info('Finished.')
 
 
 
