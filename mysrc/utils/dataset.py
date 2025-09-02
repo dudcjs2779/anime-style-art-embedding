@@ -56,6 +56,14 @@ def balanced_sampleing(df, target_key):
 
     return df_balanced
 
+def pretrain_collate(batch):
+    output = {}
+    for key in batch[0].keys():
+        output[key] = torch.stack([data[key] for data in batch])
+
+    return output
+
+
 def make_pretrain_dataset(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
@@ -63,14 +71,18 @@ def make_pretrain_dataset(args):
 
     transforms = get_preset(args.train_aug, image_size=args.image_size)
     valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
-    
-    train_dataset = PretrainDataset(train_df.image.tolist(), train_df.target.tolist(), transforms, times=train_df.years_passed.tolist())
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
+
+    train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
+    train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
+    train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
+    train_loader = DataLoader(train_dataset, collate_fn=pretrain_collate, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
-    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_df.target.tolist(), transforms, valid_trans, times=train_df.years_passed.tolist())
-    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
+    valid_times = torch.tensor(valid_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
+    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans, times=valid_times)
+    valid_loader = DataLoader(valid_dataset, collate_fn=pretrain_collate, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
     valid_loader.num_samples = len(valid_dataset)
     valid_loader.num_batches = len(valid_loader)
 
@@ -426,6 +438,22 @@ def exclude_norm_totensor(transforms):
     transforms = [trans for trans in transforms if not isinstance(trans, (A.augmentations.transforms.Normalize, A.pytorch.transforms.ToTensorV2))]
     return A.Compose(transforms)
 
+def remove_normalize_and_totensor(transforms: A.Compose) -> A.Compose:
+    def _filter(t):
+        # 만약 내부에 또 Compose가 있으면 재귀적으로 처리
+        if isinstance(t, A.core.composition.Compose):
+            return A.Compose([_filter(inner) for inner in t.transforms 
+                              if not isinstance(inner, (A.augmentations.transforms.Normalize, A.pytorch.transforms.ToTensorV2))],
+                             p=t.p)
+        else:
+            return t
+
+    filtered = [
+        _filter(t) for t in transforms.transforms
+        if not isinstance(t, (A.augmentations.transforms.Normalize, A.pytorch.transforms.ToTensorV2))
+    ]
+    return A.Compose(filtered, p=transforms.p)
+
 
 class TrainDataset(Dataset):
     def __init__(self, images, labels, transforms):
@@ -586,10 +614,11 @@ class PretrainDataset(Dataset):
         self.df = df
         self.images = images
         self.labels = labels
-        if times is not None:
-            self.times = times
-        self.transforms = transforms
-        self.test_transforms = exclude_norm_totensor(transforms)
+        self.times = times
+        self.trans1 = transforms['trans1']
+        self.trans2 = transforms['trans2']
+        self.test_trans1 = remove_normalize_and_totensor(self.trans1)
+        self.test_trans2 = remove_normalize_and_totensor(self.trans2)
 
     def __len__(self):
         return len(self.images)
@@ -598,13 +627,16 @@ class PretrainDataset(Dataset):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        image1 = self.transforms(image=image)['image']
-        image2 = self.transforms(image=image)['image']
+        image1 = self.trans1(image=image)['image']
+        image2 = self.trans2(image=image)['image']
 
         label = self.labels[idx]
-        times = self.times[idx]
+        output = {'image1': image1, 'image2': image2, 'label': label}
 
-        return image1, image2, label, times
+        if self.times is not None:
+            output['time'] = self.times[idx]
+
+        return output
     
     def get_pil(self, idx, pixels=None):
         image =Image.open(self.images[idx])
@@ -619,10 +651,17 @@ class PretrainDataset(Dataset):
 
         return image
     
-    def get_trnasformed(self, idx):
+    def get_transform1(self, idx):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = self.test_transforms(image=image)['image']
+        image = self.test_trans1(image=image)['image']
+
+        return Image.fromarray(image)
+    
+    def get_transform2(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = self.test_trans2(image=image)['image']
 
         return Image.fromarray(image)
     
@@ -635,14 +674,18 @@ class PretrainValidDataset(PretrainDataset):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        image1 = self.transforms(image=image)['image']
-        image2 = self.transforms(image=image)['image']
+        image1 = self.trans1(image=image)['image']
+        image2 = self.trans2(image=image)['image']
         image3 = self.valid_transforms(image=image)['image']
 
         label = self.labels[idx]
-        times = self.times[idx]
 
-        return image1, image2, image3, label, times
+        output= {'image1': image1, 'image2': image2, 'image3':image3, 'label': label}
+
+        if self.times is not None:
+            output['time'] = self.times[idx]
+
+        return output
     
     
 class InferDataset(Dataset):
@@ -681,4 +724,6 @@ class InferDataset(Dataset):
         image = self.test_transforms(image=image)['image']
 
         return Image.fromarray(image)
+    
+    
     

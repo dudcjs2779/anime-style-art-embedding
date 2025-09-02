@@ -109,7 +109,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
         lr = scheduler[step]
         apply_optim_scheduler(optimizer, lr)
 
-        images1, images2, classes, times = batch
+        images1, images2, classes, times = batch['image1'], batch['image2'], batch['label'], batch['time']
         images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)
         images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)
         classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
@@ -260,7 +260,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                 "lr": optimizer.param_groups[0]["lr"],
             }            
             log_data.update({name:val.val for name, val in losses_m.items()})
-            log_data.update({name:val.avg for name, val in losses_m.items()})
+            log_data.update({f"{name}_avg":val.avg for name, val in losses_m.items()})
 
             log_data = {"train/" + name: val for name, val in log_data.items()}
 
@@ -294,7 +294,7 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args)
         all_image_features, all_classes = [], []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images1, images2, images3, classes, times = batch
+                images1, images2, images3, classes, times = batch['image1'], batch['image2'], batch['image3'], batch['label'], batch['time']
                 images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)   # aug1
                 images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)   # aug2
                 images3 = images3.to(device=device, dtype=input_dtype, non_blocking=True)   # non aug

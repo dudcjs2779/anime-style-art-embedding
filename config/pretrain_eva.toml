@@ -28,8 +28,7 @@ same_class_weight = 0.9
 
 [validation]
 valid = true
-valid_batch_size = 16
-valid_size = 0.2
+valid_batch_size = 24
 val_frequency = 1
 
 [optimizer]
@@ -56,12 +55,12 @@ loss_dist_impl = 'bidir'
 train = 'datasets/pretrain_test640/train01.parquet'
 valid = 'datasets/pretrain_test640/valid01.parquet'
 image_key = 'image'
-workers = 8
+workers = 0
 
 [dataset]
 image_size = [224, 224]
 patch_size = 14
-train_aug = "pretrain_base"
+train_aug = "pretrain02"
 valid_aug = "long_max_pad_valid"
 
 [logger]

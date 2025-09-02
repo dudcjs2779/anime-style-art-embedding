@@ -1161,9 +1161,122 @@ def get_preset(preset_name, image_size=[448, 448]):
             A.Normalize(mean=mean, std=std, max_pixel_value=255),
             ToTensorV2(),
         ], p=1.0)
-        
+
+    elif preset_name == "pretrain02":
+        defualt_trans = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.1),
+
+            A.OneOf([
+                RandomResizedCropWithPad(
+                    size=[h, w],
+                    scale=[0.05, 1.0],
+                    ratio=[0.75, 1.3333333333333333],
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=255,
+                    p=0.6),
+
+                A.Compose([
+                    AutoPad(border_mode=cv2.BORDER_CONSTANT, fill=255),
+                    A.RandomResizedCrop(
+                        size=[h, w],
+                        scale=[0.33, 1.0],
+                        ratio=[0.75, 1.3333333333333333],
+                        interpolation=cv2.INTER_CUBIC,
+                        p=1.0),
+                ], p=0.4),
+            ], p=1.0),
+
+             A.OneOf([
+                A.RandomRotate90(p=0.3),
+                A.Rotate(limit=(-180, 180), p=0.7, border_mode=cv2.BORDER_CONSTANT, fill=[255, 255, 255]),
+            ], p=0.7),
+
+            A.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.2,
+                hue=0.1,
+                p=0.8
+            ),
+            A.ToGray(p=0.2),
+        ])
+
+        aug_trans1 = A.Compose([
+            A.AdditiveNoise(
+                noise_type="gaussian",
+                spatial_mode="shared",
+                noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
+                approximation=0.8,
+                p=0.1
+            ),
+
+            A.OneOf([
+                A.AdvancedBlur(
+                    blur_limit=[5, 15],
+                    sigma_x_limit=[0.5, 2.2],
+                    sigma_y_limit=[0.5, 2.2],
+                    rotate_limit=[-90, 90],
+                    beta_limit=[0.5, 8.0],
+                    noise_limit=[0.75, 1.25],
+                    p=0.5
+                ),
+                A.GaussianBlur(
+                    blur_limit=0,
+                    sigma_limit=[0.5, 2.0],
+                    p=0.5
+                ),
+            ], p=0.9),
+        ], p=1.0)
 
 
+
+        aug_trans2 = A.Compose([
+            A.OneOf([
+                A.AdvancedBlur(
+                    blur_limit=[5, 15],
+                    sigma_x_limit=[0.5, 2.2],
+                    sigma_y_limit=[0.5, 2.2],
+                    rotate_limit=[-90, 90],
+                    beta_limit=[0.5, 8.0],
+                    noise_limit=[0.75, 1.25],
+                    p=0.5
+                ),
+                A.GaussianBlur(
+                    blur_limit=0,
+                    sigma_limit=[0.5, 2.0],
+                    p=0.5
+                ),
+            ], p=0.1),
+
+            A.AdditiveNoise(
+                noise_type="gaussian",
+                spatial_mode="shared",
+                noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
+                approximation=0.8,
+                p=0.5
+            ),
+
+            A.Solarize([0.0, 0.7], p=0.2),
+        ], p=1.0)
+
+        end_trans = A.Compose([
+            A.CoarseDropout(
+                num_holes_range=[2, 5],
+                hole_height_range=[0.1, 0.5],
+                hole_width_range=[0.1, 0.5],
+                fill=0,
+                p=0.5
+            ),
+
+            A.Normalize(mean=mean, std=std, max_pixel_value=255),
+            ToTensorV2(),
+        ], p=1.0)
+
+        transforms1 = A.Compose([defualt_trans, aug_trans1, end_trans])
+        transforms2 = A.Compose([defualt_trans, aug_trans2, end_trans])
+        transforms = {"trans1": transforms1, "trans2": transforms2}
 
     return transforms
 
