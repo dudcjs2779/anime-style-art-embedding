@@ -1262,13 +1262,13 @@ def get_preset(preset_name, image_size=[448, 448]):
         ], p=1.0)
 
         end_trans = A.Compose([
-            A.CoarseDropout(
-                num_holes_range=[2, 5],
-                hole_height_range=[0.1, 0.5],
-                hole_width_range=[0.1, 0.5],
-                fill=0,
-                p=0.5
-            ),
+            # A.CoarseDropout(
+            #     num_holes_range=[2, 5],
+            #     hole_height_range=[0.1, 0.5],
+            #     hole_width_range=[0.1, 0.5],
+            #     fill=0,
+            #     p=0.5
+            # ),
 
             A.Normalize(mean=mean, std=std, max_pixel_value=255),
             ToTensorV2(),

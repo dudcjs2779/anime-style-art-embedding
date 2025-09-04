@@ -94,7 +94,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
-        accum_images1, accum_images2, accum_classes, accum_times, accum_features = [], [], [], [], {}
+        accum_images1, accum_images2, accum_masks, accum_classes, accum_times, accum_features = [], [], [], [], [], {}
 
     losses_m = {}
     # total_m = AverageMeter()
@@ -109,9 +109,10 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
         lr = scheduler[step]
         apply_optim_scheduler(optimizer, lr)
 
-        images1, images2, classes, times = batch['image1'], batch['image2'], batch['label'], batch['time']
+        images1, images2, masks, classes, times = batch['image1'], batch['image2'], batch['collated_masks'], batch['label'], batch['time']
         images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)
         images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)
+        masks = masks.to(device=device, dtype=input_dtype, non_blocking=True)
         classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
         times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
@@ -120,7 +121,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images1, images2)
+                model_out = model(images1, images2, masks)
                 logit_scale = model_out["logit_scale"]
                 losses = clip_loss(**model_out, classes=classes, same_class_weight=args.same_class_weight, 
                                    times=times, time_range=args.time_range, time_weight=args.time_weight,
@@ -134,7 +135,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    model_out = model(images1, images2)
+                    model_out = model(images1, images2, masks)
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
@@ -147,6 +148,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                     
                 accum_images1.append(images1)
                 accum_images2.append(images2)
+                accum_masks.append(masks)
                 accum_classes.append(classes)
                 accum_times.append(times)
 
@@ -164,8 +166,9 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             for j in range(args.accum_freq):
                 images1 = accum_images1[j]
                 images2 = accum_images2[j]
+                masks = accum_masks[j]
                 with autocast():
-                    model_out = model(images1, images2)
+                    model_out = model(images1, images2, masks)
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
@@ -581,7 +584,7 @@ def main(args):
             wandb.watch(model, log='all')
 
         wandb.save(args.config_path)
-        logging.debug('Finished loading wandb.')
+        logging.info(f'Finished loading wandb. run_id: {wandb.run.id}')
 
 
     total_steps = (train_loader.num_batches // args.accum_freq) * args.epochs

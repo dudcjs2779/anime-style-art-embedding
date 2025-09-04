@@ -1,14 +1,18 @@
+import logging
 import pandas as pd
 import cv2
 import math
 import json
 import torch
 import numpy as np
+import random
 
+from collections import defaultdict
+from copy import deepcopy
 import albumentations as A
-
+from functools import partial
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
@@ -56,10 +60,36 @@ def balanced_sampleing(df, target_key):
 
     return df_balanced
 
-def pretrain_collate(batch):
+def pretrain_collate(batch, mask_ratio_tuple, mask_probability, n_tokens=None, mask_generator=None):
     output = {}
     for key in batch[0].keys():
         output[key] = torch.stack([data[key] for data in batch])
+
+    B = len(output['image1'])
+    N = n_tokens
+    n_samples_masked = int(B * mask_probability)
+    probs = torch.linspace(*mask_ratio_tuple, n_samples_masked + 1)
+    upperbound = 0
+    masks_list = []
+    for i in range(0, n_samples_masked):
+        prob_min = probs[i]
+        prob_max = probs[i + 1]
+        masks_list.append(torch.BoolTensor(mask_generator(int(N * random.uniform(prob_min, prob_max)))))
+        upperbound += int(N * prob_max)
+    for i in range(n_samples_masked, B):
+        masks_list.append(torch.BoolTensor(mask_generator(0)))
+
+    random.shuffle(masks_list)
+    
+    collated_masks = torch.stack(masks_list).flatten(1)
+    mask_indices_list = collated_masks.flatten().nonzero().flatten()
+    masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
+
+    output['collated_masks'] = collated_masks
+    output['mask_indices_list'] = mask_indices_list
+    output['masks_weight'] = masks_weight
+    output['upperbound'] = upperbound
+    output['n_masked_patches'] = torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
 
     return output
 
@@ -72,24 +102,44 @@ def make_pretrain_dataset(args):
     transforms = get_preset(args.train_aug, image_size=args.image_size)
     valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
 
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transforms}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
+
+    img_size = args.image_size[0]
+    patch_size = args.patch_size
+    n_tokens = (img_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
+    )
+
+    collate_fn = partial(
+        pretrain_collate,
+        mask_ratio_tuple=(0.1, 0.5),
+        mask_probability=0.5,
+        n_tokens=n_tokens,
+        mask_generator=mask_generator,
+    )
+
     train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
     train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
     train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
-    train_loader = DataLoader(train_dataset, collate_fn=pretrain_collate, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
+    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
     valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
     valid_times = torch.tensor(valid_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
     valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans, times=valid_times)
-    valid_loader = DataLoader(valid_dataset, collate_fn=pretrain_collate, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
     valid_loader.num_samples = len(valid_dataset)
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
-
-def collate_pretrain(samples_list, mask_ratio_tuple, mask_probability, dtype, n_tokens=None, mask_generator=None):
-    pass
 
 
 def make_dataset(args):
@@ -686,6 +736,85 @@ class PretrainValidDataset(PretrainDataset):
             output['time'] = self.times[idx]
 
         return output
+
+class CustomBatchSampler(Sampler[int]):
+    r"""
+    class를 랜덤으로 하나 샘플링한뒤 해당 클래스와 같은 클래스의 샘플을 num_postive 갯수만큼 
+    1개 미니배치에 포함시킵니다. 나머지 는 선택된 class의 샘플을 제외하고 무작위로 채워집니다.
+
+    Args:
+        num_postive: 1개 미니배치에 포함하고 싶은 postive sample의 갯수 (min_num, max_num):Tuple
+            ex: (2, 4)로 설정할 경우 샘플링된 클래스가 미내배치내에 2~4개 존재합니다.
+    """
+
+    def __init__(self, dataset, batch_size, num_postive=[2, 2], drop_last=True) -> None:
+        self.dataset = dataset
+        self.indices = [i for i in range(len(self.dataset))]
+        self.labels = dataset.labels.to(dtype=int).tolist()
+        self.batch_size = batch_size
+        self.num_postive = num_postive
+        self.drop_last = drop_last
+
+        data_by_class = defaultdict(set)
+        for idx, label in zip(self.indices, self.labels):
+            data_by_class[label].add(idx)
+
+        self.data_by_class = data_by_class
+        self.idx_to_class = {idx: label for idx, label in zip(self.indices, self.labels)}
+
+    def __iter__(self):
+        self.all_batches = self.make_batches(self.data_by_class, self.idx_to_class, self.batch_size, self.num_postive, self.drop_last)
+        for idxs in self.all_batches:
+            yield idxs
+        # return iter(range(len(self.data_source)))
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        else:
+            return math.ceil(len(self.dataset) / self.batch_size)
+    
+    def make_batches(self, data_by_class, idx_to_class, batch_size, num_postive, drop_last):
+        data_by_class = deepcopy(data_by_class)
+        all_batches = []
+        while True:
+            available_classes = [k for k, v in data_by_class.items() if v]  # 남은 클래스만
+            if not available_classes:
+                break
+
+            # 2. 랜덤 클래스 선택
+            cls = random.choice(available_classes)
+
+            # 3. 최소 2~4개 뽑기
+            n_samples = min(random.randint(*num_postive), len(data_by_class[cls]))
+            selected = random.sample(list(data_by_class[cls]), n_samples)
+            data_by_class[cls].difference_update(selected)  # O(1) 제거
+
+            # 4. 남은 부분 채우기
+            remaining = batch_size - n_samples
+            other_classes = [k for k in available_classes if k != cls]
+            other_candidates = [i for k in other_classes for i in data_by_class[k]]
+
+            if remaining > len(other_candidates):
+                if drop_last:
+                    break
+                else:
+                    selected += other_candidates
+                    for k in other_classes:
+                        data_by_class[k].clear()
+                    random.shuffle(selected)
+                    all_batches.append(selected)
+                    break
+            else:
+                other_selected = random.sample(other_candidates, remaining)
+                selected += other_selected
+                for idx in other_selected:
+                    data_by_class[idx_to_class[idx]].remove(idx)
+
+                random.shuffle(selected)
+                all_batches.append(selected)
+
+        return all_batches
     
     
 class InferDataset(Dataset):
@@ -725,5 +854,80 @@ class InferDataset(Dataset):
 
         return Image.fromarray(image)
     
-    
+class MaskingGenerator:
+    def __init__(
+        self,
+        input_size,
+        num_masking_patches=None,
+        min_num_patches=4,
+        max_num_patches=None,
+        min_aspect=0.3,
+        max_aspect=None,
+    ):
+        if not isinstance(input_size, tuple):
+            input_size = (input_size,) * 2
+        self.height, self.width = input_size
+
+        self.num_patches = self.height * self.width
+        self.num_masking_patches = num_masking_patches
+
+        self.min_num_patches = min_num_patches
+        self.max_num_patches = num_masking_patches if max_num_patches is None else max_num_patches
+
+        max_aspect = max_aspect or 1 / min_aspect
+        self.log_aspect_ratio = (math.log(min_aspect), math.log(max_aspect))
+
+    def __repr__(self):
+        repr_str = "Generator(%d, %d -> [%d ~ %d], max = %d, %.3f ~ %.3f)" % (
+            self.height,
+            self.width,
+            self.min_num_patches,
+            self.max_num_patches,
+            self.num_masking_patches,
+            self.log_aspect_ratio[0],
+            self.log_aspect_ratio[1],
+        )
+        return repr_str
+
+    def get_shape(self):
+        return self.height, self.width
+
+    def _mask(self, mask, max_mask_patches):
+        delta = 0
+        for _ in range(10):
+            target_area = random.uniform(self.min_num_patches, max_mask_patches)
+            aspect_ratio = math.exp(random.uniform(*self.log_aspect_ratio))
+            h = int(round(math.sqrt(target_area * aspect_ratio)))
+            w = int(round(math.sqrt(target_area / aspect_ratio)))
+            if w < self.width and h < self.height:
+                top = random.randint(0, self.height - h)
+                left = random.randint(0, self.width - w)
+
+                num_masked = mask[top : top + h, left : left + w].sum()
+                # Overlap
+                if 0 < h * w - num_masked <= max_mask_patches:
+                    for i in range(top, top + h):
+                        for j in range(left, left + w):
+                            if mask[i, j] == 0:
+                                mask[i, j] = 1
+                                delta += 1
+
+                if delta > 0:
+                    break
+        return delta
+
+    def __call__(self, num_masking_patches=0):
+        mask = np.zeros(shape=self.get_shape(), dtype=bool)
+        mask_count = 0
+        while mask_count < num_masking_patches:
+            max_mask_patches = num_masking_patches - mask_count
+            max_mask_patches = min(max_mask_patches, self.max_num_patches)
+
+            delta = self._mask(mask, max_mask_patches)
+            if delta == 0:
+                break
+            else:
+                mask_count += delta
+
+        return mask
     

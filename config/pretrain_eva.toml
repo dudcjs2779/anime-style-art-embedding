@@ -55,13 +55,16 @@ loss_dist_impl = 'bidir'
 train = 'datasets/pretrain_test640/train01.parquet'
 valid = 'datasets/pretrain_test640/valid01.parquet'
 image_key = 'image'
-workers = 0
+workers = 8
 
 [dataset]
 image_size = [224, 224]
 patch_size = 14
 train_aug = "pretrain02"
 valid_aug = "long_max_pad_valid"
+
+[sampler]
+num_postive = [2, 3]
 
 [logger]
 report_to = 'wandb'    # tensorboard, wandb
