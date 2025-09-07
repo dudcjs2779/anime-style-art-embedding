@@ -56,8 +56,7 @@ class CustomEva(Eva):
             head_init_scale = 0.001):
         super().__init__(img_size, patch_size, in_chans, num_classes, global_pool, embed_dim, depth, num_heads, qkv_bias, qkv_fused, mlp_ratio, swiglu_mlp, scale_mlp, scale_attn_inner, attn_type, drop_rate, pos_drop_rate, patch_drop_rate, proj_drop_rate, attn_drop_rate, drop_path_rate, norm_layer, init_values, class_token, num_reg_tokens, no_embed_class, use_abs_pos_emb, use_rot_pos_emb, rope_mixed_mode, rope_grid_offset, rope_grid_indexing, rope_temperature, use_post_norm, use_pre_transformer_norm, use_post_transformer_norm, use_fc_norm, attn_pool_num_heads, attn_pool_mlp_ratio, dynamic_img_size, dynamic_img_pad, ref_feat_shape, head_init_scale)
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
-
-
+    
     def forward_features(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         """Forward pass through feature extraction layers.
 
@@ -105,7 +104,12 @@ class CustomEva(Eva):
         """
         x = self.forward_features(x, mask)
         x = self.forward_head(x)
+
+        if not self.global_pool: # global_pool을 cls_token 방식으로 처리할 예정 
+            return {"x_clstoken": x[:, 0], "x_patchtokens": x[:, self.num_prefix_tokens:]}
+        
         return x
+    
 
 
 class CustomVisual(nn.Module):
@@ -132,6 +136,13 @@ class CustomVisual(nn.Module):
 
     def encode_image(self, image, mask=None, normalize: bool = False):
         features = self.visual(image, mask)
+
+        if isinstance(features, dict):
+            if normalize:
+                features['x_clstoken'] = F.normalize(features['x_clstoken'], dim=-1)
+                features['x_patchtokens'] = F.normalize(features['x_patchtokens'], dim=-1)
+                return features
+            
         return F.normalize(features, dim=-1) if normalize else features
     
     def inference(
@@ -159,16 +170,22 @@ class CustomVisual(nn.Module):
             image1: Optional[torch.Tensor] = None,
             image2: Optional[torch.Tensor] = None,
             image3: Optional[torch.Tensor] = None,
+            mask1: Optional[torch.Tensor] = None,
+            mask2: Optional[torch.Tensor] = None,
     ):
-        image_features1 = self.encode_image(image1, normalize=True) if image1 is not None else None
-        image_features2 = self.encode_image(image2, normalize=True) if image2 is not None else None
-        image_features3 = self.encode_image(image3, normalize=True) if image3 is not None else None
+        im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
+        im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
+        im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
+        im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
+        im_feat3 = self.encode_image(image3, normalize=True) if image3 is not None else None
 
         if self.output_dict:
             out_dict = {
-                "image_features1": image_features1,
-                "image_features2": image_features2,
-                "image_features3": image_features3,
+                "im_feat1": im_feat1,
+                "im_feat1_masked": im_feat1_masked,
+                "im_feat2": im_feat2,
+                "im_feat2_masked": im_feat2_masked,
+                "im_feat3": im_feat3,
                 "logit_scale": self.logit_scale.exp()
             }
             if self.logit_bias is not None:
@@ -176,23 +193,28 @@ class CustomVisual(nn.Module):
             return out_dict
 
         if self.logit_bias is not None:
-            return image_features1, image_features2, image_features3, self.logit_scale.exp(), self.logit_bias
-        return image_features1, image_features2, image_features3, self.logit_scale.exp()
+            return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp(), self.logit_bias
+        return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp()
 
 
     def forward(
             self,
             image1: torch.Tensor,
             image2: torch.Tensor,
-            mask: Optional[torch.Tensor] = None,
+            mask1: Optional[torch.Tensor] = None,
+            mask2: Optional[torch.Tensor] = None,
     ):
-        image_features1 = self.encode_image(image1, mask, normalize=True) if image1 is not None else None
-        image_features2 = self.encode_image(image2, normalize=True) if image2 is not None else None
+        im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
+        im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
+        im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
+        im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
 
         if self.output_dict:
             out_dict = {
-                "image_features1": image_features1,
-                "image_features2": image_features2,
+                "im_feat1": im_feat1,
+                "im_feat1_masked": im_feat1_masked,
+                "im_feat2": im_feat2,
+                "im_feat2_masked": im_feat2_masked,
                 "logit_scale": self.logit_scale.exp()
             }
             if self.logit_bias is not None:
@@ -200,8 +222,8 @@ class CustomVisual(nn.Module):
             return out_dict
 
         if self.logit_bias is not None:
-            return image_features1, image_features2, self.logit_scale.exp(), self.logit_bias
-        return image_features1, image_features2, self.logit_scale.exp()
+            return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp(), self.logit_bias
+        return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp()
 
 
 def create_eva(name, pretrained: bool = False, **kwargs):

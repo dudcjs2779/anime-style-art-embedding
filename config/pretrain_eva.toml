@@ -8,7 +8,7 @@ max_save_count = 10
 
 [model_type]
 embed_dim = 0
-global_pool = 'avg'    # avg, map
+global_pool = ''    # avg, map, token(cls_token)
 
 [distributed]
 horovod = false
@@ -16,12 +16,13 @@ horovod = false
 [train]
 seed = 42
 epochs = 30
-batch_size = 16
+batch_size = 12
 accum_freq = 8
 # drop_path = 0.1
 # grad_clip_norm = null
 time_range = 10 # n years
 time_weight = 0.3
+recon_weight = 1.0
 
 [loss]
 same_class_weight = 0.9
@@ -60,8 +61,8 @@ workers = 8
 [dataset]
 image_size = [224, 224]
 patch_size = 14
-train_aug = "pretrain02"
-valid_aug = "long_max_pad_valid"
+train_aug = "pretrain_global_loacl"
+valid_aug = "simple_center_crop"
 
 [sampler]
 num_postive = [2, 3]

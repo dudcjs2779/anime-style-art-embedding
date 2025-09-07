@@ -70,17 +70,31 @@ def pretrain_collate(batch, mask_ratio_tuple, mask_probability, n_tokens=None, m
     n_samples_masked = int(B * mask_probability)
     probs = torch.linspace(*mask_ratio_tuple, n_samples_masked + 1)
     upperbound = 0
-    masks_list = []
+    
+    masks_list1 = []
     for i in range(0, n_samples_masked):
         prob_min = probs[i]
         prob_max = probs[i + 1]
-        masks_list.append(torch.BoolTensor(mask_generator(int(N * random.uniform(prob_min, prob_max)))))
+        masks_list1.append(torch.BoolTensor(mask_generator(int(N * random.uniform(prob_min, prob_max)))))
         upperbound += int(N * prob_max)
     for i in range(n_samples_masked, B):
-        masks_list.append(torch.BoolTensor(mask_generator(0)))
+        masks_list1.append(torch.BoolTensor(mask_generator(0)))
 
-    random.shuffle(masks_list)
-    
+    random.shuffle(masks_list1)
+
+    masks_list2 = []
+    for i in range(0, n_samples_masked):
+        prob_min = probs[i]
+        prob_max = probs[i + 1]
+        masks_list2.append(torch.BoolTensor(mask_generator(int(N * random.uniform(prob_min, prob_max)))))
+        upperbound += int(N * prob_max)
+    for i in range(n_samples_masked, B):
+        masks_list2.append(torch.BoolTensor(mask_generator(0)))
+        
+    random.shuffle(masks_list2)
+
+    masks_list = masks_list1 + masks_list2
+
     collated_masks = torch.stack(masks_list).flatten(1)
     mask_indices_list = collated_masks.flatten().nonzero().flatten()
     masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]

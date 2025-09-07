@@ -265,3 +265,15 @@ class SigLipLoss(nn.Module):
                 assert False
 
         return {"contrastive_loss": loss} if output_dict else loss
+    
+
+class CosineSimilarityLoss(nn.Module):
+    def __init__(self, dim=-1):
+        super().__init__()
+        self.loss_fn = nn.CosineSimilarity(dim=dim)
+
+    def forward(self, pred, label, mask_weight=None):
+        loss = 1 - self.loss_fn(pred, label)
+        if mask_weight is not None:
+            loss = loss * mask_weight
+        return loss.mean()

@@ -25,7 +25,7 @@ from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset
 from mysrc.utils.optim_utils import make_param_groups
-from mysrc.utils.loss import SigLipLoss
+from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss
 from mysrc.utils.scheduler import CosineScheduler
 from mysrc.utils.precision import get_autocast, get_input_dtype
 from mysrc.model import CustomVisual
@@ -85,7 +85,7 @@ def apply_optim_scheduler(optimizer, lr):
         param_group["lr"] =  lr * lr_multiplier
 
 
-def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scaler, scheduler, tb_writer, args):
+def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, optimizer, scaler, scheduler, tb_writer, args):
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
     model.train()
@@ -94,7 +94,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
-        accum_images1, accum_images2, accum_masks, accum_classes, accum_times, accum_features = [], [], [], [], [], {}
+        accum_images1, accum_images2, accum_masks1, accum_masks2, accum_mask_indices, accum_masks_weight, accum_classes, accum_times, accum_features = [], [], [], [], [], [], [], [], {}
 
     losses_m = {}
     # total_m = AverageMeter()
@@ -112,20 +112,47 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
         images1, images2, masks, classes, times = batch['image1'], batch['image2'], batch['collated_masks'], batch['label'], batch['time']
         images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)
         images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)
-        masks = masks.to(device=device, dtype=input_dtype, non_blocking=True)
+        masks1 = masks[:len(images1)].to(device=device, dtype=input_dtype, non_blocking=True)
+        masks2 = masks[len(images1):].to(device=device, dtype=input_dtype, non_blocking=True)
         classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
         times = times.to(device=device, dtype=input_dtype, non_blocking=True)
+
+        mask_indices_list = batch['mask_indices_list'].to(device=device, non_blocking=True)
+        masks_weight = batch['masks_weight'].to(device=device, dtype=input_dtype, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images1, images2, masks)
+                model_out = model(images1, images2, masks1, masks2)
+                cls_features = {
+                    'image_features1': model_out['im_feat1_masked']['x_clstoken'],
+                    'image_features2': model_out['im_feat2']['x_clstoken'],
+                    'logit_scale': model_out['logit_scale'],
+                    'logit_bias': model_out['logit_bias']
+                }
                 logit_scale = model_out["logit_scale"]
-                losses = clip_loss(**model_out, classes=classes, same_class_weight=args.same_class_weight, 
+                losses = clip_loss(**cls_features, classes=classes, same_class_weight=args.same_class_weight, 
                                    times=times, time_range=args.time_range, time_weight=args.time_weight,
                                    output_dict=True)
+                
+                ## Reconstruction loss
+                # _dim = model_out['im_feat1_masked']["x_clstoken"].shape[-1]
+                # patch_tokens = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                # buffer_tensor_patch_tokens = patch_tokens.new_zeros(upperbound, _dim)
+                # buffer_tensor_patch_tokens[:n_masked_patches].copy_(torch.index_select(patch_tokens.flatten(0, 1), dim=0, index=mask_indices_list))
+
+                output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                
+                output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
+                label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+
+                # loss = cosine_loss(masked_patches, label_patches, masks_weight)
+                loss = args.recon_weight * cosine_loss(masked_patches, label_patches)
+                loss /= args.accum_freq
+                losses['reconstruction_loss'] = loss
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
@@ -135,12 +162,16 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    model_out = model(images1, images2, masks)
+                    model_out = model(images1, images2, masks1, masks2)
+                    cls_features = {
+                        'image_features1': model_out['im_feat1_masked']['x_clstoken'],
+                        'image_features2': model_out['im_feat2']['x_clstoken'],
+                    }
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
 
-                    for key, val in model_out.items():
+                    for key, val in cls_features.items():
                         if key in accum_features:
                             accum_features[key].append(val)
                         else:
@@ -148,7 +179,10 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                     
                 accum_images1.append(images1)
                 accum_images2.append(images2)
-                accum_masks.append(masks)
+                accum_masks1.append(masks1)
+                accum_masks2.append(masks2)
+                accum_mask_indices.append(mask_indices_list)
+                accum_masks_weight.append(masks_weight)
                 accum_classes.append(classes)
                 accum_times.append(times)
 
@@ -166,9 +200,16 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
             for j in range(args.accum_freq):
                 images1 = accum_images1[j]
                 images2 = accum_images2[j]
-                masks = accum_masks[j]
+                masks1 = accum_masks1[j]
+                masks2 = accum_masks2[j]
+                mask_indices_list = accum_mask_indices[j]
+                masks_weight = accum_masks_weight[j]
                 with autocast():
-                    model_out = model(images1, images2, masks)
+                    model_out = model(images1, images2, masks1, masks2)
+                    cls_features = {
+                        'image_features1': model_out['im_feat1_masked']['x_clstoken'],
+                        'image_features2': model_out['im_feat2']['x_clstoken'],
+                    }
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
@@ -178,7 +219,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
                     inputs = {}
                     for key, val in accum_features.items():
                         accumulated = accum_features[key]
-                        inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
+                        inputs[key] = torch.cat(accumulated[:j] + [cls_features[key]] + accumulated[j + 1:])
 
                     losses = clip_loss(**inputs, **inputs_no_accum, classes=accum_classes, same_class_weight=args.same_class_weight, 
                                        times=accum_times, time_range=args.time_range, time_weight=args.time_weight,
@@ -186,6 +227,24 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
 
                     del inputs
                     del inputs_no_accum
+
+                    ## Reconstruction loss
+                    # _dim = model_out['im_feat1_masked']["x_clstoken"].shape[-1]
+                    # patch_tokens = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                    # buffer_tensor_patch_tokens = patch_tokens.new_zeros(upperbound, _dim)
+                    # buffer_tensor_patch_tokens[:n_masked_patches].copy_(torch.index_select(patch_tokens.flatten(0, 1), dim=0, index=mask_indices_list))
+
+                    output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                    masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                    
+                    output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
+                    label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+
+                    # loss = cosine_loss(masked_patches, label_patches, masks_weight)
+                    loss = cosine_loss(masked_patches, label_patches)
+                    loss /= args.accum_freq
+                    losses['reconstruction_loss'] = loss
+
                     total_loss = sum(losses.values())
                     losses["loss"] = total_loss
 
@@ -214,7 +273,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
 
         # reset gradient accum, if enabled
         if args.accum_freq > 1:
-            accum_images1, accum_images2, accum_classes, accum_times, accum_features = [], [], [], [], {}
+            accum_images1, accum_images2, accum_masks1, accum_masks2, accum_mask_indices, accum_masks_weight, accum_classes, accum_times, accum_features = [], [], [], [], [], [], [], [], {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -283,7 +342,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, epoch, optimizer, scal
     # end for
 
 
-def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args):
+def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer, step, args):
     metrics = {}
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
@@ -293,20 +352,26 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args)
         num_samples = 0
         samples_per_val = dataloader.num_samples
 
-        cumulative_loss = 0.0
+        # cumulative_loss = {}
+        losses_m = {}
         all_image_features, all_classes = [], []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images1, images2, images3, classes, times = batch['image1'], batch['image2'], batch['image3'], batch['label'], batch['time']
+                images1, images2, images3, masks, classes, times = batch['image1'], batch['image2'], batch['image3'], batch['collated_masks'], batch['label'], batch['time']
                 images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)   # aug1
                 images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)   # aug2
                 images3 = images3.to(device=device, dtype=input_dtype, non_blocking=True)   # non aug
+                masks1 = masks[:len(images1)].to(device=device, dtype=input_dtype, non_blocking=True)
+                masks2 = masks[len(images1):].to(device=device, dtype=input_dtype, non_blocking=True)
                 classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
                 times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
+                mask_indices_list = batch['mask_indices_list'].to(device=device, non_blocking=True)
+                masks_weight = batch['masks_weight'].to(device=device, dtype=input_dtype, non_blocking=True)
+
                 with autocast():
-                    model_out = model.evaluate(images1, images2, images3)
-                    image_features3 = model_out["image_features3"].clone()
+                    model_out = model.evaluate(images1, images2, images3, masks1, masks2)
+                    image_features3 = model_out["im_feat3"]['x_clstoken'].clone()
                     logit_scale = model_out["logit_scale"]
                     logit_bias = model_out.get('logti_bias', None)
                     
@@ -314,22 +379,39 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args)
                     all_image_features.append(image_features3.cpu())
                     all_classes.append(classes.cpu())
                     losses = clip_loss(
-                        image_features1=model_out["image_features1"], 
-                        image_features2=model_out["image_features2"],
+                        image_features1=model_out['im_feat1']['x_clstoken'], 
+                        image_features2=model_out['im_feat2']['x_clstoken'],
                         logit_scale=model_out["logit_scale"], 
                         logit_bias=model_out.get('logit_bias', None), 
                         classes=classes, 
                         times=times, time_range=args.time_range, time_weight=args.time_weight,
-                        same_class_weight=args.same_class_weight, 
+                        same_class_weight=args.same_class_weight,
+                        output_dict=True
                     )
 
-                cumulative_loss += losses * batch_size
+                    output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                    masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                    
+                    output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
+                    label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+
+                    # loss = cosine_loss(masked_patches, label_patches, masks_weight)
+                    loss = cosine_loss(masked_patches, label_patches)
+                    losses['reconstruction_loss'] = args.recon_weight * loss
+
+                for key, val in losses.items():
+                    if key not in losses_m:
+                        losses_m[key] = AverageMeter()
+                    losses_m[key].update(val.item(), batch_size)
+
+                # cumulative_loss += losses * batch_size
                 num_samples += batch_size
 
                 if is_master(args) and (i % 100) == 0:
                     logging.info(
                         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
-                        f"Clip Loss: {cumulative_loss / num_samples:.6f}\t")
+                        f"Clip Loss: {losses_m['contrastive_loss'].avg:.6f}\t"
+                        f"Recon Loss: {losses_m['reconstruction_loss'].avg:.6f}\t")
             
             if logit_bias:
                 logit_bias = logit_bias.cpu()
@@ -341,14 +423,16 @@ def evaluate(model, device, dataloader, clip_loss, epoch, tb_writer, step, args)
                 logit_bias=logit_bias,
             )
 
-            loss = cumulative_loss / num_samples
-            metrics.update(
-                {**val_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
-            )
+            metrics.update({
+                    **val_metrics, 
+                    "clip_val_loss": losses_m['contrastive_loss'].avg, 
+                    "recon_loss": losses_m['reconstruction_loss'].avg, 
+                    "epoch": epoch, "num_samples": num_samples
+                 })
 
     logging.info(
         f"Eval Epoch: {epoch} "
-        + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in metrics.items()])
+        + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
     )
 
     log_data = {"val/" + name: val for name, val in metrics.items()}
@@ -537,6 +621,8 @@ def main(args):
         dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
     )
 
+    cosine_loss = CosineSimilarityLoss(dim=-1)
+
     if is_master(args):
             defaults = copy.deepcopy(optimizer.defaults)
             defaults['weight_decay'] = args.wd
@@ -594,9 +680,9 @@ def main(args):
     print(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(model, device, train_loader, clip_loss, epoch, optimizer, scaler, scheduler, writer, args)
+        train_one_epoch(model, device, train_loader, clip_loss, cosine_loss, epoch, optimizer, scaler, scheduler, writer, args)
         completed_epoch = epoch + 1
-        metrics = evaluate(model, device, valid_loader, clip_loss, completed_epoch, writer, args.step, args)
+        metrics = evaluate(model, device, valid_loader, clip_loss, cosine_loss, completed_epoch, writer, args.step, args)
 
         checkpoint_dict = {
             "epoch": completed_epoch,
@@ -633,7 +719,7 @@ def main(args):
     if args.wandb and is_master(args):
         wandb.finish()
 
-    logging.info('Finished.')
+        logging.info('Finished.')
 
 
 

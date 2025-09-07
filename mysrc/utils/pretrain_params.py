@@ -140,6 +140,12 @@ def setup_parser():
         default=1.0,
         help="the label to set positive pair except for self."
     )
+    parser.add_argument(
+        "--recon_weight",
+        type= float,
+        default=1.0,
+        help="Reconstruction loss weight."
+    )
 
 
     ## validation
