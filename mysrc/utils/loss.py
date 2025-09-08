@@ -268,6 +268,12 @@ class SigLipLoss(nn.Module):
     
 
 class CosineSimilarityLoss(nn.Module):
+    '''
+    vector-wise하게 pred와 label간의  Cosine Similarity를 계산해 
+    두 vector의 Cosine Similarity가 최대화 되도록 loss를 계산
+    loss가 0에 가까울 수록 pred와 label간의 Cosine Similarity가 높음
+    범위: 0~2
+    '''
     def __init__(self, dim=-1):
         super().__init__()
         self.loss_fn = nn.CosineSimilarity(dim=dim)
