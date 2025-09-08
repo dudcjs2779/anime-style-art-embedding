@@ -107,6 +107,46 @@ def pretrain_collate(batch, mask_ratio_tuple, mask_probability, n_tokens=None, m
 
     return output
 
+def pretrain_collate02(batch, size_per_mask_range, mask_probability, mask_generator=None):
+    output = {}
+    for key in batch[0].keys():
+        output[key] = torch.stack([data[key] for data in batch])
+
+    B = len(output['image1'])
+    n_samples_masked = int(B * mask_probability)
+
+    masks_list1 = []
+    for i in range(0, n_samples_masked):
+        masks_list1.append(torch.BoolTensor(mask_generator(size_per_mask_range=size_per_mask_range)))
+    for i in range(n_samples_masked, B):
+        masks_list1.append(torch.BoolTensor(mask_generator(0)))
+
+    random.shuffle(masks_list1)
+
+    B = len(output['image2'])
+    n_samples_masked = int(B * mask_probability)
+
+    masks_list2 = []
+    for i in range(0, n_samples_masked):
+        masks_list2.append(mask_generator(size_per_mask_range=size_per_mask_range))
+    for i in range(n_samples_masked, B):
+        masks_list2.append(torch.BoolTensor(mask_generator(0)))
+
+    random.shuffle(masks_list2)
+
+    masks_list = masks_list1 + masks_list2
+
+    collated_masks = torch.stack(masks_list).flatten(1)
+    mask_indices_list = collated_masks.flatten().nonzero().flatten()
+    masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
+
+    output['collated_masks'] = collated_masks
+    output['mask_indices_list'] = mask_indices_list
+    output['masks_weight'] = masks_weight
+    output['n_masked_patches'] = torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
+
+    return output
+
 
 def make_pretrain_dataset(args):
     train_df = pd.read_parquet(args.train)
@@ -134,6 +174,49 @@ def make_pretrain_dataset(args):
         mask_ratio_tuple=(0.1, 0.5),
         mask_probability=0.5,
         n_tokens=n_tokens,
+        mask_generator=mask_generator,
+    )
+
+    train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
+    train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
+    train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
+    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    train_loader.num_samples = len(train_dataset)
+    train_loader.num_batches = len(train_loader)
+
+    valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
+    valid_times = torch.tensor(valid_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
+    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans, times=valid_times)
+    valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_loader.num_samples = len(valid_dataset)
+    valid_loader.num_batches = len(valid_loader)
+
+    return train_loader, valid_loader
+
+def make_pretrain_dataset02(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
+
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transforms}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
+
+    mask_generator = CustomMaskingGenerator(
+        input_size=args.image_size[0],
+        patch_size=args.patch_size,
+    )
+
+    collate_fn = partial(
+        pretrain_collate02,
+        size_per_mask_range=args.size_per_mask_range,
+        mask_probability=0.5,
         mask_generator=mask_generator,
     )
 
@@ -867,7 +950,7 @@ class InferDataset(Dataset):
         image = self.test_transforms(image=image)['image']
 
         return Image.fromarray(image)
-    
+
 class MaskingGenerator:
     def __init__(
         self,
@@ -943,5 +1026,46 @@ class MaskingGenerator:
             else:
                 mask_count += delta
 
+        return mask
+
+class CustomMaskingGenerator:
+    '''
+    input_size / patch_size x input_size / patch_size 크기의 유니폼한 마스크 텐서 반환
+
+    Args:
+        size_per_mask_range: 개별 마스크의 크기 범위
+            ex:(1, 3) => 한번에 마스킹 되는 크기가 1x1, 2x2, 3x3 중 랜덤으로 생성
+
+    '''
+    def __init__(
+        self,
+        input_size,
+        patch_size,
+    ):
+        self.input_size = input_size
+        self.n_patches = int(input_size / patch_size)
+        self.patterns = [
+                            [[1, 0], [0, 1]],
+                            [[1, 0], [0, 0]]
+                        ]
+
+    def __call__(self, size_per_mask_range):
+        if size_per_mask_range == 0:
+            return torch.zeros(self.n_patches, self.n_patches, dtype=torch.bool)
+        
+        mask_scale = random.randint(*size_per_mask_range)  # 한번에 마스킹할 최대 patch 크기
+        pattern = torch.tensor(random.choices(self.patterns, weights=[1.0, 1.0], k=1)[0])
+        mask_unit = torch.kron(pattern, torch.ones((mask_scale, mask_scale), dtype=torch.int))    # mask_scale 기준으로 하나의 pattern의 크기를 키움 최대 3x3패치까지 한번에 마스킹
+
+        unit_size = mask_unit.size(0)
+        repeat = math.ceil(self.n_patches / unit_size) + 1   # mask_unit을 n_patches x n_patches보다 크면서 다양한 패턴으로 crop하기 위해 repeat 수를 +1 해줌.
+
+        repeated_mask = mask_unit.repeat(repeat, repeat)    #  mask_unit을 repeat x repeat으로 확장
+
+        # 최대 1 mask_unit 만큼만 움직이면서 crop => 가능한 패턴에 대해서 유니폼한 확률로 crop할 것을 의도
+        left = random.randint(1, unit_size)
+        top = random.randint(1, unit_size)
+
+        mask = repeated_mask[top:top+self.n_patches, left:left+self.n_patches].to(dtype=bool)    # crop
         return mask
     

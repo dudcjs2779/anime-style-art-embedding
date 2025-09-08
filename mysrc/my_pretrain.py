@@ -23,7 +23,7 @@ from sklearn.metrics import silhouette_score
 
 from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
-from mysrc.utils.dataset import make_pretrain_dataset
+from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02
 from mysrc.utils.optim_utils import make_param_groups
 from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss
 from mysrc.utils.scheduler import CosineScheduler
@@ -588,7 +588,8 @@ def main(args):
             scaler = torch.cuda.amp.GradScaler()
 
     print("## Load Dataset")
-    train_loader, valid_loader = make_pretrain_dataset(args)
+    # train_loader, valid_loader = make_pretrain_dataset(args)
+    train_loader, valid_loader = make_pretrain_dataset02(args)
 
     print("## Model Create\n")
     kargs = {
@@ -633,6 +634,10 @@ def main(args):
 
     start_epoch = 0
     if args.resume is not None:
+        logging.info(f"Resume training")
+        logging.info(f"Resume checkpoint: {args.resume}")
+        logging.info(f"wandb run_id: {args.run_id}")
+
         checkpoint = pt_load(args.resume, map_location='cpu')
         if 'epoch' in checkpoint:
             # resuming a train checkpoint w/ epoch and optimizer state
@@ -643,9 +648,13 @@ def main(args):
                 optimizer.load_state_dict(checkpoint["optimizer"])
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
+        
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
+
+        logging.info(f"Resume checkpoint is loaded successfully")
+        logging.info(f"Training begins at epoch {start_epoch}.")
 
 
     if args.tensorboard:
