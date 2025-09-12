@@ -1,12 +1,12 @@
 [model]
-model_name = 'vit_so150m2_patch16_reg1_gap_448.sbb_e200_in12k_ft_in1k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+model_name = 'maxvit_base_tf_384.in21k_ft_in1k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 # name = "MANIQA" #002_CFANet_Res50_koniq
 # precision = 'amp'  # amp, float16
 precision = 'fp16'  # amp, float16
 # resume = 'logs/25-07-28_23-32-50_eva02_base_patch14_448.mim_in22k_ft_in22k_in1k/checkpoint/epoch_16.pt'
-pretrain = 'logs/25-08-22_15-23-01_vit_so150m2_patch16_reg1_gap_448.sbb_e200_in12k_ft/checkpoint/epoch_1.pt'
+pretrain = 'logs/25-09-11_23-00-48_maxvit_base_tf_384.in21k_ft_in1k/checkpoint/epoch_7.pt'
 save_frequency = 1
-# max_save_count = 10
+max_save_count = 10
 
 [train]
 seed = 42
@@ -33,7 +33,7 @@ wandb_project_name = 'quality'  # nkoma-greyscale
 
 [optimizer]
 opt_name = 'adamw'  # adamw, adamw8bit, dadaptation, prodigy
-lr = 6e-6
+lr = 1e-5
 wd = 0.05
 beta1 = 0.9
 beta2 = 0.999
@@ -43,7 +43,7 @@ lr_decay = 1.0  # 0.7, 0.8
 [schaduler]
 sch_name = 'cos'  # cos, cos_restart
 min_lr = 1e-7
-warmup = 0
+warmup = 1500
 cycles = 5
 cycle_multiplier = 1.0
 re_g = 0.9
@@ -54,12 +54,12 @@ train = 'datasets/quality04_processed_640/train_mse_quality_mid16.parquet'
 image_key = 'image'
 target_key = 'mse_label'
 label_json = ''
-workers = 0
+workers = 8
 mos_range = [0, 100]    # [0, 100]  [25, 75]
 balanced_sample = false
 
 [dataset]
-image_size = [448, 448]
+image_size = [384, 384]
 patch_size = 16
 train_aug = "train_preset07"
 valid_aug = "long_max_pad_valid"

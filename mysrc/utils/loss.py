@@ -283,3 +283,18 @@ class CosineSimilarityLoss(nn.Module):
         if mask_weight is not None:
             loss = loss * mask_weight
         return loss.mean()
+    
+
+def mae_loss(pred, label, mask, norm_pix_loss=False):
+    if norm_pix_loss:
+        mean = label.mean(dim=-1, keepdim=True)
+        var = label.var(dim=-1, keepdim=True)
+        label = (label - mean) / (var + 1.e-6)**.5
+
+    loss = ((pred - label) ** 2).mean(dim=-1)
+    loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+
+    return loss
+
+
+

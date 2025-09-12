@@ -63,6 +63,7 @@ def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, block_depth=12):
         or "mask_token" in name
         or "cls_token" in name
         or "reg_token" in name
+        or "decoder_embed" in name
     ):
         depthness = 0
     elif "blocks." in name and "residual." not in name:
@@ -84,9 +85,8 @@ def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier"
     return fused_params_groups.values()
 
 
-def make_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
+def make_param_groups(model, block_depth, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
     param_groups = []
-    block_depth = len(model.visual.blocks)
 
     for name, param in model.named_parameters():
         if not param.requires_grad:

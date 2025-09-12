@@ -194,14 +194,105 @@ class RandomResizedCropWithPad(A.RandomResizedCrop):
         crop = fcrops.crop(img, *crop_coords)
         resize = fgeometric.resize(crop, self.size, self.interpolation)
         return resize
+    
+class RandomResizedCropAutoScale(A.RandomResizedCrop):
+    class InitSchema(BaseTransformInitSchema):  # 스키마가 없으니까 padding이 빨간색으로 표시되는 버그가 발생함.
+        scale: Annotated[tuple[float, float], AfterValidator(check_range_bounds(0, 1)), AfterValidator(nondecreasing)]
+        ratio: Annotated[
+            tuple[float, float],
+            AfterValidator(check_range_bounds(0, None)),
+            AfterValidator(nondecreasing),
+        ]
+        size: Annotated[tuple[int, int], AfterValidator(check_range_bounds(1, None))]
+        interpolation: InterpolationType
+        mask_interpolation: InterpolationType
 
+    def __init__(
+        self,
+        size: tuple[int, int],
+        scale: tuple[float, float] = (0.08, 1.0),
+        ratio: tuple[float, float] = (0.75, 1.3333333333333333),
+        interpolation: int = cv2.INTER_LINEAR,
+        mask_interpolation: int = cv2.INTER_NEAREST,
+        p: float = 1.0,
+    ):
+        super().__init__(
+            size=size,
+            interpolation=interpolation,
+            mask_interpolation=mask_interpolation,
+            p=p,
+        )
+        self.scale = scale
+        self.ratio = ratio
+
+    def get_params_dependent_on_data(
+        self,
+        params: dict[str, Any],
+        data: dict[str, Any],
+    ) -> dict[str, tuple[int, int, int, int]]:
+        image_shape = params["shape"][:2]
+        image_height, image_width = image_shape
+
+        max_scale = min(image_height, image_width) / max(image_height, image_width)
+        self.scale = (self.scale[0], math.ceil(max_scale*100) / 100)
+        
+        area = image_height * image_width
+
+        for _ in range(10):
+            target_area = self.py_random.uniform(*self.scale) * area
+            log_ratio = (math.log(self.ratio[0]), math.log(self.ratio[1]))
+            aspect_ratio = math.exp(self.py_random.uniform(*log_ratio))
+
+            width = int(round(math.sqrt(target_area * aspect_ratio)))
+            height = int(round(math.sqrt(target_area / aspect_ratio)))
+
+            if 0 < width <= image_width and 0 < height <= image_height:
+                i = self.py_random.randint(0, image_height - height)
+                j = self.py_random.randint(0, image_width - width)
+
+                h_start = i * 1.0 / (image_height - height + 1e-10)
+                w_start = j * 1.0 / (image_width - width + 1e-10)
+
+                crop_shape = (height, width)
+
+                crop_coords = fcrops.get_crop_coords(image_shape, crop_shape, h_start, w_start)
+
+                return {"crop_coords": crop_coords}
+
+        # Fallback to central crop
+        in_ratio = image_width / image_height
+        if in_ratio < min(self.ratio):
+            width = image_width
+            height = int(round(image_width / min(self.ratio)))
+        elif in_ratio > max(self.ratio):
+            height = image_height
+            width = int(round(height * max(self.ratio)))
+        else:  # whole image
+            width = image_width
+            height = image_height
+
+        i = (image_height - height) // 2
+        j = (image_width - width) // 2
+
+        h_start = i * 1.0 / (image_height - height + 1e-10)
+        w_start = j * 1.0 / (image_width - width + 1e-10)
+
+        crop_shape = (height, width)
+
+        crop_coords = fcrops.get_crop_coords(image_shape, crop_shape, h_start, w_start)
+
+        return {"crop_coords": crop_coords}
+    
 
 def list_preset():
     return preset_list
 
-def get_preset(preset_name, image_size=[448, 448]):
-    mean = [0.6938988, 0.6323308, 0.6300056] 
-    std = [0.3098821,  0.31194064, 0.30595565]
+def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
+    if mean is None:
+        mean = [0.6938988, 0.6323308, 0.6300056] 
+    if std is None:
+        std = [0.3098821,  0.31194064, 0.30595565]
+
     w, h = image_size
 
     if preset_name == "simple_center_crop":
@@ -209,6 +300,19 @@ def get_preset(preset_name, image_size=[448, 448]):
             A.SmallestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_AREA),
             A.CenterCrop(h, w),
             A.Normalize(mean=mean, std=std, max_pixel_value=255),
+            ToTensorV2(),
+        ])
+
+    elif preset_name == "RandomResizedCropWithPad":
+        transforms = A.Compose([
+            RandomResizedCropWithPad(
+                    size=[h, w],
+                    scale=[0.5, 1.0],
+                    ratio=[1.0, 1.0],
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=255,
+                    p=1.0),
             ToTensorV2(),
         ])
 
@@ -795,15 +899,15 @@ def get_preset(preset_name, image_size=[448, 448]):
 
             A.OneOf([
                 A.Compose([
-                    A.LongestMaxSize(max_size=max(448, 448), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
-                    A.PadIfNeeded(min_height=448, min_width=448, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
+                    A.LongestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
+                    A.PadIfNeeded(min_height=h, min_width=w, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
                 ], p=0.2),
 
                 A.Compose([
-                    A.LongestMaxSize(max_size=max(640, 640), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
-                    A.PadIfNeeded(min_height=640, min_width=640, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
-                    A.RandomScale(scale_limit=[-0.3, 0.0], interpolation=cv2.INTER_CUBIC, p=1.0),
-                    A.RandomCrop(448, 448, border_mode=cv2.BORDER_CONSTANT, p=1.0),
+                    A.LongestMaxSize(max_size=max(540, 540), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
+                    A.PadIfNeeded(min_height=540, min_width=540, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
+                    A.RandomScale(scale_limit=[-0.28, 0.0], interpolation=cv2.INTER_CUBIC, p=1.0),
+                    A.RandomCrop(h, w, border_mode=cv2.BORDER_CONSTANT, p=1.0),
                 ], p=0.8),
             ], p=1.0),
 
@@ -1463,6 +1567,111 @@ def get_preset(preset_name, image_size=[448, 448]):
         transforms1 = A.Compose([crop1, aug_trans1, end_trans])
         transforms2 = A.Compose([crop2, aug_trans2, end_trans])
         transforms = {"trans1": transforms1, "trans2": transforms2}
+
+    elif preset_name == "mae_pretrain":
+
+        transforms = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.1),
+            A.RandomRotate90(p=0.4),
+            A.Rotate(limit=(-15, 15), p=0.5, border_mode=cv2.BORDER_CONSTANT, fill=[255, 255, 255]),
+
+            A.OneOf([
+                RandomResizedCropWithPad(
+                    size=[h, w],
+                    scale=[0.3, 1.0],
+                    ratio=[0.75, 1.3333333333333333],
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=255,
+                    p=0.6),
+
+                RandomResizedCropAutoScale(
+                    size=[h, w],
+                    scale=[0.03, 0.3],
+                    ratio=[0.75, 1.3333333333333333],
+                    interpolation=cv2.INTER_CUBIC,
+                    p=0.4),
+            ], p=1.0),
+
+            A.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.2,
+                hue=0.2,
+                p=0.7
+            ),
+
+            A.RGBShift(
+                r_shift_limit=[-20, 20],
+                g_shift_limit=[-20, 20],
+                b_shift_limit=[-20, 20],
+                p=0.5
+            ),
+
+            A.ToGray(p=0.2),
+
+            A.OneOf([
+                A.Compose([
+                    A.AdditiveNoise(
+                        noise_type="gaussian",
+                        spatial_mode="shared",
+                        noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
+                        approximation=0.8,
+                        p=0.6
+                    ),
+
+                    A.OneOf([
+                        A.AdvancedBlur(
+                            blur_limit=[5, 15],
+                            sigma_x_limit=[0.5, 2.2],
+                            sigma_y_limit=[0.5, 2.2],
+                            rotate_limit=[-90, 90],
+                            beta_limit=[0.5, 8.0],
+                            noise_limit=[0.75, 1.25],
+                            p=0.5
+                        ),
+                        A.GaussianBlur(
+                            blur_limit=0,
+                            sigma_limit=[0.5, 2.0],
+                            p=0.5
+                        ),
+                    ], p=0.6),
+                ], p=0.8),
+
+                A.Compose([
+                    A.AdditiveNoise(
+                        noise_type="gaussian",
+                        spatial_mode="shared",
+                        noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
+                        approximation=0.8,
+                        p=0.2
+                    ),
+
+                    A.OneOf([
+                        A.AdvancedBlur(
+                            blur_limit=[5, 15],
+                            sigma_x_limit=[0.5, 2.2],
+                            sigma_y_limit=[0.5, 2.2],
+                            rotate_limit=[-90, 90],
+                            beta_limit=[0.5, 8.0],
+                            noise_limit=[0.75, 1.25],
+                            p=0.5
+                        ),
+                        A.GaussianBlur(
+                            blur_limit=0,
+                            sigma_limit=[0.5, 2.0],
+                            p=0.5
+                        ),
+                    ], p=0.2),
+
+                    A.Solarize([0.0, 0.7], p=0.9),
+                ], p=0.2)
+            ]),
+
+            A.Normalize(mean=mean, std=std, max_pixel_value=255),
+            ToTensorV2(),
+        ])
 
     return transforms
 

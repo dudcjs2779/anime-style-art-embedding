@@ -138,14 +138,41 @@ def pretrain_collate02(batch, size_per_mask_range, mask_probability, mask_genera
 
     collated_masks = torch.stack(masks_list).flatten(1)
     mask_indices_list = collated_masks.flatten().nonzero().flatten()
+    none_mask_indices_list = (collated_masks == False).flatten().nonzero().flatten()
     masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
 
     output['collated_masks'] = collated_masks
     output['mask_indices_list'] = mask_indices_list
+    output['none_mask_indices_list'] = none_mask_indices_list
     output['masks_weight'] = masks_weight
     output['n_masked_patches'] = torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
 
     return output
+
+def make_mae_dataset(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
+
+    transform = get_preset(args.train_aug, image_size=[224, 224], mean=[0.70843786, 0.65038896, 0.6473464 ], std=[0.25763473, 0.26254627, 0.25369588])
+    valid_trans = get_preset(args.valid_aug, image_size=[224, 224], mean=[0.70843786, 0.65038896, 0.6473464 ], std=[0.25763473, 0.26254627, 0.25369588])
+
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transform}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
+
+
+    train_dataset = NoLabelDataset(train_df.image.tolist(), transforms=transform)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
+    train_loader.num_samples = len(train_dataset)
+    train_loader.num_batches = len(train_loader)
+
+    valid_dataset = NoLabelDataset(valid_df.image.tolist(), transforms=transform)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, num_workers=args.workers, drop_last=False)
+    valid_loader.num_samples = len(valid_dataset)
+    valid_loader.num_batches = len(valid_loader)
+
+    return train_loader, valid_loader
 
 
 def make_pretrain_dataset(args):
@@ -237,7 +264,6 @@ def make_pretrain_dataset02(args):
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
-
 
 def make_dataset(args):
     df = pd.read_parquet(args.train)
@@ -603,9 +629,10 @@ def remove_normalize_and_totensor(transforms: A.Compose) -> A.Compose:
 
 
 class TrainDataset(Dataset):
-    def __init__(self, images, labels, transforms):
+    def __init__(self, images, labels=None, transforms=None):
         self.images = images
-        self.labels = labels
+        if labels is None:
+            self.labels = None
         self.transforms = transforms
         self.test_transforms = exclude_norm_totensor(transforms)
 
@@ -616,7 +643,8 @@ class TrainDataset(Dataset):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = self.transforms(image=image)['image']
-        label = self.labels[idx]
+        if self.labels is None:
+            label = None
         
         return image, label
     
@@ -640,7 +668,21 @@ class TrainDataset(Dataset):
 
         return Image.fromarray(image)
     
+class NoLabelDataset(TrainDataset):
+    def __init__(self, images, transforms=None):
+        self.images = images
+        self.transforms = transforms
+        self.test_transforms = exclude_norm_totensor(transforms)
 
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = self.transforms(image=image)['image']
+        
+        return image
     
 
 class MLDataset(Dataset):

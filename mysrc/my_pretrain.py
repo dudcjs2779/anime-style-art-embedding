@@ -229,11 +229,6 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                     del inputs_no_accum
 
                     ## Reconstruction loss
-                    # _dim = model_out['im_feat1_masked']["x_clstoken"].shape[-1]
-                    # patch_tokens = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
-                    # buffer_tensor_patch_tokens = patch_tokens.new_zeros(upperbound, _dim)
-                    # buffer_tensor_patch_tokens[:n_masked_patches].copy_(torch.index_select(patch_tokens.flatten(0, 1), dim=0, index=mask_indices_list))
-
                     output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
                     masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
                     
@@ -607,7 +602,8 @@ def main(args):
             val = getattr(args, name)
             logging.info(f"  {name}: {val}")
 
-    params_group = make_param_groups(model, args.lr_decay, args.patch_embed_lr_mult)
+    block_depth = len(model.visual.blocks)
+    params_group = make_param_groups(model, block_depth, args.lr_decay, args.patch_embed_lr_mult)
     if args.opt_name == "adamw8bit":
         from bitsandbytes.optim import AdamW8bit
         optimizer = AdamW8bit(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16 학습을 위함
@@ -625,12 +621,12 @@ def main(args):
     cosine_loss = CosineSimilarityLoss(dim=-1)
 
     if is_master(args):
-            defaults = copy.deepcopy(optimizer.defaults)
-            defaults['weight_decay'] = args.wd
-            defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
-            logging.info(
-                f'Created {type(optimizer).__name__} ({args.opt_name}) optimizer: {defaults}'
-            )
+        defaults = copy.deepcopy(optimizer.defaults)
+        defaults['weight_decay'] = args.wd
+        defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
+        logging.info(
+            f'Created {type(optimizer).__name__} ({args.opt_name}) optimizer: {defaults}'
+        )
 
     start_epoch = 0
     if args.resume is not None:
@@ -729,8 +725,6 @@ def main(args):
         wandb.finish()
 
         logging.info('Finished.')
-
-
 
 
 if __name__ == "__main__":
