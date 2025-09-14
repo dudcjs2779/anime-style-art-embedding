@@ -85,24 +85,37 @@ def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier"
     return fused_params_groups.values()
 
 
-def make_param_groups(model, block_depth, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
+def make_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
     param_groups = []
 
+    block_depth = len(model.visual.blocks)
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        decay_rate = get_vit_lr_decay_rate(name, lr_decay_rate, block_depth)
+        if name.startswith("visual."):
+            decay_rate = get_vit_lr_decay_rate(name, lr_decay_rate, block_depth)
 
-        d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
+            d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
 
-        if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
-            d.update({"wd_multiplier": 0.0})
+            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+                d.update({"wd_multiplier": 0.0})
 
-        if "patch_embed" in name:
-            d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            if "patch_embed" in name:
+                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            
+            param_groups.append(d)
         
-        param_groups.append(d)
+        else:
+            d = {"params": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
+
+            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+                d.update({"wd_multiplier": 0.0})
+
+            if "patch_embed" in name:
+                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            
+            param_groups.append(d)
 
     param_groups = fuse_params_groups(param_groups)
     for g in param_groups:

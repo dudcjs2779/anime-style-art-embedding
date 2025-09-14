@@ -139,11 +139,14 @@ def pretrain_collate02(batch, size_per_mask_range, mask_probability, mask_genera
     collated_masks = torch.stack(masks_list).flatten(1)
     mask_indices_list = collated_masks.flatten().nonzero().flatten()
     none_mask_indices_list = (collated_masks == False).flatten().nonzero().flatten()
-    masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
+    masks_weight = collated_masks.sum(-1)
+    mask_sample_indices = masks_weight.nonzero().flatten()
+    masks_weight = (1 / masks_weight.clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
 
     output['collated_masks'] = collated_masks
     output['mask_indices_list'] = mask_indices_list
     output['none_mask_indices_list'] = none_mask_indices_list
+    output['mask_sample_indices'] = mask_sample_indices
     output['masks_weight'] = masks_weight
     output['n_masked_patches'] = torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
 

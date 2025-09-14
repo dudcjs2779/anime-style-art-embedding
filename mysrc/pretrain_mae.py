@@ -130,7 +130,6 @@ def train_one_epoch(model, device, dataloader, epoch, optimizer, scaler, schedul
     
         backward(loss, scaler)
 
-
         if ((i+1) % args.accum_freq) == 0:
             if scaler is not None:
                 if args.horovod:
@@ -300,9 +299,14 @@ def main(args):
         except (AttributeError, TypeError) as e:
             scaler = torch.cuda.amp.GradScaler()
     
-    backbonre = timm.create_model(args.model_name, pretrained=True)
-    model = MAE(backbonre).to(device)
-    load_pretrain(model, args.pretrain)
+    kargs = {
+        'num_classes': args.embed_dim,
+        "global_pool": args.global_pool,
+    }
+    model = MAE(args.model_name, args.decoder_name, encoder_kargs=kargs).to(device)
+    
+    if args.pretrain is not None:
+        load_pretrain(model, args.pretrain)
 
     logging.info("Model:")
     logging.info(f"{str(model)}")
@@ -315,7 +319,7 @@ def main(args):
 
     # Optimizer
     
-    params_group = make_param_groups(model, len(backbonre.blocks), args.lr_decay, args.patch_embed_lr_mult)
+    params_group = make_param_groups(model, args.lr_decay, args.patch_embed_lr_mult)
     optimizer = torch.optim.AdamW(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)
     defaults = copy.deepcopy(optimizer.defaults)
     defaults['weight_decay'] = args.wd

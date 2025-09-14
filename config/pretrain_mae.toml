@@ -2,13 +2,16 @@
 model_name = 'eva02_base_patch14_224.mim_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 precision = 'amp'  # amp, float16
 # resume = 'logs/25-09-07_20-49-47_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_7.pt'
-pretrain = 'mae_logs/25-09-11_16-59-02_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_13.pt'
+# pretrain = 'mae_logs/25-09-11_16-59-02_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_13.pt'
 save_frequency = 1
 max_save_count = 10
 
 [model_type]
 embed_dim = 0
 global_pool = ''    # avg, map, token(cls_token)
+
+[decoder]
+decoder_name = "vit_decoder"
 
 [distributed]
 horovod = false
@@ -17,7 +20,7 @@ horovod = false
 seed = 42
 epochs = 30
 batch_size = 32
-accum_freq = 32
+accum_freq = 1
 norm_pix_loss = false
 grad_clip_norm = 1.0
 
@@ -45,7 +48,7 @@ warmup = 10
 train = 'datasets/pretrain01_640/train01.parquet'
 valid = 'datasets/pretrain01_640/valid01.parquet'
 image_key = 'image'
-workers = 8
+workers = 0
 
 [dataset]
 image_size = [224, 224]

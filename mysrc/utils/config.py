@@ -72,9 +72,9 @@ def read_config_ipynb(parser, config_path):
         if not isinstance(section_dict, dict):
             config_dict[section_name] = section_dict
             continue
-
-        if section_name == "network":
-            config_dict['network'] = section_dict
+        
+        if section_name in ['decoder_type']:
+            config_dict[section_name] = section_dict
             continue
 
         for key, value in section_dict.items():

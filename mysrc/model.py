@@ -10,7 +10,6 @@ from timm.models.vision_transformer import Block
 from timm.models._manipulate import checkpoint
 from timm.models._builder import load_pretrained, resolve_pretrained_cfg
 from timm.layers import LayerNorm, Mlp, GluMlp, SwiGLU
-from timm.models.layers import trunc_normal_
 
 class CustomEva(Eva):
     def __init__(
@@ -76,6 +75,7 @@ class CustomEva(Eva):
             x = torch.where(mask.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
 
         x, rot_pos_embed = self._pos_embed(x)
+        self.rot = rot_pos_embed
         x = self.norm_pre(x)
 
         if getattr(self, 'rope_mixed', False) and rot_pos_embed is not None:
@@ -227,34 +227,44 @@ class CustomVisual(nn.Module):
             return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp(), self.logit_bias
         return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp()
 
-
-class MAEDecoder(nn.Module):
+class EvaDecoder(nn.Module):
     def __init__(
-            self,
+            self, 
+            patch_size, 
+            num_patches, 
             in_chans,
-            patch_size,
-            num_patches,
-            num_prefix_tokens,
             encoder_dim, 
-            decoder_dim=512, 
-            depth=8, 
-            num_heads=16, 
-            mlp_ratio=4., 
-            norm_layer=nn.LayerNorm, 
+            decoder_dim, 
+            depth,
+            num_heads, 
+            mlp_ratio, 
+            qkv_bias,
+            swiglu_mlp,
+            scale_mlp,
+            norm_layer=nn.LayerNorm,
+            rope=None,
+            **kargs
         ):
         super().__init__()
         self.patch_size = patch_size
-        self.num_prefix_tokens = num_prefix_tokens
         self.decoder_embed = nn.Linear(encoder_dim, decoder_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + num_prefix_tokens, decoder_dim))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_dim), requires_grad=True)
+        self.rope = rope
         self.decoder_blocks = nn.ModuleList([
-            Block(decoder_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
-            for i in range(depth)])
-        
+            EvaBlock(
+                decoder_dim, 
+                num_heads, 
+                mlp_ratio=mlp_ratio, 
+                swiglu_mlp=swiglu_mlp,
+                scale_mlp=scale_mlp, 
+                qkv_bias=qkv_bias, 
+                norm_layer=norm_layer
+            )
+            for _ in range(depth)
+        ])
         self.decoder_norm = norm_layer(decoder_dim)
-        self.decoder_pred = nn.Linear(decoder_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
-
+        self.decoder_pred = nn.Linear(decoder_dim, patch_size**2 * in_chans, bias=True)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -265,7 +275,6 @@ class MAEDecoder(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        # nn.Linear, nn.LayerNorm 초기화는 여기서
         if isinstance(m, nn.Linear):
             # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
@@ -303,31 +312,23 @@ class MAEDecoder(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
         return imgs
 
-    # 코드 확인 필요!!!
-    def forward(self, x, mask, mask_indices_list, none_mask_indices_list):
-        B, N, D = x.shape   # B N D
+    def forward(self, x):
+        x = self.decoder_embed(x)
+        
+        rope = self.rope.get_embed()
 
-        x_keep = torch.index_select(x[:, self.num_prefix_tokens:, :].flatten(0, 1), dim=0, index=none_mask_indices_list)   # B N D => BN' D
-        x_keep = torch.cat((x[:, :self.num_prefix_tokens, :].flatten(0, 1), x_keep), dim=0)
-        x_keep = self.decoder_embed(x_keep) # BN' D'
-
-        # 패치들의 원래 위치 복원 및 마스킹
-        x_ordered = torch.zeros((B * N, x_keep.shape[-1]), device=x_keep.device, dtype=x_keep.dtype) # BN D'
-        x_ordered[none_mask_indices_list] = x_keep[B * self.num_prefix_tokens:, :]
-        x_ordered[mask_indices_list] = self.mask_token.to(dtype=x_keep.dtype)
-        x_ordered = torch.cat((x_keep[:B * self.num_prefix_tokens, :], x_ordered), dim=0)
-
-        x = x_ordered.view(B, N, -1)    # BN D' => B N D'
         x = x + self.decoder_pos_embed
-
         for blk in self.decoder_blocks:
-            x = blk(x)
-
+            x = blk(x, rope)
         x = self.decoder_norm(x)
+
+        # predictor projection
         x = self.decoder_pred(x)
 
-        return x
+        # remove cls token
+        x = x[:, 1:, :]
 
+        return x
 
 class EmbeddingHead(nn.Module):
     def __init__(
@@ -387,17 +388,19 @@ class EmbeddingHead(nn.Module):
             nn.init.constant_(self.norm.bias, 0)
             nn.init.constant_(self.norm.weight, 1.0)
             
-    def forward(self, x):
+    def forward(self, x, normalize=True):
         for mlp in self.mlps:
             x = mlp(x)
         x = self.norm(x)
-        return x
+
+        return F.normalize(x, dim=-1) if normalize else x
 
 
 class CustomMaeVisual(nn.Module):
     def __init__(
             self,
             model_name: str,
+            decoder_name: str,
             model_kargs: dict = {},
             decoder_kargs: dict = {},
             embed_head_kargs: dict = {},
@@ -417,13 +420,20 @@ class CustomMaeVisual(nn.Module):
         else:
             self.logit_bias = None
 
-        decoder_kargs['img_size'] = visual_args['img_size']
-        decoder_kargs['in_chans'] = self.visual.patch_embed.proj.in_channels
+        # decoder_kargs['img_size'] = visual_args['img_size']
+        # decoder_kargs['in_chans'] = self.visual.patch_embed.proj.in_channels
+        # decoder_kargs['patch_size'] = visual_args['patch_size']
+        # decoder_kargs['encoder_dim'] = visual_args['embed_dim']
+        # decoder_kargs['num_patches'] = self.visual.patch_embed.num_patches
+        # decoder_kargs['num_prefix_tokens'] = self.visual.num_prefix_tokens
+        # self.mae_decoder = mae_vit_base_decoder(**decoder_kargs)
+
         decoder_kargs['patch_size'] = visual_args['patch_size']
+        decoder_kargs['in_chans'] = self.visual.patch_embed.proj.in_channels
         decoder_kargs['encoder_dim'] = visual_args['embed_dim']
         decoder_kargs['num_patches'] = self.visual.patch_embed.num_patches
-        decoder_kargs['num_prefix_tokens'] = self.visual.num_prefix_tokens
-        self.mae_decoder = mae_vit_base_decoder(**decoder_kargs)
+        decoder_kargs['rope'] = self.visual.rope
+        self.decoder = create_decoder(decoder_name, decoder_kargs)
 
         embed_head_kargs['dim'] = visual_args['embed_dim']
         embed_head_kargs['mlp_ratio'] = visual_args['mlp_ratio']
@@ -435,34 +445,40 @@ class CustomMaeVisual(nn.Module):
 
     def encode_image(self, image, mask=None, normalize: bool = False):
         features = self.visual(image, mask)
-
-        if isinstance(features, dict):
-            if normalize:
-                features['x_clstoken'] = F.normalize(features['x_clstoken'], dim=-1)
-                features['x_patchtokens'] = F.normalize(features['x_patchtokens'], dim=-1)
-                return features
-            
         return F.normalize(features, dim=-1) if normalize else features
     
     def inference(
             self,
             image: Optional[torch.Tensor] = None,
             normalize: bool = True,
+            mask=None,
     ):
-        image_features = self.encode_image(image, normalize=normalize) if image is not None else None
+        image_features = self.encode_image(image, normalize=False) if image is not None else None
+
+        if mask is not None:
+            pred = self.decoder(image_features)
+
+        image_features = self.embed_head(image_features, normalize=normalize)
 
         if self.output_dict:
             out_dict = {
-                "image_features": image_features,
+                "im_feat_cls": image_features[:, 0],
+                "im_feat_patches": image_features[:, self.visual.num_prefix_tokens:],
                 "logit_scale": self.logit_scale.exp()
             }
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
+
+            if mask is not None:
+                out_dict['pred'] = pred
+                out_dict['mask'] = mask
             return out_dict
 
         if self.logit_bias is not None:
             return image_features, self.logit_scale.exp(), self.logit_bias
+        
         return image_features, self.logit_scale.exp()
+   
     
     def evaluate(
             self,
@@ -473,20 +489,21 @@ class CustomMaeVisual(nn.Module):
             mask2: Optional[torch.Tensor] = None,
             mask_indices_list = None,
             none_mask_indices_list = None,
+            mask_sample_indices=None,
     ):
-        im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
-        im_feat3 = self.encode_image(image3, normalize=True) if image3 is not None else None
+        im_feat1 = self.encode_image(image1, normalize=False) if image1 is not None else None
+        im_feat2 = self.encode_image(image2, normalize=False) if image2 is not None else None
+        im_feat3 = self.encode_image(image3, normalize=False) if image3 is not None else None
 
-        cat_patches = torch.concat((im_feat1[:, self.visual.num_prefix_tokens:], im_feat2[:, self.visual.num_prefix_tokens:]), dim=0)
-        cat_mask = torch.concat((mask1, mask2), dim=0)
 
-        if mask_indices_list is not None:
-            pred = self.mae_decoder(cat_patches, cat_mask, mask_indices_list, none_mask_indices_list)
+        if mask_sample_indices is not None:
+            cat_patches = torch.concat((im_feat1, im_feat2), dim=0)[mask_sample_indices]
+            cat_mask = torch.concat((mask1, mask2), dim=0)[mask_sample_indices]
+            pred = self.decoder(cat_patches)
 
-        im_feat1 = self.embed_head(im_feat1)
-        im_feat2 = self.embed_head(im_feat2)
-        im_feat3 = self.embed_head(im_feat3)
+        im_feat1 = self.embed_head(im_feat1, normalize=True)
+        im_feat2 = self.embed_head(im_feat2, normalize=True)
+        im_feat3 = self.embed_head(im_feat3, normalize=True)
 
         if self.output_dict:
             out_dict = {
@@ -501,7 +518,7 @@ class CustomMaeVisual(nn.Module):
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
 
-            if mask_indices_list is not None:
+            if mask_sample_indices is not None:
                 out_dict['pred'] = pred
                 out_dict['mask'] = cat_mask
 
@@ -519,34 +536,38 @@ class CustomMaeVisual(nn.Module):
             mask2: Optional[torch.Tensor] = None,
             mask_indices_list = None,
             none_mask_indices_list = None,
+            mask_sample_indices = None,
     ):
-        im_feat1 = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
+        im_feat1 = self.encode_image(image1, mask1, normalize=False) if image1 is not None else None
+        im_feat2 = self.encode_image(image2, mask2, normalize=False) if image2 is not None else None
         # im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
         # im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
         # im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
         # im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
 
-        # cat_patches = torch.concat((im_feat1[:, self.visual.num_prefix_tokens:], im_feat2[:, self.visual.num_prefix_tokens:]), dim=0)
-        # cat_masked_patches = torch.concat((im_feat1_masked[:, self.visual.num_prefix_tokens:], im_feat2_masked[:, self.visual.num_prefix_tokens:]), dim=0)
-        
-        # if mask_indices_list is not None:
-        #     label_patches = torch.index_select(cat_patches.flatten(0, 1), dim=0, index=mask_indices_list)
-        #     masked_patches = torch.index_select(cat_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+        # cat_patches = torch.concat((im_feat1[:, self.visual.num_prefix_tokens:], im_feat2[:, self.visual.num_prefix_tokens:]), dim=0)[mask_sample_indices]
+        # cat_masked_patches = torch.concat((im_feat1_masked[:, self.visual.num_prefix_tokens:], im_feat2_masked[:, self.visual.num_prefix_tokens:]), dim=0)[mask_sample_indices]
+        # cat_mask = torch.concat((mask1, mask2), dim=0)[mask_sample_indices]
 
-        #     _label_patches = torch.index_select(cat_patches.flatten(0, 1), dim=0, index=none_mask_indices_list)
-        #     _masked_patches = torch.index_select(cat_masked_patches.flatten(0, 1), dim=0, index=none_mask_indices_list)
+        # if mask_sample_indices is not None:
+        #     breakpoint()
+        #     label_patches = cat_patches[cat_mask]
+        #     masked_patches = cat_masked_patches[cat_mask]
+
+        #     _label_patches = cat_masked_patches[cat_mask==0]
+        #     _masked_patches = cat_masked_patches[cat_mask==0]
+
         #     masked_patches @ label_patches.T
         #     _masked_patches @ _label_patches.T
 
-        cat_feates = torch.concat((im_feat1, im_feat2), dim=0)
-        cat_mask = torch.concat((mask1, mask2), dim=0)
+        if mask_sample_indices is not None:
+            cat_patches = torch.concat((im_feat1, im_feat2), dim=0)[mask_sample_indices]
+            cat_mask = torch.concat((mask1, mask2), dim=0)[mask_sample_indices]
 
-        if mask_indices_list is not None:
-            pred = self.mae_decoder(cat_feates, cat_mask, mask_indices_list, none_mask_indices_list)
+            pred = self.decoder(cat_patches)
 
-        im_feat1 = self.embed_head(im_feat1)
-        im_feat2 = self.embed_head(im_feat2)
+        im_feat1 = self.embed_head(im_feat1, normalize=True)
+        im_feat2 = self.embed_head(im_feat2, normalize=True)
 
         if self.output_dict:
             out_dict = {
@@ -560,7 +581,7 @@ class CustomMaeVisual(nn.Module):
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
 
-            if mask_indices_list is not None:
+            if mask_sample_indices is not None:
                 out_dict['pred'] = pred
                 out_dict['mask'] = cat_mask
 
@@ -618,18 +639,23 @@ def eva02_base_patch14_224(pretrained: bool = False, **kwargs) -> CustomEva:
     )
     return model, model_args
 
+def create_decoder(name, kwargs):
+    model = globals()[name](kwargs)
 
-def mae_vit_base_decoder(**kwargs):
+    return model
 
+def eva_decoder(kwargs):
     model_args = dict(
-        decoder_dim=512,
-        num_heads=16,
-        mlp_ratio=4.,
+        decoder_dim=768,
         depth=8,
+        num_heads=12,
+        qkv_fused=False,
+        qkv_bias = True,
+        mlp_ratio=4 * 2 / 3,
+        swiglu_mlp=True,
+        scale_mlp=True,
     )
-    model_args.update(kwargs)
-    model = MAEDecoder(**model_args)
 
-    checkpoint = torch.load("pretrain/mae_pretrain_vit_base.pth")
-    
+    model_args.update(kwargs)
+    model = EvaDecoder(**model_args)
     return model
