@@ -42,8 +42,8 @@ def read_config(args: argparse.Namespace, parser: argparse.ArgumentParser):
             config_dict[section_name] = section_dict
             continue
 
-        if section_name == "network":
-            config_dict['network'] = section_dict
+        if section_name in ['model_type']:
+            config_dict[section_name] = section_dict
             continue
 
         for key, value in section_dict.items():
@@ -73,7 +73,7 @@ def read_config_ipynb(parser, config_path):
             config_dict[section_name] = section_dict
             continue
         
-        if section_name in ['decoder_type']:
+        if section_name in ['model_type']:
             config_dict[section_name] = section_dict
             continue
 

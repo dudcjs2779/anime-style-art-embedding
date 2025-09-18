@@ -107,48 +107,64 @@ def pretrain_collate(batch, mask_ratio_tuple, mask_probability, n_tokens=None, m
 
     return output
 
-def pretrain_collate02(batch, size_per_mask_range, mask_probability, mask_generator=None):
+def pretrain_collate02(batch, patch_size, size_per_mask_range, mask_probability, mask_generator=None):
     output = {}
     for key in batch[0].keys():
         output[key] = torch.stack([data[key] for data in batch])
 
-    B = len(output['image1'])
+    if output['image2'].dim() == 5:
+        output['image2'] = output['image2'].reshape(-1, *output['image2'].shape[2:])
+
+    B, C, H, W = output['image1'].shape
     n_samples_masked = int(B * mask_probability)
 
-    masks_list1 = []
+    global_crop_masks = []
     for i in range(0, n_samples_masked):
-        masks_list1.append(torch.BoolTensor(mask_generator(size_per_mask_range=size_per_mask_range)))
+        global_crop_masks.append(torch.BoolTensor(mask_generator(H, patch_size, size_per_mask_range)))
     for i in range(n_samples_masked, B):
-        masks_list1.append(torch.BoolTensor(mask_generator(0)))
+        global_crop_masks.append(torch.BoolTensor(mask_generator(H, patch_size, 0)))
 
-    random.shuffle(masks_list1)
+    # random.shuffle(global_crop_masks)
 
-    B = len(output['image2'])
+    B, C, H, W = output['image2'].shape
     n_samples_masked = int(B * mask_probability)
 
-    masks_list2 = []
+    local_crop_masks = []
     for i in range(0, n_samples_masked):
-        masks_list2.append(mask_generator(size_per_mask_range=size_per_mask_range))
+        local_crop_masks.append(mask_generator(H, patch_size, size_per_mask_range))
     for i in range(n_samples_masked, B):
-        masks_list2.append(torch.BoolTensor(mask_generator(0)))
+        local_crop_masks.append(torch.BoolTensor(mask_generator(H, patch_size, 0)))
 
-    random.shuffle(masks_list2)
+    # random.shuffle(local_crop_masks)
 
-    masks_list = masks_list1 + masks_list2
+    # masks_list = global_crop_masks + local_crop_masks
 
-    collated_masks = torch.stack(masks_list).flatten(1)
-    mask_indices_list = collated_masks.flatten().nonzero().flatten()
-    none_mask_indices_list = (collated_masks == False).flatten().nonzero().flatten()
-    masks_weight = collated_masks.sum(-1)
-    mask_sample_indices = masks_weight.nonzero().flatten()
-    masks_weight = (1 / masks_weight.clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
+    global_crop_masks = torch.stack(global_crop_masks).flatten(1)
+    global_mask_indices = global_crop_masks.flatten().nonzero().flatten()
+    global_none_mask_indices = (global_crop_masks == False).flatten().nonzero().flatten()
+    global_masks_weight = global_crop_masks.sum(-1)
+    global_mask_samples = global_masks_weight.nonzero().flatten()
+    global_masks_weight = (1 / global_masks_weight.clamp(min=1.0)).unsqueeze(-1).expand_as(global_crop_masks)[global_crop_masks]
+    
+    local_crop_masks = torch.stack(local_crop_masks).flatten(1)
+    local_mask_indices = local_crop_masks.flatten().nonzero().flatten()
+    local_none_mask_indices = (local_crop_masks == False).flatten().nonzero().flatten()
+    local_masks_weight = local_crop_masks.sum(-1)
+    local_mask_samples = local_masks_weight.nonzero().flatten()
+    local_masks_weight = (1 / local_masks_weight.clamp(min=1.0)).unsqueeze(-1).expand_as(local_crop_masks)[local_crop_masks]
+    
 
-    output['collated_masks'] = collated_masks
-    output['mask_indices_list'] = mask_indices_list
-    output['none_mask_indices_list'] = none_mask_indices_list
-    output['mask_sample_indices'] = mask_sample_indices
-    output['masks_weight'] = masks_weight
-    output['n_masked_patches'] = torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
+    output['global_crop_masks'] = global_crop_masks
+    output['global_mask_indices'] = global_mask_indices
+    output['global_none_mask_indices'] = global_none_mask_indices
+    output['global_mask_samples'] = global_mask_samples
+    output['global_masks_weight'] = global_masks_weight
+
+    output['local_crop_masks'] = local_crop_masks
+    output['local_mask_indices'] = local_mask_indices
+    output['local_none_mask_indices'] = local_none_mask_indices
+    output['local_mask_samples'] = local_mask_samples
+    output['local_masks_weight'] = local_masks_weight
 
     return output
 
@@ -230,8 +246,8 @@ def make_pretrain_dataset02(args):
     valid_df = pd.read_parquet(args.valid)
     print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    transforms = get_preset(args.train_aug, image_size=args.image_size)
-    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
+    transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
 
     logging.info(f"Train Image Processor:")
     logging.info(f"{transforms}")
@@ -253,6 +269,50 @@ def make_pretrain_dataset02(args):
     train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
     train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
     train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
+    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    train_loader.num_samples = len(train_dataset)
+    train_loader.num_batches = len(train_loader)
+
+    valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
+    valid_times = torch.tensor(valid_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
+    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans, times=valid_times)
+    valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_loader.num_samples = len(valid_dataset)
+    valid_loader.num_batches = len(valid_loader)
+
+    return train_loader, valid_loader
+
+def make_pretrain_dataset03(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+
+    transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464 ], std=[0.25763473, 0.26254627, 0.25369588])
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464 ], std=[0.25763473, 0.26254627, 0.25369588])
+
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transforms}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
+
+    mask_generator = CustomMaskingGenerator(
+        input_size=args.image_size[0],
+        patch_size=args.patch_size,
+    )
+
+    collate_fn = partial(
+        pretrain_collate02,
+        patch_size=args.patch_size,
+        size_per_mask_range=args.size_per_mask_range,
+        mask_probability=0.5,
+        mask_generator=mask_generator,
+    )
+
+    train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
+    train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
+    train_dataset = PretrainLocalCrops(train_df.image.tolist(), train_labels, transforms, num_crops=args.num_crops, times=train_times)
     sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
     train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
@@ -878,7 +938,114 @@ class PretrainValidDataset(PretrainDataset):
             output['time'] = self.times[idx]
 
         return output
+    
+class PretrainInferDataset(PretrainDataset):
+    def __init__(self, images, labels, transforms, times=None, df=None):
+        self.df = df
+        self.images = images
+        self.labels = labels
+        self.times = times
+        self.transforms = transforms
+        self.test_transforms = remove_normalize_and_totensor(self.transforms)
 
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = self.transforms(image=image)['image']
+        label = self.labels[idx]
+
+        output= {'image': image, 'label': label}
+
+        if self.times is not None:
+            output['time'] = self.times[idx]
+
+        return output
+    
+    def get_pil(self, idx, pixels=None):
+        image =Image.open(self.images[idx])
+        if pixels:
+            width, height = image.size
+
+            aspect_ratio = width / height
+            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
+            resize_w = math.ceil(resize_h * aspect_ratio)
+
+            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
+
+        return image
+    
+    def get_transform(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = self.test_trans1(image=image)['image']
+
+        return Image.fromarray(image)
+    
+class PretrainLocalCrops(Dataset):
+    def __init__(self, images, labels, transforms, num_crops, times=None, df=None):
+        self.df = df
+        self.images = images
+        self.labels = labels
+        self.num_crops = num_crops
+        self.times = times
+        self.trans1 = transforms['trans1']
+        self.trans2 = transforms['trans2']
+        self.test_trans1 = remove_normalize_and_totensor(self.trans1)
+        self.test_trans2 = remove_normalize_and_totensor(self.trans2)
+
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image1 = self.trans1(image=image)['image']
+
+        crops = []
+        for i in range(self.num_crops):
+            crops.append(self.trans2(image=image)['image'])
+
+        image2 = torch.stack(crops, dim=0)
+
+        label = self.labels[idx]
+        output = {'image1': image1, 'image2': image2, 'label': label}
+
+        if self.times is not None:
+            output['time'] = self.times[idx]
+
+        return output
+    
+    def get_pil(self, idx, pixels=None):
+        image =Image.open(self.images[idx])
+        if pixels:
+            width, height = image.size
+
+            aspect_ratio = width / height
+            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
+            resize_w = math.ceil(resize_h * aspect_ratio)
+
+            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
+
+        return image
+    
+    def get_transform1(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = self.test_trans1(image=image)['image']
+
+        return Image.fromarray(image)
+    
+    def get_transform2(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = self.test_trans2(image=image)['image']
+
+        return Image.fromarray(image)
+    
 class CustomBatchSampler(Sampler[int]):
     r"""
     class를 랜덤으로 하나 샘플링한뒤 해당 클래스와 같은 클래스의 샘플을 num_postive 갯수만큼 
@@ -1094,16 +1261,18 @@ class CustomMaskingGenerator:
                             [[1, 0], [0, 0]]
                         ]
 
-    def __call__(self, size_per_mask_range):
+    def __call__(self, input_size, patch_size, size_per_mask_range):
+        n_patches = int(input_size / patch_size)
+        
         if size_per_mask_range == 0:
-            return torch.zeros(self.n_patches, self.n_patches, dtype=torch.bool)
+            return torch.zeros(n_patches, n_patches, dtype=torch.bool)
         
         mask_scale = random.randint(*size_per_mask_range)  # 한번에 마스킹할 최대 patch 크기
         pattern = torch.tensor(random.choices(self.patterns, weights=[1.0, 1.0], k=1)[0])
         mask_unit = torch.kron(pattern, torch.ones((mask_scale, mask_scale), dtype=torch.int))    # mask_scale 기준으로 하나의 pattern의 크기를 키움 최대 3x3패치까지 한번에 마스킹
 
         unit_size = mask_unit.size(0)
-        repeat = math.ceil(self.n_patches / unit_size) + 1   # mask_unit을 n_patches x n_patches보다 크면서 다양한 패턴으로 crop하기 위해 repeat 수를 +1 해줌.
+        repeat = math.ceil(n_patches / unit_size) + 1   # mask_unit을 n_patches x n_patches보다 크면서 다양한 패턴으로 crop하기 위해 repeat 수를 +1 해줌.
 
         repeated_mask = mask_unit.repeat(repeat, repeat)    #  mask_unit을 repeat x repeat으로 확장
 
@@ -1111,6 +1280,6 @@ class CustomMaskingGenerator:
         left = random.randint(1, unit_size)
         top = random.randint(1, unit_size)
 
-        mask = repeated_mask[top:top+self.n_patches, left:left+self.n_patches].to(dtype=bool)    # crop
+        mask = repeated_mask[top:top+n_patches, left:left+n_patches].to(dtype=bool)    # crop
         return mask
     

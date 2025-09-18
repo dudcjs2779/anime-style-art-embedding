@@ -117,12 +117,16 @@ class SigLipLoss(nn.Module):
             rank: int = 0,
             world_size: int = 1,
             dist_impl: Optional[str] = None,
+            block_diagonal = False,
+            block_size = 1
     ):
         super().__init__()
         self.cache_labels = cache_labels
         self.rank = rank
         self.world_size = world_size
         self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
+        self.block_diagonal = block_diagonal
+        self.block_size = block_size
         assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
 
         # cache state FIXME cache not currently used, worthwhile?
@@ -142,7 +146,14 @@ class SigLipLoss(nn.Module):
                                             midpoint=1.0, steepness=6, max_y=time_weight)
                 
                 labels = labels * (same_class_weight - time_weights)
-                labels.fill_diagonal_(1.0)
+
+                if self.block_diagonal:
+                    kron_size = num_logits // self.block_size
+                    diagonal = torch.eye(kron_size)
+                    diagonal = torch.kron(diagonal, torch.ones((self.block_size, self.block_size)))
+                    labels[diagonal == 1] = 1.0
+                else:
+                    labels.fill_diagonal_(1.0)
             else:
                 eye = torch.eye(num_logits, dtype=torch.bool, device=classes.device)
                 labels[labels.bool() & ~eye] = same_class_weight
@@ -176,6 +187,9 @@ class SigLipLoss(nn.Module):
             negative_only=negative_only,
         )
         # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
+
+        # if self.block_diagonal:
+        #     breakpoint()
         loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
         return loss
 
