@@ -10,6 +10,9 @@
 import numpy as np
 import torch
 
+import torch
+import torch.nn.functional as F
+
 
 # --------------------------------------------------------
 # 2D sine-cosine position embedding
@@ -94,3 +97,27 @@ def interpolate_pos_embed(model, checkpoint_model):
             pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
             checkpoint_model['pos_embed'] = new_pos_embed
+
+
+
+def interpolate_pos_embed_weight(pos_embed, old_grid_size, new_grid_size):
+    # pos_embed shape: [1, num_patches+1, dim]
+    cls_token = pos_embed[:, 0:1, :]   # [1, 1, dim]
+    patch_pos = pos_embed[:, 1:, :]    # [1, N, dim]
+
+    # (1, H*W, C) → (1, C, H, W)
+    dim = patch_pos.shape[-1]
+    patch_pos = patch_pos.reshape(1, old_grid_size, old_grid_size, dim).permute(0, 3, 1, 2)
+
+    # bicubic interpolate
+    patch_pos = F.interpolate(patch_pos, size=(new_grid_size, new_grid_size), mode='bicubic', align_corners=False)
+
+    # (1, C, H, W) → (1, H*W, C)
+    patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, new_grid_size**2, dim)
+
+    return torch.cat((cls_token, patch_pos), dim=1)
+
+
+def interpolate_patch_embed_weight(conv_weight, new_size=14):
+    # conv_weight: [out_channels, in_channels, old_size, old_size]
+    return F.interpolate(conv_weight, size=(new_size, new_size), mode='bicubic', align_corners=False)

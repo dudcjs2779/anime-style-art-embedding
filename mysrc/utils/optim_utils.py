@@ -71,6 +71,23 @@ def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, block_depth=12):
 
     return lr_decay_rate ** (block_depth + 1 - depthness)
 
+def get_transformer_lr_decay_rate(name, lr_decay_rate=1.0, block_depth=12):
+    depthness = block_depth + 1
+    if (
+        "pos_embed" in name
+        or "patch_embed" in name
+        or "mask_token" in name
+        or "cls_token" in name
+        or "reg_token" in name
+        or "token_embedding" in name
+        or "positional_embedding" in name
+    ):
+        depthness = 0
+    elif "blocks." in name and "residual." not in name:
+        depthness = int(name[name.find("blocks.") :].split(".")[1]) + 1
+
+    return lr_decay_rate ** (block_depth + 1 - depthness)
+
 def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier")):
     fused_params_groups = defaultdict(lambda: {"params": []})
     for d in all_params_groups:
@@ -93,9 +110,34 @@ def make_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
         if not param.requires_grad:
             continue
 
-        if name.startswith("visual."):
-            decay_rate = get_vit_lr_decay_rate(name, lr_decay_rate, block_depth)
+        decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, block_depth)
+        d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
 
+        if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+            d.update({"wd_multiplier": 0.0})
+
+        if "patch_embed" in name:
+            d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+        
+        param_groups.append(d)
+     
+    param_groups = fuse_params_groups(param_groups)
+    for g in param_groups:
+        g["foreach"] = True
+
+    return list(param_groups)
+
+def make_mae_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
+    param_groups = []
+
+    vit_depth = len(model.visual.blocks)
+    decoder_depth = len(model.decoder.decoder_blocks)
+    for name, param in model.named_parameters():
+        if "visual" in name:
+            if not param.requires_grad:
+                continue
+
+            decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, vit_depth)
             d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
 
             if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
@@ -105,9 +147,78 @@ def make_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
                 d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
             
             param_groups.append(d)
-        
+
+        elif "decoder" in name:
+            if not param.requires_grad:
+                continue
+
+            decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, decoder_depth)
+            d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
+
+            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+                d.update({"wd_multiplier": 0.0})
+
+            if "patch_embed" in name:
+                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            
+            param_groups.append(d)
         else:
+            if not param.requires_grad:
+                continue
+
             d = {"params": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
+
+            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+                d.update({"wd_multiplier": 0.0})
+
+            if "patch_embed" in name:
+                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            
+            param_groups.append(d)
+
+    param_groups = fuse_params_groups(param_groups)
+    for g in param_groups:
+        g["foreach"] = True
+
+    return list(param_groups)
+
+def make_clip_param_groups(model, image_lr, text_lr, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
+    param_groups = []
+
+    image_depth = len(model.visual.trunk.blocks)
+    text_depth = len(model.text.transformer.resblocks)
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if "visual." in name:
+            decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, image_depth)
+            d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, 'lr': image_lr, "name": name}
+
+            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+                d.update({"wd_multiplier": 0.0})
+
+            if "patch_embed" in name:
+                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            
+            param_groups.append(d)
+
+        elif "text." in name:
+            decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, text_depth)
+            d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, 'lr': text_lr, "name": name}
+
+            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+                d.update({"wd_multiplier": 0.0})
+
+            if "patch_embed" in name:
+                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+            
+            param_groups.append(d)
+
+        else:
+            decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, image_depth)
+            d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, 'lr': image_lr, "name": name}
 
             if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
                 d.update({"wd_multiplier": 0.0})

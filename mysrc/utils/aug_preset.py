@@ -62,55 +62,104 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
             BatchToTensor(),
         ])
 
-    elif preset_name == "art_style_aug1":
-        transforms1 = A.Compose([
-            A.SmallestMaxSize(max_size=max(w, h), interpolation=cv2.INTER_AREA),
-            A.OneOf([
-                A.RandomRotate90(p=0.2),
-                A.Rotate(limit=(-180, 180), p=0.8, border_mode=cv2.BORDER_CONSTANT, value=[255, 255, 255]),
-            ], p=0.8),
-            A.HorizontalFlip(p=0.2),
-            A.VerticalFlip(p=0.2),
+    elif preset_name == "style_train01":
+        shared_trans = A.Compose([
+            A.ShiftScaleRotate(
+                shift_limit=[-0.0625, 0.0625],
+                scale_limit=[0.0, 0.15],
+                rotate_limit=[-5, 5],
+                interpolation=cv2.INTER_CUBIC,
+                border_mode=cv2.BORDER_CONSTANT,
+                rotate_method="ellipse",
+                fill=255,
+                p=0.9,
+            ),
+            A.LongestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_CUBIC, p=1.0),
+            A.PadIfNeeded(min_height=h, min_width=w, border_mode=cv2.BORDER_CONSTANT, fill=255, p=1.0),
+            A.HorizontalFlip(p=0.5),
+        ], additional_targets={'image2': 'image'}, p=1.0)
 
-            A.RandomScale(scale_limit=(0, 0.5), p=0.7),
-            A.RandomCrop(width=w, height=h),
+        style_trans = A.Compose([
+            A.ColorJitter(
+                brightness=0.05,
+                contrast=0.05,
+                saturation=0.05,
+                hue=0.0,
+                p=1.0
+            ),
 
-            A.ColorJitter(brightness=(0.8, 1.2), contrast=(0.8, 1.3), saturation=(0.0, 1.7), hue=(-0.1, 0.1), p=0.8),
-            A.CoarseDropout(
-                num_holes_range=(1, 3),
-                hole_height_range=(114, 224),
-                hole_width_range=(114, 224),
-                p=0.5)
-        ], p=0.5)
+            # A.RGBShift(
+            #     r_shift_limit=[-10, 10],
+            #     g_shift_limit=[-10, 10],
+            #     b_shift_limit=[-10, 10],
+            #     p=0.9
+            # ),
+        ], p=1.0)
 
-        transforms2 = A.Compose([
-            RandomSmallestMaxSize(min_size = 1024, max_size=3072, interpolation=cv2.INTER_AREA),
-            A.OneOf([
-                A.RandomRotate90(p=0.2),
-                A.Rotate(limit=(-180, 180), p=0.8, border_mode=cv2.BORDER_CONSTANT, value=[255, 255, 255]),
-            ], p=0.8),
-            A.HorizontalFlip(p=0.2),
-            A.VerticalFlip(p=0.2),
-
-            A.RandomCrop(width=w, height=h),
-
-            A.ColorJitter(brightness=(0.8, 1.2), contrast=(0.8, 1.3), saturation=(0.0, 1.7), hue=(-0.1, 0.1), p=0.8),
-            # A.CoarseDropout(
-            #     num_holes_range=(1, 3),
-            #     hole_height_range=(114, 224),
-            #     hole_width_range=(114, 224),
-            #     p=0.5)
-        ], p=0.5)
-
-        transforms = A.Compose([
-            A.OneOf([
-                transforms1,
-                transforms2,
-            ], p=1.0),
-            
+        end_trans = A.Compose([
             A.Normalize(mean=mean, std=std, max_pixel_value=255),
             ToTensorV2(),
         ])
+        transforms = {"shared_trans": shared_trans, "style_trans": style_trans, 'end_trans': end_trans}
+
+    elif preset_name == "style_train02":
+        shared_trans = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.OneOf([
+                RandomResizedCropWithPad(
+                    size=[h, w],
+                    scale=[0.05, 1.0],
+                    ratio=[0.75, 1.3333333333333333],
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=255,
+                    p=0.6),
+
+                A.Compose([
+                    AutoPad(border_mode=cv2.BORDER_CONSTANT, fill=255),
+                    A.RandomResizedCrop(
+                        size=[h, w],
+                        scale=[0.33, 1.0],
+                        ratio=[0.75, 1.3333333333333333],
+                        interpolation=cv2.INTER_CUBIC,
+                        p=1.0),
+                ], p=0.4),
+            ], p=1.0),
+            A.RandomRotate90(p=0.4),
+            A.Rotate(limit=(-15, 15), p=0.5, border_mode=cv2.BORDER_CONSTANT, fill=[255, 255, 255]),
+        ], additional_targets={'image2': 'image'}, p=1.0)
+
+        style_trans = A.Compose([
+            A.ColorJitter(
+                brightness=0.05,
+                contrast=0.05,
+                saturation=0.05,
+                hue=0.0,
+                p=1.0
+            ),
+
+            A.RGBShift(
+                r_shift_limit=[-10, 10],
+                g_shift_limit=[-10, 10],
+                b_shift_limit=[-10, 10],
+                p=0.9
+            ),
+        ], p=1.0)
+
+        end_trans = A.Compose([
+            A.Normalize(mean=mean, std=std, max_pixel_value=255),
+            ToTensorV2(),
+        ])
+
+        valid_trans = A.Compose([ # Center Crop
+            A.SmallestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_CUBIC),
+            A.CenterCrop(h, w),
+            A.Normalize(mean=mean, std=std, max_pixel_value=255),
+            ToTensorV2(),
+        ], additional_targets={'image2': 'image'}, p=1.0)
+
+        transforms = {"shared_trans": shared_trans, "style_trans": style_trans, 'end_trans': end_trans, 'valid_trans': valid_trans}
+
     elif preset_name == "bad_aug1":
         transforms = A.Compose([
             A.OneOf([
@@ -136,7 +185,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
 
     elif preset_name == "long_max_pad_train":
         transforms = A.Compose([
-        A.LongestMaxSize(max_size=max(w, h), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
+        A.LongestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
         A.PadIfNeeded(min_height=h, min_width=w, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
         A.OneOf([
             A.RandomRotate90(p=0.3),
@@ -153,7 +202,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
 
     elif preset_name == "long_max_pad_rot":
         transforms = A.Compose([
-        A.LongestMaxSize(max_size=max(w, h), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
+        A.LongestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
         A.PadIfNeeded(min_height=h, min_width=w, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
         A.OneOf([
             A.RandomRotate90(p=0.3),
@@ -168,7 +217,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
         
     elif preset_name == "long_max_pad_valid":
         transforms = A.Compose([
-        A.LongestMaxSize(max_size=max(w, h), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
+        A.LongestMaxSize(max_size=max(h, w), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
         A.PadIfNeeded(min_height=h, min_width=w, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
         A.Normalize(mean=mean, std=std, max_pixel_value=255),
         ToTensorV2(),
@@ -1220,15 +1269,15 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
 
             A.OneOf([
                 A.RandomResizedCrop(
-                    size=[h//2, w//2],
+                    size=[h, w],
                     scale=[0.01, 0.15],
                     ratio=[0.75, 1.3333333333333333],
                     interpolation=cv2.INTER_CUBIC,
                     p=0.9),
 
                 RandomResizedCropWithPad(
-                    size=[h//2, w//2],
-                    scale=[0.15, 0.5],
+                    size=[h, w],
+                    scale=[0.15, 1.0],
                     ratio=[0.75, 1.3333333333333333],
                     interpolation=cv2.INTER_CUBIC,
                     border_mode=cv2.BORDER_CONSTANT,
@@ -1240,7 +1289,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
                 brightness=0.4,
                 contrast=0.4,
                 saturation=0.2,
-                hue=0.1,
+                hue=0.2,
                 p=0.8
             ),
             A.ToGray(p=0.2),
@@ -1252,7 +1301,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
                 spatial_mode="shared",
                 noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
                 approximation=0.8,
-                p=0.1
+                p=0.2
             ),
 
             A.OneOf([
@@ -1270,12 +1319,22 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
                     sigma_limit=[0.5, 2.0],
                     p=0.5
                 ),
-            ], p=0.9),
+            ], p=0.5),
+
+            A.Solarize([0.5, 0.5], p=0.1),
         ], p=1.0)
 
 
 
         aug_trans2 = A.Compose([
+            A.AdditiveNoise(
+                noise_type="gaussian",
+                spatial_mode="shared",
+                noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
+                approximation=0.8,
+                p=0.2
+            ),
+
             A.OneOf([
                 A.AdvancedBlur(
                     blur_limit=[5, 15],
@@ -1291,17 +1350,9 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
                     sigma_limit=[0.5, 2.0],
                     p=0.5
                 ),
-            ], p=0.1),
+            ], p=0.5),
 
-            A.AdditiveNoise(
-                noise_type="gaussian",
-                spatial_mode="shared",
-                noise_params={"mean_range":[0,0],"std_range":[0.01,0.08]},
-                approximation=0.8,
-                p=0.5
-            ),
-
-            A.Solarize([0.0, 0.7], p=0.2),
+            A.Solarize([0.5, 0.5], p=0.1),
         ], p=1.0)
 
         end_trans = A.Compose([
