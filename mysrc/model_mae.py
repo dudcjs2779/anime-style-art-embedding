@@ -200,7 +200,6 @@ class Decoder(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        breakpoint()
         x = self.decoder_embed(x)
         # x[:, num_prefix_tokens:, :] = torch.where(mask.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x[:, num_prefix_tokens:, :])
         

@@ -18,9 +18,6 @@ import torch.utils.tensorboard as tensorboard
 from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object
 from open_clip_train.logger import setup_logging
 
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-
 from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02
@@ -30,6 +27,7 @@ from mysrc.utils.scheduler import CosineScheduler
 from mysrc.utils.precision import get_autocast, get_input_dtype
 from mysrc.model import CustomVisual
 from mysrc.utils.file_utils import pt_load
+from mysrc.utils.metrics import get_embed_metrics
 
 
 class AverageMeter(object):
@@ -94,7 +92,9 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
-        accum_images1, accum_images2, accum_masks1, accum_masks2, accum_mask_indices, accum_masks_weight, accum_classes, accum_times, accum_features = [], [], [], [], [], [], [], [], {}
+        accum_images1, accum_images2, accum_classes, accum_times = [], [], [], []
+        accum_gl_masks, accum_loc_masks = [], []
+        accum_features = {}
 
     losses_m = {}
     # total_m = AverageMeter()
@@ -109,26 +109,35 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
         lr = scheduler[step]
         apply_optim_scheduler(optimizer, lr)
 
-        images1, images2, masks, classes, times = batch['image1'], batch['image2'], batch['collated_masks'], batch['label'], batch['time']
+        images1, images2, classes, times = batch['image1'], batch['image2'], batch['label'], batch['time']
         images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)
         images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)
-        masks1 = masks[:len(images1)].to(device=device, dtype=input_dtype, non_blocking=True)
-        masks2 = masks[len(images1):].to(device=device, dtype=input_dtype, non_blocking=True)
         classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
         times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
-        mask_indices_list = batch['mask_indices_list'].to(device=device, non_blocking=True)
-        masks_weight = batch['masks_weight'].to(device=device, dtype=input_dtype, non_blocking=True)
+        global_crop_masks, global_mask_indices, global_none_mask_indices, global_mask_samples = batch['global_crop_masks'], batch['global_mask_indices'], batch['global_none_mask_indices'], batch['global_mask_samples']
+        local_crop_masks, local_mask_indices, local_none_mask_indices, local_mask_samples = batch['local_crop_masks'], batch['local_mask_indices'], batch['local_none_mask_indices'], batch['local_mask_samples']
+        
+        gl_masks = global_crop_masks.to(device=device, non_blocking=True)
+        # gm_indices = global_mask_indices.to(device=device, non_blocking=True)
+        # gnm_indices = global_none_mask_indices.to(device=device, non_blocking=True)
+        # gm_samples = global_mask_samples.to(device=device, non_blocking=True)
+
+        loc_masks = local_crop_masks.to(device=device, non_blocking=True)
+        # lm_indices = local_mask_indices.to(device=device, non_blocking=True)
+        # lnm_indices = local_none_mask_indices.to(device=device, non_blocking=True)
+        # lm_samples = local_mask_samples.to(device=device, non_blocking=True)
+
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images1, images2, masks1, masks2)
+                model_out = model(images1, images2, gl_masks, loc_masks)
                 cls_features = {
-                    'image_features1': model_out['im_feat1_masked']['x_clstoken'],
-                    'image_features2': model_out['im_feat2']['x_clstoken'],
+                    'image_features1': model_out['im_feat1_cls'],
+                    'image_features2': model_out['im_feat2_cls'],
                     'logit_scale': model_out['logit_scale'],
                     'logit_bias': model_out['logit_bias']
                 }
@@ -138,21 +147,16 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                                    output_dict=True)
                 
                 ## Reconstruction loss
-                # _dim = model_out['im_feat1_masked']["x_clstoken"].shape[-1]
-                # patch_tokens = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
-                # buffer_tensor_patch_tokens = patch_tokens.new_zeros(upperbound, _dim)
-                # buffer_tensor_patch_tokens[:n_masked_patches].copy_(torch.index_select(patch_tokens.flatten(0, 1), dim=0, index=mask_indices_list))
-
-                output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
-                masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                # output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                # masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
                 
-                output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
-                label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                # output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
+                # label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
 
-                # loss = cosine_loss(masked_patches, label_patches, masks_weight)
-                loss = args.recon_weight * cosine_loss(masked_patches, label_patches)
-                loss /= args.accum_freq
-                losses['reconstruction_loss'] = loss
+                # # loss = cosine_loss(masked_patches, label_patches, masks_weight)
+                # loss = args.recon_weight * cosine_loss(masked_patches, label_patches)
+                # loss /= args.accum_freq
+                # losses['reconstruction_loss'] = loss
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
@@ -162,10 +166,10 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    model_out = model(images1, images2, masks1, masks2)
+                    model_out = model(images1, images2, gl_masks, loc_masks)
                     cls_features = {
-                        'image_features1': model_out['im_feat1_masked']['x_clstoken'],
-                        'image_features2': model_out['im_feat2']['x_clstoken'],
+                        'image_features1': model_out['im_feat1_cls'],
+                        'image_features2': model_out['im_feat1_cls'],
                     }
 
                     for f in ("logit_scale", "logit_bias"):
@@ -179,10 +183,8 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                     
                 accum_images1.append(images1)
                 accum_images2.append(images2)
-                accum_masks1.append(masks1)
-                accum_masks2.append(masks2)
-                accum_mask_indices.append(mask_indices_list)
-                accum_masks_weight.append(masks_weight)
+                accum_gl_masks.append(gl_masks)
+                accum_loc_masks.append(loc_masks)
                 accum_classes.append(classes)
                 accum_times.append(times)
 
@@ -200,15 +202,13 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
             for j in range(args.accum_freq):
                 images1 = accum_images1[j]
                 images2 = accum_images2[j]
-                masks1 = accum_masks1[j]
-                masks2 = accum_masks2[j]
-                mask_indices_list = accum_mask_indices[j]
-                masks_weight = accum_masks_weight[j]
+                gl_masks = accum_gl_masks[j]
+                loc_masks = accum_loc_masks[j]
                 with autocast():
-                    model_out = model(images1, images2, masks1, masks2)
+                    model_out = model(images1, images2, gl_masks, loc_masks)
                     cls_features = {
-                        'image_features1': model_out['im_feat1_masked']['x_clstoken'],
-                        'image_features2': model_out['im_feat2']['x_clstoken'],
+                        'image_features1': model_out['im_feat1_cls'],
+                        'image_features2': model_out['im_feat2_cls'],
                     }
 
                     inputs_no_accum = {}
@@ -228,17 +228,17 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                     del inputs
                     del inputs_no_accum
 
-                    ## Reconstruction loss
-                    output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
-                    masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                    # ## Reconstruction loss
+                    # output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                    # masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
                     
-                    output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
-                    label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                    # output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
+                    # label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
 
-                    # loss = cosine_loss(masked_patches, label_patches, masks_weight)
-                    loss = cosine_loss(masked_patches, label_patches)
-                    loss /= args.accum_freq
-                    losses['reconstruction_loss'] = loss
+                    # # loss = cosine_loss(masked_patches, label_patches, masks_weight)
+                    # loss = cosine_loss(masked_patches, label_patches)
+                    # loss /= args.accum_freq
+                    # losses['reconstruction_loss'] = loss
 
                     total_loss = sum(losses.values())
                     losses["loss"] = total_loss
@@ -268,7 +268,9 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
 
         # reset gradient accum, if enabled
         if args.accum_freq > 1:
-            accum_images1, accum_images2, accum_masks1, accum_masks2, accum_mask_indices, accum_masks_weight, accum_classes, accum_times, accum_features = [], [], [], [], [], [], [], [], {}
+            accum_images1, accum_images2, accum_classes, accum_times = [], [], [], []
+            accum_gl_masks, accum_loc_masks = [], []
+            accum_features = {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -352,21 +354,29 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
         all_image_features, all_classes = [], []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images1, images2, images3, masks, classes, times = batch['image1'], batch['image2'], batch['image3'], batch['collated_masks'], batch['label'], batch['time']
+                images1, images2, images3, classes, times = batch['image1'], batch['image2'], batch['image3'], batch['label'], batch['time']
                 images1 = images1.to(device=device, dtype=input_dtype, non_blocking=True)   # aug1
                 images2 = images2.to(device=device, dtype=input_dtype, non_blocking=True)   # aug2
                 images3 = images3.to(device=device, dtype=input_dtype, non_blocking=True)   # non aug
-                masks1 = masks[:len(images1)].to(device=device, dtype=input_dtype, non_blocking=True)
-                masks2 = masks[len(images1):].to(device=device, dtype=input_dtype, non_blocking=True)
                 classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
                 times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
-                mask_indices_list = batch['mask_indices_list'].to(device=device, non_blocking=True)
-                masks_weight = batch['masks_weight'].to(device=device, dtype=input_dtype, non_blocking=True)
+                # global_crop_masks, global_mask_indices, global_none_mask_indices, global_mask_samples = batch['global_crop_masks'], batch['global_mask_indices'], batch['global_none_mask_indices'], batch['global_mask_samples']
+                # local_crop_masks, local_mask_indices, local_none_mask_indices, local_mask_samples = batch['local_crop_masks'], batch['local_mask_indices'], batch['local_none_mask_indices'], batch['local_mask_samples']
+
+                # gl_masks = global_crop_masks.to(device=device, non_blocking=True)
+                # gm_indices = global_mask_indices.to(device=device, non_blocking=True)
+                # gnm_indices = global_none_mask_indices.to(device=device, non_blocking=True)
+                # gm_samples = global_mask_samples.to(device=device, non_blocking=True)
+
+                # loc_masks = local_crop_masks.to(device=device, non_blocking=True)
+                # lm_indices = local_mask_indices.to(device=device, non_blocking=True)
+                # lnm_indices = local_none_mask_indices.to(device=device, non_blocking=True)
+                # lm_samples = local_mask_samples.to(device=device, non_blocking=True)
 
                 with autocast():
-                    model_out = model.evaluate(images1, images2, images3, masks1, masks2)
-                    image_features3 = model_out["im_feat3"]['x_clstoken'].clone()
+                    model_out = model.evaluate(images1, images2, images3)
+                    image_features3 = model_out["im_feat3_cls"]
                     logit_scale = model_out["logit_scale"]
                     logit_bias = model_out.get('logti_bias', None)
                     
@@ -374,8 +384,8 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
                     all_image_features.append(image_features3.cpu())
                     all_classes.append(classes.cpu())
                     losses = clip_loss(
-                        image_features1=model_out['im_feat1']['x_clstoken'], 
-                        image_features2=model_out['im_feat2']['x_clstoken'],
+                        image_features1=model_out['im_feat1_cls'], 
+                        image_features2=model_out['im_feat2_cls'],
                         logit_scale=model_out["logit_scale"], 
                         logit_bias=model_out.get('logit_bias', None), 
                         classes=classes, 
@@ -384,15 +394,15 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
                         output_dict=True
                     )
 
-                    output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
-                    masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                    # output_masked_patches = torch.concat((model_out['im_feat1_masked']["x_patchtokens"], model_out['im_feat2_masked']["x_patchtokens"]), dim=0)
+                    # masked_patches = torch.index_select(output_masked_patches.flatten(0, 1), dim=0, index=mask_indices_list)
                     
-                    output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
-                    label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
+                    # output_label_patches = torch.concat((model_out['im_feat1']["x_patchtokens"], model_out['im_feat2']["x_patchtokens"]), dim=0)
+                    # label_patches = torch.index_select(output_label_patches.flatten(0, 1), dim=0, index=mask_indices_list)
 
-                    # loss = cosine_loss(masked_patches, label_patches, masks_weight)
-                    loss = cosine_loss(masked_patches, label_patches)
-                    losses['reconstruction_loss'] = args.recon_weight * loss
+                    # # loss = cosine_loss(masked_patches, label_patches, masks_weight)
+                    # loss = cosine_loss(masked_patches, label_patches)
+                    # losses['reconstruction_loss'] = args.recon_weight * loss
 
                 for key, val in losses.items():
                     if key not in losses_m:
@@ -406,22 +416,21 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
                     logging.info(
                         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
                         f"Clip Loss: {losses_m['contrastive_loss'].avg:.6f}\t"
-                        f"Recon Loss: {losses_m['reconstruction_loss'].avg:.6f}\t")
+                        # f"Recon Loss: {losses_m['reconstruction_loss'].avg:.6f}\t"
+                    )
             
             if logit_bias:
                 logit_bias = logit_bias.cpu()
 
-            val_metrics = get_clip_metrics(
+            val_metrics = get_embed_metrics(
                 image_features=torch.cat(all_image_features),
                 classes=torch.cat(all_classes),
-                logit_scale=logit_scale.cpu(),
-                logit_bias=logit_bias,
             )
 
             metrics.update({
                     **val_metrics, 
                     "clip_val_loss": losses_m['contrastive_loss'].avg, 
-                    "recon_loss": losses_m['reconstruction_loss'].avg, 
+                    # "recon_loss": losses_m['reconstruction_loss'].avg, 
                     "epoch": epoch, "num_samples": num_samples
                  })
 
@@ -447,88 +456,6 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
 
     return metrics
        
-            
-def get_clip_metrics(image_features, classes, logit_scale, logit_bias=None):
-    metrics = {}
-
-    ## 분류 accuracy
-    # logits_image = (logit_scale * image_features @ image_features.t()).detach().cpu()
-    logits_image = (image_features @ image_features.t()).detach().cpu()
-    # if logit_bias:
-    #     logits_image += logit_bias
-
-    ground_truth = (classes.unsqueeze(0) == classes.unsqueeze(1)).int()
-    N = logits_image.size(0)
-
-    # 자기 자신 제외
-    logits_no_diag = logits_image.clone()
-    logits_no_diag.fill_diagonal_(-float("inf"))
-
-    ## 클래스 별 총 데이터수 만큼의 top-k 랭크에서 얼마나 해당 class를 상위에 랭크시켰는지 accuracy 계산
-    sorted_idx = logits_no_diag.argsort(dim=1, descending=True)  # 각 row에서 similarity 순으로 정렬한 index
-    gt_mask = ground_truth.gather(1, sorted_idx)  # ground_truth 요소를 sorted_idx의 순서대로 재배열 즉, 높은 sim에 해당하는 ground_truth값이 앞으로 배치됨
-
-    num_gt_per_row = ground_truth.sum(dim=1) # 각 샘플별 gt의 갯수
-    ranks = torch.arange(N, device=logits_image.device).unsqueeze(0)
-
-    rank_range = (ranks < num_gt_per_row.unsqueeze(1)) # (존재하는 클래스 갯수 만큼 앞부분을 True)
-    rank_range_x1_5 = (ranks < (num_gt_per_row * 1.5).to(dtype=int).unsqueeze(1))
-    rank_range_x3 = (ranks < (num_gt_per_row * 3).to(dtype=int).unsqueeze(1))
-    rank_range_x10 = (ranks < (num_gt_per_row * 10).to(dtype=int).unsqueeze(1))
-
-    acc_per_row = rank_range & (gt_mask.bool()) # (측정 랭킹 구간) & (sim이 높은 순으로 정렬한 gt_mask)
-    acc_per_row_x1_5 = rank_range_x1_5 & (gt_mask.bool())
-    acc_per_row_x3 = rank_range_x3 & (gt_mask.bool())
-    acc_per_row_x10 = rank_range_x10 & (gt_mask.bool())
-
-    accuracy = acc_per_row.float().sum(dim=1) / num_gt_per_row
-    accuracy_x1_5 = acc_per_row_x1_5.float().sum(dim=1) / num_gt_per_row
-    accuracy_x3 = acc_per_row_x3.float().sum(dim=1) / num_gt_per_row
-    accuracy_x10 = acc_per_row_x10.float().sum(dim=1) / num_gt_per_row
-
-    accuracy = accuracy.mean().item()
-    accuracy_x1_5 = accuracy_x1_5.mean().item()
-    accuracy_x3 = accuracy_x3.mean().item()
-    accuracy_x10 = accuracy_x10.mean().item()
-
-    metrics[f"accuracy"] = accuracy
-    metrics[f"accuracy_x1_5"] = accuracy_x1_5
-    metrics[f"accuracy_x3"] = accuracy_x3
-    metrics[f"accuracy_x10"] = accuracy_x10
-
-    ## 클래스별 평균 유사도 및 표준편차
-    image_features = image_features.numpy()
-    classes = classes.numpy()
-    unique_classes = np.unique(classes)
-
-    mean_list = []
-    std_list = []
-    for i in unique_classes:
-        class_features = image_features[classes == i]
-        class_sims = class_features @ class_features.T
-        np.fill_diagonal(class_sims, np.nan)
-
-        sims_mean = np.nanmean(class_sims)
-        mean_list.append(sims_mean)
-
-        stds = np.nanstd(class_sims, axis=-1)
-        stds_mean = np.nanmean(stds)
-        std_list.append(stds_mean)
-
-    metrics[f"sim_mean_by_class"] = np.mean(mean_list)
-    metrics[f"sim_stu_mean_by_class"] = np.mean(std_list)
-
-    ## silhouette_score
-    metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
-
-    kmeans = KMeans(n_clusters=len(unique_classes), random_state=42)
-    labels = kmeans.fit_predict(image_features)
-    metrics[f"silhouette_score_kmeans"] = silhouette_score(image_features, labels, metric='cosine')
-
-    return metrics
-
-
-
 def main(args):
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
@@ -541,7 +468,7 @@ def main(args):
     device = init_distributed_device(args)
 
     t_now = datetime.now().strftime('%y-%m-%d_%H-%M-%S')
-    args.logs = "./logs"
+    args.logs = "pretrain_log"
     args.output_path = os.path.join(args.logs, f"{t_now}_{args.model_name[:50]}")
     args.log_name = os.path.basename(args.output_path)
     args.checkpoint_path = os.path.join(args.output_path, "checkpoint")
@@ -587,11 +514,7 @@ def main(args):
     train_loader, valid_loader = make_pretrain_dataset02(args)
 
     print("## Model Create\n")
-    kargs = {
-        'num_classes': args.embed_dim,
-        "global_pool": args.global_pool,
-    }
-    model = CustomVisual(model_name="eva02_base_patch14_224.mim_in22k", init_logit_scale=math.log(10), init_logit_bias=-10, output_dict=True, model_kargs=kargs)
+    model = CustomVisual(model_name="eva02_base_patch14_224.mim_in22k", init_logit_scale=math.log(10), init_logit_bias=-10, output_dict=True, model_kargs=args.model_type)
     model.to(device=device)
 
     if is_master(args):
@@ -602,8 +525,7 @@ def main(args):
             val = getattr(args, name)
             logging.info(f"  {name}: {val}")
 
-    block_depth = len(model.visual.blocks)
-    params_group = make_param_groups(model, block_depth, args.lr_decay, args.patch_embed_lr_mult)
+    params_group = make_param_groups(model, args.lr_decay, args.patch_embed_lr_mult)
     if args.opt_name == "adamw8bit":
         from bitsandbytes.optim import AdamW8bit
         optimizer = AdamW8bit(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16 학습을 위함

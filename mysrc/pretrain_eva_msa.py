@@ -195,7 +195,6 @@ def train_one_epoch(epoch, model, dataloader, optimizer, device):
 
     pbar = tqdm(total=len(dataloader), desc=f"Training Epoch:{epoch+1}")
     for imgs, _ in dataloader:
-        breakpoint()
         imgs = imgs.to(device)
 
         optimizer.zero_grad()
@@ -228,7 +227,6 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 vit = timm.create_model('vit_base_patch16_224', pretrained=False)
 # mae = MAE(vit, norm_pix_loss=True).to(device)
 mae = MAE(vit, norm_pix_loss=True).to('cpu')
-breakpoint()
 
 # Data
 transform = transforms.Compose([

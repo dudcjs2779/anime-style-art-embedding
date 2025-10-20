@@ -6,10 +6,9 @@ pretrain = 'pretrain_log/25-09-14_04-10-12_eva02_base_patch14_224.mim_in22k_qx2l
 save_frequency = 1
 max_save_count = 10
 
-[model_type]
+[model_kargs]
 num_classes = 0
 global_pool = ''    # avg, map, token(cls_token)
-dynamic_img_size = true
 
 [decoder]
 decoder_name = "eva_decoder"
@@ -33,7 +32,6 @@ size_per_mask_range = [1, 4]
 same_class_weight = 0.9
 mae_weight = 0.5
 norm_pix_loss = false
-block_diagonal = true
 
 [validation]
 valid = true
@@ -69,9 +67,8 @@ workers = 8
 [dataset]
 image_size = [224, 224]
 patch_size = 14
-train_aug = "pretrain_global_loacl02"
+train_aug = "pretrain_global_loacl"
 valid_aug = "simple_center_crop"
-num_crops = 4
 
 [sampler]
 num_postive = [2, 3]

@@ -11,6 +11,7 @@ from timm.models._manipulate import checkpoint
 from timm.models._builder import load_pretrained, resolve_pretrained_cfg
 from timm.layers import LayerNorm, Mlp, GluMlp, SwiGLU, resample_abs_pos_embed
 
+
 class CustomEva(Eva):
     def __init__(
             self, img_size = 224, 
@@ -140,13 +141,6 @@ class CustomVisual(nn.Module):
 
     def encode_image(self, image, mask=None, normalize: bool = False):
         features = self.visual(image, mask)
-
-        if isinstance(features, dict):
-            if normalize:
-                features['x_clstoken'] = F.normalize(features['x_clstoken'], dim=-1)
-                features['x_patchtokens'] = F.normalize(features['x_patchtokens'], dim=-1)
-                return features
-            
         return F.normalize(features, dim=-1) if normalize else features
     
     def inference(
@@ -174,59 +168,100 @@ class CustomVisual(nn.Module):
             image1: Optional[torch.Tensor] = None,
             image2: Optional[torch.Tensor] = None,
             image3: Optional[torch.Tensor] = None,
-            mask1: Optional[torch.Tensor] = None,
-            mask2: Optional[torch.Tensor] = None,
+            gl_masks: Optional[torch.Tensor] = None,
+            loc_masks: Optional[torch.Tensor] = None,
     ):
-        im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
-        im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
-        im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
+        im_feat1 = self.encode_image(image1, gl_masks, normalize=True) if image1 is not None else None
+        im_feat2 = self.encode_image(image2, loc_masks,  normalize=True) if image2 is not None else None
         im_feat3 = self.encode_image(image3, normalize=True) if image3 is not None else None
 
         if self.output_dict:
             out_dict = {
-                "im_feat1": im_feat1,
-                "im_feat1_masked": im_feat1_masked,
-                "im_feat2": im_feat2,
-                "im_feat2_masked": im_feat2_masked,
-                "im_feat3": im_feat3,
-                "logit_scale": self.logit_scale.exp()
+                "im_feat1_cls": im_feat1[:, 0],
+                "im_feat1_patches": im_feat1[:, self.visual.num_prefix_tokens:],
+                "im_feat2_cls": im_feat2[:, 0],
+                "im_feat2_patches": im_feat2[:, self.visual.num_prefix_tokens:],
+                "im_feat3_cls": im_feat3[:, 0],
+                "logit_scale": self.logit_scale.exp(),
             }
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
             return out_dict
 
         if self.logit_bias is not None:
-            return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp(), self.logit_bias
-        return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp()
+            return im_feat1, im_feat2, im_feat3, self.logit_scale.exp(), self.logit_bias
+        return im_feat1, im_feat2, im_feat3, self.logit_scale.exp()
+    
+        # im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
+        # im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
+        # im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
+        # im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
+        # im_feat3 = self.encode_image(image3, normalize=True) if image3 is not None else None
+
+        # if self.output_dict:
+        #     out_dict = {
+        #         "im_feat1": im_feat1,
+        #         "im_feat1_masked": im_feat1_masked,
+        #         "im_feat2": im_feat2,
+        #         "im_feat2_masked": im_feat2_masked,
+        #         "im_feat3": im_feat3,
+        #         "logit_scale": self.logit_scale.exp()
+        #     }
+        #     if self.logit_bias is not None:
+        #         out_dict['logit_bias'] = self.logit_bias
+        #     return out_dict
+
+        # if self.logit_bias is not None:
+        #     return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp(), self.logit_bias
+        # return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp()
 
     def forward(
             self,
             image1: torch.Tensor,
             image2: torch.Tensor,
-            mask1: Optional[torch.Tensor] = None,
-            mask2: Optional[torch.Tensor] = None,
+            gl_masks: Optional[torch.Tensor] = None,
+            loc_masks: Optional[torch.Tensor] = None,
     ):
-        im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
-        im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
-        im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
-
+        im_feat1 = self.encode_image(image1, gl_masks, normalize=True) if image1 is not None else None
+        im_feat2 = self.encode_image(image2, loc_masks, normalize=True) if image2 is not None else None
+     
         if self.output_dict:
             out_dict = {
-                "im_feat1": im_feat1,
-                "im_feat1_masked": im_feat1_masked,
-                "im_feat2": im_feat2,
-                "im_feat2_masked": im_feat2_masked,
-                "logit_scale": self.logit_scale.exp()
+                "im_feat1_cls": im_feat1[:, 0],
+                "im_feat1_patches": im_feat1[:, self.visual.num_prefix_tokens:],
+                "im_feat2_cls": im_feat2[:, 0],
+                "im_feat2_patches": im_feat2[:, self.visual.num_prefix_tokens:],
+                "logit_scale": self.logit_scale.exp(),
             }
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
             return out_dict
 
         if self.logit_bias is not None:
-            return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp(), self.logit_bias
-        return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp()
+            return im_feat1, im_feat2, self.logit_scale.exp(), self.logit_bias
+        return im_feat1, im_feat2, self.logit_scale.exp()
+
+
+        # im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
+        # im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
+        # im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
+        # im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
+     
+        # if self.output_dict:
+        #     out_dict = {
+        #         "im_feat1": im_feat1,
+        #         "im_feat1_masked": im_feat1_masked,
+        #         "im_feat2": im_feat2,
+        #         "im_feat2_masked": im_feat2_masked,
+        #         "logit_scale": self.logit_scale.exp()
+        #     }
+        #     if self.logit_bias is not None:
+        #         out_dict['logit_bias'] = self.logit_bias
+        #     return out_dict
+
+        # if self.logit_bias is not None:
+        #     return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp(), self.logit_bias
+        # return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp()
 
 class EvaDecoder(nn.Module):
     def __init__(
@@ -323,14 +358,14 @@ class EvaDecoder(nn.Module):
     def _pos_embed(self, x) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         cls_token = x[:, :self.npt]
         x = x[:, self.npt:]
-
-        if x.dim() == 3:
-            b, n, c = x.shape
-            h = int(np.sqrt(n))
-            w = h
-            x = x.reshape(b, h, w, c)
-
+        
         if self.dynamic_img_size:
+            if x.dim() == 3:
+                b, n, c = x.shape
+                h = int(np.sqrt(n))
+                w = h
+                x = x.reshape(b, h, w, c)
+
             B, H, W, C = x.shape
             if self.decoder_pos_embed is not None:
                 prev_grid_size = self.grid_size
@@ -529,73 +564,55 @@ class CustomMaeVisual(nn.Module):
     
     def evaluate(
             self,
-            image1: Optional[torch.Tensor] = None,
-            image2: Optional[torch.Tensor] = None,
-            image3: Optional[torch.Tensor] = None,
-            gl_masks: Optional[torch.Tensor] = None,
-            gm_indices = None,
-            gnm_indices = None,
-            gm_samples = None,
-            loc_masks: Optional[torch.Tensor] = None,
-            lm_indices = None,
-            lnm_indices = None,
-            lm_samples  = None,
+            images: torch.Tensor,
+            image_eval: torch.Tensor,
+            masks: Optional[torch.Tensor] = None,
+            mask_indices = None,
+            none_mask_indices = None,
+            mask_samples = None,
     ):
-        im_feat1 = self.encode_image(image1, gl_masks, normalize=False) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, loc_masks, normalize=False) if image2 is not None else None
-        im_feat3 = self.encode_image(image3, normalize=False) if image3 is not None else None
+        im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
+        im_eval_feats = self.encode_image(image_eval, normalize=False) if image_eval is not None else None
 
-        if gm_samples is not None:
-            im1_pred = self.decoder(im_feat1[gm_samples])
+        if mask_samples is not None:
+            im_pred = self.decoder(im_feats[mask_samples])
 
-        if lm_samples is not None:
-            im2_pred = self.decoder(im_feat2[lm_samples])
-
-        im_feat1 = self.embed_head(im_feat1, normalize=True)
-        im_feat2 = self.embed_head(im_feat2, normalize=True)
-        im_feat3 = self.embed_head(im_feat3, normalize=True)
+        im_feats = self.embed_head(im_feats, normalize=True)
+        im_eval_feats = self.embed_head(im_eval_feats, normalize=True)
 
         if self.output_dict:
             out_dict = {
-                "im_feat1_cls": im_feat1[:, 0],
-                "im_feat1_patches": im_feat1[:, self.visual.num_prefix_tokens:],
-                "im_feat2_cls": im_feat2[:, 0],
-                "im_feat2_patches": im_feat2[:, self.visual.num_prefix_tokens:],
-                "im_feat3": im_feat3[:, 0],
+                "im_feats_cls": im_feats[:, 0],
+                "im_feats_patches": im_feats[:, self.visual.num_prefix_tokens:],
+                "im_eval_feats_cls": im_eval_feats[:, 0],
                 "logit_scale": self.logit_scale.exp(),
             }
 
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
 
-            if gm_samples is not None:
-                out_dict['im1_pred'] = im1_pred
-                out_dict['im2_pred'] = im2_pred
-                out_dict['gl_masks'] = gl_masks[gm_samples]
-                out_dict['loc_masks'] = loc_masks[lm_samples]
+            if mask_samples is not None:
+                out_dict['im_pred'] = im_pred
+                out_dict['masks'] = masks[mask_samples]
 
             return out_dict
 
         if self.logit_bias is not None:
-            return im_feat1, im_feat2, im_feat3, self.logit_scale.exp(), self.logit_bias
-        return im_feat1, im_feat2, im_feat3, self.logit_scale.exp()
+            return im_feats, im_eval_feats, self.logit_scale.exp(), self.logit_bias
+        return im_feats, im_eval_feats, self.logit_scale.exp()
 
     def forward(
             self,
-            image1: torch.Tensor,
-            image2: torch.Tensor,
-            gl_masks: Optional[torch.Tensor] = None,
-            gm_indices = None,
-            gnm_indices = None,
-            gm_samples = None,
-            loc_masks: Optional[torch.Tensor] = None,
-            lm_indices = None,
-            lnm_indices = None,
-            lm_samples  = None,
+            images: torch.Tensor,
+            masks: Optional[torch.Tensor] = None,
+            mask_indices = None,
+            none_mask_indices = None,
+            mask_samples = None,
 
     ):
-        im_feat1 = self.encode_image(image1, gl_masks, normalize=False) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, loc_masks, normalize=False) if image2 is not None else None
+        # if mask_samples is not None:
+        #     breakpoint()
+        im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
         
         # im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
         # im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
@@ -625,39 +642,30 @@ class CustomMaeVisual(nn.Module):
         #     masked_patches @ label_patches.T
         #     _masked_patches @ _label_patches.T
 
-        if gm_samples is not None:
-            im1_pred = self.decoder(im_feat1[gm_samples])
+        if mask_samples is not None:
+            im_pred = self.decoder(im_feats[mask_samples])
 
-        if lm_samples is not None:
-            im2_pred = self.decoder(im_feat2[lm_samples])
-
-
-        im_feat1 = self.embed_head(im_feat1, normalize=True)
-        im_feat2 = self.embed_head(im_feat2, normalize=True)
+        im_feats = self.embed_head(im_feats, normalize=True)
 
         if self.output_dict:
             out_dict = {
-                "im_feat1_cls": im_feat1[:, 0],
-                "im_feat1_patches": im_feat1[:, self.visual.num_prefix_tokens:],
-                "im_feat2_cls": im_feat2[:, 0],
-                "im_feat2_patches": im_feat2[:, self.visual.num_prefix_tokens:],
+                "im_feats_cls": im_feats[:, 0],
+                "im_feats_patches": im_feats[:, self.visual.num_prefix_tokens:],
                 "logit_scale": self.logit_scale.exp(),
             }
 
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
 
-            if gm_samples is not None:
-                out_dict['im1_pred'] = im1_pred
-                out_dict['im2_pred'] = im2_pred
-                out_dict['gl_masks'] = gl_masks[gm_samples]
-                out_dict['loc_masks'] = loc_masks[lm_samples]
+            if mask_samples is not None:
+                out_dict['im_pred'] = im_pred
+                out_dict['masks'] = masks[mask_samples]
 
             return out_dict
 
         if self.logit_bias is not None:
-            return im_feat1, im_feat2, self.logit_scale.exp(), self.logit_bias
-        return im_feat1, im_feat2, self.logit_scale.exp()
+            return im_feats, self.logit_scale.exp(), self.logit_bias
+        return im_feats, self.logit_scale.exp()
 
 
 def create_eva(name, pretrained: bool = False, **kwargs):
