@@ -42,7 +42,7 @@ def read_config(args: argparse.Namespace, parser: argparse.ArgumentParser):
             config_dict[section_name] = section_dict
             continue
 
-        if section_name in ['model_kargs', 'vision_kargs', 'text_kargs', 'style_embed_head_kargs']:
+        if section_name in ['model_kargs', 'style_head', 'content_head', 'vision_kargs', 'text_kargs', 'style_embed_head_kargs']:
             config_dict[section_name] = section_dict
             continue
 
@@ -73,7 +73,7 @@ def read_config_ipynb(parser, config_path):
             config_dict[section_name] = section_dict
             continue
         
-        if section_name in ['model_kargs', 'vision_kargs', 'text_kargs', 'style_embed_head_kargs']:
+        if section_name in ['model_kargs', 'style_head', 'content_head', 'vision_kargs', 'text_kargs', 'style_embed_head_kargs']:
             config_dict[section_name] = section_dict
             continue
 

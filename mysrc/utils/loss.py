@@ -17,7 +17,7 @@ try:
 except ImportError:
     hvd = None
 
-def growth_function(x, midpoint=0.5, steepness=10, max_y=0.5):
+def growth_function(x, midpoint=0.5, steepness=10, max_y=0.5, tolerance=0.1):
     """
     Logistic growth-like function.
 
@@ -29,7 +29,9 @@ def growth_function(x, midpoint=0.5, steepness=10, max_y=0.5):
     Returns:
         float or np.ndarray: y값 (0 ~ 1)
     """
-    return  2 * max_y / (1 + torch.exp(-steepness * (x - midpoint))) 
+    y = 2 * max_y / (1 + torch.exp(-steepness * (x - midpoint)))
+    y[x < tolerance] = 0
+    return  y
     # return 1 / (1 + np.exp(-steepness * (x - midpoint)))
 
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):
@@ -149,18 +151,19 @@ class SigLipLoss(nn.Module):
         times=None, time_range=10, time_weight=0.3, 
         negative_only=False
     ) -> torch.Tensor:
-        
-        labels = (classes[:, None] == classes[None, :]).float()
-        if times is not None:
-            time_diff = torch.cdist(times[:, None], times[:, None], p=1.0)
-            time_weights = growth_function(torch.clamp(time_diff, max=time_range) / time_range,
-                                        midpoint=1.0, steepness=6, max_y=time_weight)
-            
-            labels = labels * (same_class_weight - time_weights)
-            labels.fill_diagonal_(1.0)
+        if classes is not None:
+            labels = (classes[:, None] == classes[None, :]).float()
+            if times is not None:
+                time_diff = torch.cdist(times[:, None], times[:, None], p=1.0)
+                time_weights = growth_function(torch.clamp(time_diff, max=time_range) / time_range,
+                                            midpoint=1.0, steepness=6, max_y=time_weight, tolerance=0.1)
+                
+                labels = labels * (same_class_weight - time_weights)
+            else:
+                eye = torch.eye(num_logits, dtype=torch.bool, device=classes.device)
+                labels[labels.bool() & ~eye] = same_class_weight
         else:
-            eye = torch.eye(num_logits, dtype=torch.bool, device=classes.device)
-            labels[labels.bool() & ~eye] = same_class_weight
+            labels = torch.eye(num_logits, dtype=dtype, device=device)
         
         labels = labels.to(device=device, dtype=dtype)
 
@@ -175,8 +178,13 @@ class SigLipLoss(nn.Module):
             logits += logit_bias
         return logits
 
-    def _loss(self, image_features1, image_features2, classes, logit_scale, logit_bias=None, same_class_weight=1.0, 
-              times=None, time_range=10, time_weight=0.3, negative_only=False):
+    def _loss(
+            self, image_features1, image_features2, 
+            logit_scale, logit_bias=None, 
+            classes=None, same_class_weight=1.0, 
+            times=None, time_range=10, time_weight=0.3, 
+            negative_only=False
+            ):
         logits = self.get_logits(image_features1, image_features2, logit_scale, logit_bias)
         labels = self.get_ground_truth(
             image_features1.device,
@@ -188,14 +196,28 @@ class SigLipLoss(nn.Module):
             negative_only=negative_only,
         )
         # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
+        if classes is not None:
+            loss_matrix  = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            mask = ~torch.eye(loss_matrix.size(0), dtype=torch.bool, device=loss_matrix.device)
+            loss = loss_matrix[mask].mean()
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
 
-        loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
         return loss
 
-    def forward(self, image_features1, image_features2, logit_scale, logit_bias, classes, same_class_weight=1.0, 
-                times=None, time_range=10, time_weight=0.3,
-                output_dict=False):
-        loss = self._loss(image_features1, image_features2, classes, logit_scale, logit_bias, same_class_weight, times, time_range, time_weight)
+    def forward(
+            self, image_features1, image_features2, 
+            logit_scale, logit_bias, 
+            classes=None, same_class_weight=1.0, 
+            times=None, time_range=10, time_weight=0.3,
+            output_dict=False
+        ):
+        loss = self._loss(
+            image_features1, image_features2, 
+            logit_scale, logit_bias, 
+            classes, same_class_weight, 
+            times, time_range, time_weight
+        )
 
         if self.world_size > 1:
             if self.dist_impl == 'bidir':

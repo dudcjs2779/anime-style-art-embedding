@@ -81,6 +81,7 @@ def get_transformer_lr_decay_rate(name, lr_decay_rate=1.0, block_depth=12):
         or "reg_token" in name
         or "token_embedding" in name
         or "positional_embedding" in name
+        or "decoder_embed" in name
     ):
         depthness = 0
     elif "blocks." in name and "residual." not in name:
@@ -131,9 +132,10 @@ def make_mae_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
     param_groups = []
 
     vit_depth = len(model.visual.blocks)
+    # vit_depth = len(model.encoder.blocks)
     decoder_depth = len(model.decoder.decoder_blocks)
     for name, param in model.named_parameters():
-        if "visual" in name:
+        if "visual" in name:    # encoder, visual
             if not param.requires_grad:
                 continue
 
@@ -154,6 +156,7 @@ def make_mae_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
 
             decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, decoder_depth)
             d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
+            # d = {"params": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
 
             if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
                 d.update({"wd_multiplier": 0.0})

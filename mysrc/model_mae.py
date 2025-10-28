@@ -3,6 +3,8 @@ import torch.nn as nn
 
 from timm.models.vision_transformer import Block
 from timm.models.eva import Eva, EvaBlock
+from typing import Optional, Tuple, Union
+from timm.layers import resample_abs_pos_embed, to_2tuple, RotaryEmbeddingCat, RotaryEmbeddingMixed
 
 from mysrc.model import create_eva
 
@@ -64,16 +66,56 @@ class EvaDecoder(nn.Module):
             qkv_bias,
             swiglu_mlp,
             scale_mlp,
+            num_prefix_tokens,
+            grid_size,
             norm_layer=nn.LayerNorm,
-            rope=None,
+            dynamic_img_size=False,
+            use_rot_pos_emb=False,
+            rope_mixed_mode=False,
+            rope_grid_offset: float = 0.,
+            rope_grid_indexing: str = 'ij',
+            rope_temperature: float = 10000.,
+            ref_feat_shape: Optional[Union[Tuple[int, int], int]] = None,
             **kargs
         ):
         super().__init__()
+        self.patch_size = patch_size
+        self.grid_size = grid_size
+        self.npt = num_prefix_tokens
+        self.dynamic_img_size = dynamic_img_size
         
         self.decoder_embed = nn.Linear(encoder_dim, decoder_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_dim), requires_grad=True)
-        self.rope = rope
+
+        if use_rot_pos_emb:
+            ref_feat_shape = to_2tuple(ref_feat_shape) if ref_feat_shape is not None else None
+            if rope_mixed_mode:
+                self.rope_mixed = True
+                # Mixed mode to supports depth-dependent frequencies
+                self.rope = RotaryEmbeddingMixed(
+                    dim=decoder_dim,
+                    depth=depth,
+                    num_heads=num_heads,
+                    temperature=rope_temperature,
+                    feat_shape=None if dynamic_img_size else self.grid_size,
+                    grid_indexing=rope_grid_indexing,
+                )
+            else:
+                self.rope_mixed = False
+                self.rope = RotaryEmbeddingCat(
+                    dim=decoder_dim // num_heads,
+                    temperature=rope_temperature,
+                    in_pixels=False,
+                    feat_shape=None if dynamic_img_size else self.grid_size,
+                    ref_feat_shape=ref_feat_shape,
+                    grid_offset=rope_grid_offset,
+                    grid_indexing=rope_grid_indexing,
+                )
+        else:
+            self.rope_mixed = False
+            self.rope = None
+
         self.decoder_blocks = nn.ModuleList([
             EvaBlock(
                 decoder_dim, 
@@ -91,11 +133,12 @@ class EvaDecoder(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
+        # initialize nn.Linear and nn.LayerNorm
+        self.apply(self._init_weights)
+
         torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.mask_token, std=.02)
 
-        # initialize nn.Linear and nn.LayerNorm
-        self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -107,13 +150,47 @@ class EvaDecoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def _pos_embed(self, x) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        cls_token = x[:, :self.npt]
+        x = x[:, self.npt:]
+        
+        if self.dynamic_img_size:
+            if x.dim() == 3:
+                b, n, c = x.shape
+                h = int(np.sqrt(n))
+                w = h
+                x = x.reshape(b, h, w, c)
+
+            B, H, W, C = x.shape
+            if self.decoder_pos_embed is not None:
+                prev_grid_size = self.grid_size
+                pos_embed = resample_abs_pos_embed(
+                    self.decoder_pos_embed,
+                    new_size=(H, W),
+                    old_size=prev_grid_size,
+                    num_prefix_tokens=self.npt,
+                )
+            else:
+                pos_embed = None
+            x = x.view(B, -1, C)
+            rot_pos_embed = self.rope.get_embed(shape=(H, W)) if self.rope is not None else None
+        else:
+            pos_embed = self.decoder_pos_embed
+            rot_pos_embed = self.rope.get_embed() if self.rope is not None else None
+
+        x = torch.cat((cls_token, x), dim=1)
+
+        x = x + pos_embed
+
+        return x, rot_pos_embed
     def forward(self, x):
         x = self.decoder_embed(x)
         # x[:, num_prefix_tokens:, :] = torch.where(mask.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x[:, num_prefix_tokens:, :])
         
-        rope = self.rope.get_embed()
+        x, rope = self._pos_embed(x)
+        # rope = self.rope.get_embed()
+        # x = x + self.decoder_pos_embed
 
-        x = x + self.decoder_pos_embed
         for blk in self.decoder_blocks:
             x = blk(x, rope)
         x = self.decoder_norm(x)
@@ -253,7 +330,7 @@ class MAE(nn.Module):
         super().__init__()
 
         # Encoder
-        self.encoder, _ = create_eva(encoder_name, pretrained=True, **encoder_kargs)
+        self.encoder, encoder_args = create_eva(encoder_name, pretrained=True, **encoder_kargs)
         self.mask_ratio = mask_ratio
         self.embed_dim = self.encoder.embed_dim  # ViT embed dim
         self.patch_size = self.encoder.patch_embed.patch_size[0]  # ViT patch size
@@ -261,10 +338,12 @@ class MAE(nn.Module):
         self.num_patches = self.encoder.patch_embed.num_patches
         self.num_prefix_tokens = self.encoder.num_prefix_tokens
 
-        decoder_kargs['patch_size'] = self.patch_size
-        decoder_kargs['in_chans'] = in_chans
-        decoder_kargs['num_patches'] = self.num_patches
-        decoder_kargs['rope'] = self.encoder.rope
+        decoder_kargs['patch_size'] = encoder_args['patch_size']
+        decoder_kargs['in_chans'] = self.encoder.patch_embed.proj.in_channels
+        decoder_kargs['encoder_dim'] = encoder_args['embed_dim']
+        decoder_kargs['num_patches'] = self.encoder.patch_embed.num_patches
+        decoder_kargs['grid_size'] = self.encoder.patch_embed.grid_size
+        decoder_kargs['num_prefix_tokens'] = self.encoder.num_prefix_tokens
         self.decoder = create_decoder(decoder_name, decoder_kargs)
 
     def patchify(self, imgs):
@@ -345,14 +424,16 @@ def create_decoder(name, kwargs):
 
 def eva_decoder(kwargs):
     model_args = dict(
-        decoder_dim=768,
+        decoder_dim=512,
         depth=8,
-        num_heads=12,
+        num_heads=16,
         qkv_fused=False,
         qkv_bias = True,
         mlp_ratio=4 * 2 / 3,
         swiglu_mlp=True,
         scale_mlp=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(16, 16),
     )
 
     model_args.update(kwargs)

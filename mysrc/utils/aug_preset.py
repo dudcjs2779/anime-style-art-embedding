@@ -19,9 +19,11 @@ def list_preset():
 
 def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
     if mean is None:
-        mean = [0.6938988, 0.6323308, 0.6300056] 
+        mean = [0.5, 0.5, 0.5] 
+        # mean = [0.6938988, 0.6323308, 0.6300056] 
     if std is None:
-        std = [0.3098821,  0.31194064, 0.30595565]
+        std = [0.5, 0.5, 0.5]
+        # std = [0.3098821, 0.31194064, 0.30595565]
 
     w, h = image_size
 

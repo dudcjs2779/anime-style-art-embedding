@@ -144,20 +144,25 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                     crop_masks, mask_indices, none_mask_indices, mask_samples,
                 )
                 cls_features = {
-                    'image_features1': model_out['im_feats_cls'][:bsz],
-                    'image_features2': model_out['im_feats_cls'][bsz:],
-                    'logit_scale': model_out['logit_scale'],
-                    'logit_bias': model_out['logit_bias']
+                    'style_feat1': model_out['style_cls'][:bsz],
+                    'style_feat2': model_out['style_cls'][bsz:],
+                    'content_feat1': model_out['content_cls'][:bsz],
+                    'content_feat2': model_out['content_cls'][bsz:],
                 }
                 logit_scale = model_out["logit_scale"]
                 logit_bias = model_out.get("logit_bias", None)
                 
                 losses = {}
-                losses['clip_loss'] = clip_loss(
-                    cls_features['image_features1'], cls_features['image_features2'], 
+                losses['style_loss'] = clip_loss(
+                    cls_features['style_feat1'], cls_features['style_feat2'], 
                     logit_scale, logit_bias, 
                     classes, same_class_weight=args.same_class_weight, 
                     times=times, time_range=10, time_weight=0.3,
+                    output_dict=False
+                )
+                losses['content_loss'] = clip_loss(
+                    cls_features['content_feat1'], cls_features['content_feat2'], 
+                    logit_scale, logit_bias,
                     output_dict=False
                 )
 
@@ -168,7 +173,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
 
                 loss = mae_loss(pred, label, masks, norm_pix_loss=args.norm_pix_loss)
                 # loss = loss * args.mae_weight
-                losses['mae_loss'] = loss
+                losses['mae_loss'] = loss * 0.5
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
@@ -182,12 +187,11 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                 with autocast():
                     model_out = model(images, crop_masks)
                     cls_features = {
-                        'image_features1': model_out['im_feats_cls'][:bsz],
-                        'image_features2': model_out['im_feats_cls'][bsz:],
+                        'style_feat1': model_out['style_cls'][:bsz],
+                        'style_feat2': model_out['style_cls'][bsz:],
+                        'content_feat1': model_out['content_cls'][:bsz],
+                        'content_feat2': model_out['content_cls'][bsz:],
                     }
-
-                    for f in ("logit_scale", "logit_bias"):
-                        model_out.pop(f, None)
 
                     for key, val in cls_features.items():
                         if key in accum_features:
@@ -228,8 +232,10 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                         crop_masks, mask_indices, none_mask_indices, mask_samples,
                     )
                     cls_features = {
-                        'image_features1': model_out['im_feats_cls'][:bsz],
-                        'image_features2': model_out['im_feats_cls'][bsz:],
+                        'style_feat1': model_out['style_cls'][:bsz],
+                        'style_feat2': model_out['style_cls'][bsz:],
+                        'content_feat1': model_out['content_cls'][:bsz],
+                        'content_feat2': model_out['content_cls'][bsz:],
                     }
                     logit_scale = model_out["logit_scale"]
                     logit_bias = model_out.get("logit_bias", None)
@@ -240,11 +246,16 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                         inputs[key] = torch.cat(accumulated[:j] + [cls_features[key]] + accumulated[j + 1:])
                     
                     losses = {}
-                    losses['clip_loss'] = clip_loss(
-                        inputs['image_features1'], inputs['image_features2'], 
+                    losses['style_loss'] = clip_loss(
+                        inputs['style_feat1'], inputs['style_feat2'], 
                         logit_scale, logit_bias, 
                         accum_classes, same_class_weight=args.same_class_weight, 
                         times=accum_times, time_range=10, time_weight=0.3,
+                        output_dict=False
+                    )
+                    losses['content_loss'] = clip_loss(
+                        inputs['content_feat1'], inputs['content_feat2'], 
+                        logit_scale, logit_bias,
                         output_dict=False
                     )
 
@@ -271,7 +282,6 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                 losses_log['mae_loss'] = losses_log['mae_loss'] * args.accum_freq
                 losses_log['loss'] = sum(losses_log.values())
 
-
         if scaler is not None:
             if args.horovod:
                 optimizer.synchronize()
@@ -290,7 +300,6 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
             if args.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
             optimizer.step()
-
 
         # reset gradient accum, if enabled
         if args.accum_freq > 1:
@@ -393,25 +402,37 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
                 none_mask_indices = none_mask_indices.to(device=device, non_blocking=True)
                 mask_samples = mask_samples.to(device=device, non_blocking=True)
 
+                batch_size = images.shape[0] // 2
                 with autocast():
                     model_out = model.evaluate(
                         images, image_eval,
                         crop_masks, mask_indices, none_mask_indices, mask_samples,
                     )
-                    eval_features = model_out["im_eval_feats_cls"]
+                    cls_features = {
+                        'style_feat1': model_out['style_cls'][:batch_size],
+                        'style_feat2': model_out['style_cls'][batch_size:],
+                        'content_feat1': model_out['content_cls'][:batch_size],
+                        'content_feat2': model_out['content_cls'][batch_size:],
+                    }
+                    eval_features = model_out["eval_style_cls"]
                     logit_scale = model_out["logit_scale"]
-                    logit_bias = model_out.get('logti_bias', None)
+                    logit_bias = model_out.get('logit_bias', None)
                     
-                    batch_size = images.shape[0] // 2
                     all_image_features.append(eval_features.cpu())
                     all_classes.append(classes.cpu())
 
                     losses = {}
-                    losses['clip_loss'] = clip_loss(
-                        model_out['im_feats_cls'][:batch_size], model_out['im_feats_cls'][batch_size:],
+                    losses['style_loss'] = clip_loss(
+                        cls_features['style_feat1'], cls_features['style_feat2'], 
                         logit_scale, logit_bias, 
                         classes=classes, same_class_weight=args.same_class_weight,
                         times=times, time_range=args.time_range, time_weight=args.time_weight,
+                        output_dict=False
+                    )
+
+                    losses['content_loss'] = clip_loss(
+                        cls_features['content_feat1'], cls_features['content_feat2'], 
+                        logit_scale, logit_bias,
                         output_dict=False
                     )
 
@@ -459,7 +480,8 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
 
             metrics.update({
                     **val_metrics, 
-                    "clip_loss": losses_m['clip_loss'].avg, 
+                    "style_loss": losses_m['style_loss'].avg, 
+                    "content_loss": losses_m['content_loss'].avg, 
                     "mae_loss": losses_m['mae_loss'].avg, 
                     "epoch": epoch, "num_samples": num_samples
                  })
@@ -546,8 +568,14 @@ def main(args):
     # train_loader, valid_loader = make_pretrain_dataset03(args)
 
     print("## Model Create\n")
-    model = CustomMaeVisual(model_name=args.model_name, decoder_name=args.decoder_name, init_logit_scale=math.log(10), init_logit_bias=-10, output_dict=True, model_kargs=args.model_kargs)
-    model.to(device=device)
+    model = CustomMaeVisual(
+        model_name=args.model_name, 
+        decoder_name=args.decoder_name, 
+        model_kargs=args.model_kargs,
+        init_logit_scale=math.log(10), 
+        init_logit_bias=-10, 
+        output_dict=True, 
+    ).to(device=device)
     load_pretrain(model, args.pretrain)
 
     if is_master(args):
@@ -639,11 +667,11 @@ def main(args):
     scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
     print(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
 
-    args.step = 0
+    # args.step = 0
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(model, device, train_loader, clip_loss, cosine_loss, epoch, optimizer, scaler, scheduler, writer, args)
         completed_epoch = epoch + 1
-        args.step += 1
+        # args.step += 1
         metrics = evaluate(model, device, valid_loader, clip_loss, cosine_loss, completed_epoch, writer, args.step, args)
 
         checkpoint_dict = {

@@ -21,7 +21,7 @@ from mysrc.utils.pos_embed import get_2d_sincos_pos_embed
 from mysrc.utils.logger import setup_logging
 from mysrc.utils.precision import get_autocast, get_input_dtype
 from mysrc.utils.scheduler import CosineScheduler
-from mysrc.utils.optim_utils import make_param_groups
+from mysrc.utils.optim_utils import make_mae_param_groups
 from mysrc.utils.dataset import make_mae_dataset
 from mysrc.model_mae import MAE
 
@@ -319,7 +319,7 @@ def main(args):
 
     # Optimizer
     
-    params_group = make_param_groups(model, args.lr_decay, args.patch_embed_lr_mult)
+    params_group = make_mae_param_groups(model, args.lr_decay, args.patch_embed_lr_mult)
     optimizer = torch.optim.AdamW(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)
     defaults = copy.deepcopy(optimizer.defaults)
     defaults['weight_decay'] = args.wd

@@ -395,11 +395,13 @@ def make_pretrain_dataset02(args):
     valid_df = pd.read_parquet(args.valid)
     print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    # train_df = train_df[train_df['target'].isin([i for i in range(30)])]
-    # valid_df = valid_df[valid_df['target'].isin([i for i in range(30)])]
+    # train_df = train_df[train_df['target'].isin([i for i in range(60)])]
+    # valid_df = valid_df[valid_df['target'].isin([i for i in range(60)])]
 
-    transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
-    valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
 
     logging.info(f"Train Image Processor:")
     logging.info(f"{transforms}")
@@ -1322,70 +1324,6 @@ class StyleClipDataset(Dataset):
         # return result, tags_encoded, _keep_tags_encoded
         return result, tag_onehot, tag_keep_onehot
     
-    # def tokenize_tag(self, tags, label=0):
-    #     np.random.shuffle(tags)
-    #     if label is not None:
-    #         label_tag = f"<artist_{label}>"
-    #         tags = np.concatenate(([label_tag], tags))
-
-    #     tag_str = " , ".join(tags) + " ,"
-    #     result = torch.zeros(self.tokenizer.context_length, dtype=torch.long)
-
-    #     tokens = self.tokenizer.encode(tag_str)
-    #     # tags_encoded = self.split_tokens(tokens)[1:] if label is not None else self.split_tokens(tokens)  # 라벨태그 제거
-    #     tags_encoded = self.split_tokens(tokens)
-    #     tags_encoded = [str(tag) for tag in tags_encoded]
-    #     num_keep = self.tokenizer.context_length - 2
-
-    #     keep_tokens = tokens[:num_keep+1]
-    #     trunc_id = (len(keep_tokens)-1) - keep_tokens[::-1].index(267)
-
-    #     keep_tags_encoded = self.split_tokens(keep_tokens[:trunc_id])
-    #     # _keep_tags_encoded = keep_tags_encoded[1:] if label is not None else keep_tags_encoded  # 라벨태그 제거
-    #     _keep_tags_encoded = keep_tags_encoded  # 라벨태그 제거
-    #     _keep_tags_encoded = [str(tag) for tag in _keep_tags_encoded]
-    #     np.random.shuffle(keep_tags_encoded)
-
-    #     flatten_tokens = [token for tag in keep_tags_encoded for token in (*tag, 267)][:-1]
-    #     result_tokens = [self.tokenizer.sot_token_id] + flatten_tokens + [self.tokenizer.eot_token_id]
-    #     result[:len(result_tokens)] = torch.tensor(result_tokens)
-    #     # [self.tokenizer.decode(tag) for tag in tags_encoded], [self.tokenizer.decode(tag) for tag in _keep_tags_encoded]
-
-    #     return result, tags_encoded, _keep_tags_encoded
-        
-    
-    # def tokenize_tag(self, tags, label=None, return_decode=False):
-    #     np.random.shuffle(tags)
-
-    #     if label is not None:
-    #         tags = np.concatenate(([f"<artist_{label}>"], tags))
-
-    #     tag_str = " , ".join(tags) + " ,"
-    #     result = torch.zeros(self.tokenizer.context_length, dtype=torch.long)
-
-    #     tokens = self.tokenizer.encode(tag_str)
-    #     num_keep = self.tokenizer.context_length - 2
-
-    #     keep_tokens = tokens[:num_keep+1]
-    #     trunc_id = (len(keep_tokens)-1) - keep_tokens[::-1].index(267)
-
-    #     _decoded_tags = self.tokenizer.decode(keep_tokens[:trunc_id]).split(",")
-    #     _decoded_tags = [tag.strip() for tag in _decoded_tags]
-    #     decoded_tags = _decoded_tags[1:] if label is not None else _decoded_tags
-
-    #     np.random.shuffle(_decoded_tags)
-    #     shuffled_tag_str = " , ".join(_decoded_tags)
-    #     result_tokens = [self.tokenizer.sot_token_id] + self.tokenizer.encode(shuffled_tag_str) + [self.tokenizer.eot_token_id]
-
-    #     # result_tokens = [self.tokenizer.sot_token_id] + keep_tokens[:trunc_id] + [self.tokenizer.eot_token_id]
-    #     result[:len(result_tokens)] = torch.tensor(result_tokens)
-
-    #     if return_decode:
-    #         return result, decoded_tags
-        
-    #     return result
-    
-
 
     def get_pil(self, idx, pixels=None):
         image =Image.open(self.images[idx])

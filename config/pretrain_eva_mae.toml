@@ -1,8 +1,8 @@
 [model]
 model_name = 'eva02_base_patch14_224.mim_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 precision = 'amp'  # amp, float16
-# resume = 'logs/25-09-07_20-49-47_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_7.pt'
-pretrain = 'pretrain_log/25-09-14_04-10-12_eva02_base_patch14_224.mim_in22k_qx2lxgde/checkpoint/epoch_30.pt'
+# resume = 'pretrain_log/25-10-21_22-02-45_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_6.pt'
+pretrain = 'pretrain_log/25-10-25_02-45-13_eva02_base_patch14_224.mim_in22k_7zv8a3xc/checkpoint/epoch_30.pt' # pretrain/my_eva_decoder_512.pt
 save_frequency = 1
 max_save_count = 10
 
@@ -17,7 +17,7 @@ decoder_name = "eva_decoder"
 horovod = false
 
 [train]
-seed = 42
+seed = 43
 epochs = 30
 batch_size = 16
 accum_freq = 16
@@ -29,7 +29,7 @@ recon_weight = 1.0
 size_per_mask_range = [1, 4]
 
 [loss]
-same_class_weight = 0.9
+same_class_weight = 1.0
 mae_weight = 0.5
 norm_pix_loss = false
 
@@ -76,7 +76,7 @@ num_postive = [2, 3]
 [logger]
 report_to = 'wandb'    # tensorboard, wandb
 wandb_project_name = 'pretrain_quality'  # nkoma-greyscale
-# run_id = 'r15fyjq4'
+# run_id = 'ntxc9wft'
 log_every_n_steps = 10
 log_local = false
 
