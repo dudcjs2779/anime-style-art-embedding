@@ -21,12 +21,12 @@ from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02, make_pretrain_dataset03
 from mysrc.utils.optim_utils import make_mae_param_groups
-from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss
+from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, PrototypeContrastiveLoss
 from mysrc.utils.scheduler import CosineScheduler
 from mysrc.utils.precision import get_autocast, get_input_dtype
 from mysrc.model import CustomMaeVisual
 from mysrc.utils.file_utils import pt_load
-from mysrc.utils.metrics import get_embed_metrics
+from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics
 
 
 class AverageMeter(object):
@@ -94,7 +94,7 @@ def load_pretrain(model, path):
         logging.info(f"missing_key: {len(missing)}: {missing[:10]}")
         logging.info(f"unexpected_key: {len(unexpected)}: {unexpected[:10]}")
 
-def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, optimizer, scaler, scheduler, tb_writer, args):
+def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, optimizer, scaler, scheduler, tb_writer, args):
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
     model.train()
@@ -153,13 +153,28 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                 logit_bias = model_out.get("logit_bias", None)
                 
                 losses = {}
-                losses['style_loss'] = clip_loss(
-                    cls_features['style_feat1'], cls_features['style_feat2'], 
-                    logit_scale, logit_bias, 
-                    classes, same_class_weight=args.same_class_weight, 
-                    times=times, time_range=10, time_weight=0.3,
-                    output_dict=False
-                )
+                # losses['style_loss'] = clip_loss(
+                #     cls_features['style_feat1'], cls_features['style_feat2'], 
+                #     logit_scale, logit_bias, 
+                #     classes, same_class_weight=args.same_class_weight, 
+                #     times=times, time_range=10, time_weight=0.3,
+                #     output_dict=False
+                # )
+
+                losses['style_loss'] = proto_loss(
+                    cls_features['style_feat1'], model.prototypes,
+                    logit_scale, logit_bias,
+                    classes,
+                    train=True,
+                ) * 0.5
+
+                losses['style_loss'] +=  proto_loss(
+                    cls_features['style_feat2'], model.prototypes,
+                    logit_scale, logit_bias,
+                    classes,
+                    train=True,
+                ) * 0.5
+
                 losses['content_loss'] = clip_loss(
                     cls_features['content_feat1'], cls_features['content_feat2'], 
                     logit_scale, logit_bias,
@@ -246,13 +261,27 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
                         inputs[key] = torch.cat(accumulated[:j] + [cls_features[key]] + accumulated[j + 1:])
                     
                     losses = {}
-                    losses['style_loss'] = clip_loss(
-                        inputs['style_feat1'], inputs['style_feat2'], 
-                        logit_scale, logit_bias, 
-                        accum_classes, same_class_weight=args.same_class_weight, 
-                        times=accum_times, time_range=10, time_weight=0.3,
-                        output_dict=False
-                    )
+                    # losses['style_loss'] = clip_loss(
+                    #     inputs['style_feat1'], inputs['style_feat2'], 
+                    #     logit_scale, logit_bias, 
+                    #     accum_classes, same_class_weight=args.same_class_weight, 
+                    #     times=accum_times, time_range=10, time_weight=0.3,
+                    #     output_dict=False
+                    # )
+                    losses['style_loss'] = proto_loss(
+                        inputs['style_feat1'], model.prototypes,
+                        logit_scale, logit_bias,
+                        accum_classes,
+                        train=True,
+                    ) * 0.5
+
+                    losses['style_loss'] +=  proto_loss(
+                        inputs['style_feat2'], model.prototypes,
+                        logit_scale, logit_bias,
+                        accum_classes,
+                        train=True,
+                    ) * 0.5
+
                     losses['content_loss'] = clip_loss(
                         inputs['content_feat1'], inputs['content_feat2'], 
                         logit_scale, logit_bias,
@@ -375,7 +404,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, cosine_loss, epoch, op
     # end for
 
 
-def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer, step, args):
+def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer, step, args):
     metrics = {}
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
@@ -422,13 +451,24 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
                     all_classes.append(classes.cpu())
 
                     losses = {}
-                    losses['style_loss'] = clip_loss(
-                        cls_features['style_feat1'], cls_features['style_feat2'], 
-                        logit_scale, logit_bias, 
-                        classes=classes, same_class_weight=args.same_class_weight,
-                        times=times, time_range=args.time_range, time_weight=args.time_weight,
-                        output_dict=False
-                    )
+                    # losses['style_loss'] = clip_loss(
+                    #     cls_features['style_feat1'], cls_features['style_feat2'], 
+                    #     logit_scale, logit_bias, 
+                    #     classes=classes, same_class_weight=args.same_class_weight,
+                    #     times=times, time_range=args.time_range, time_weight=args.time_weight,
+                    #     output_dict=False
+                    # )
+                    losses['style_loss'] = proto_loss(
+                        cls_features['style_feat1'], model.prototypes,
+                        logit_scale, logit_bias,
+                        classes,
+                    ) * 0.5
+
+                    losses['style_loss'] +=  proto_loss(
+                        cls_features['style_feat2'], model.prototypes,
+                        logit_scale, logit_bias,
+                        classes,
+                    ) * 0.5
 
                     losses['content_loss'] = clip_loss(
                         cls_features['content_feat1'], cls_features['content_feat2'], 
@@ -473,8 +513,14 @@ def evaluate(model, device, dataloader, clip_loss, cosine_loss, epoch, tb_writer
             if logit_bias:
                 logit_bias = logit_bias.cpu()
 
-            val_metrics = get_embed_metrics(
+            # val_metrics = get_embed_metrics(
+            #     image_features=torch.cat(all_image_features),
+            #     classes=torch.cat(all_classes),
+            # )
+
+            val_metrics = get_proto_metrics(
                 image_features=torch.cat(all_image_features),
+                prototypes=model.prototypes.cpu(),
                 classes=torch.cat(all_classes),
             )
 
@@ -574,7 +620,8 @@ def main(args):
         model_kargs=args.model_kargs,
         init_logit_scale=math.log(10), 
         init_logit_bias=-10, 
-        output_dict=True, 
+        output_dict=True,
+        num_classes=args.num_classes,
     ).to(device=device)
     load_pretrain(model, args.pretrain)
 
@@ -602,6 +649,16 @@ def main(args):
     )
 
     cosine_loss = CosineSimilarityLoss(dim=-1)
+
+    proto_loss = PrototypeContrastiveLoss(
+        num_classes=args.num_classes,
+        feat_dim=768,
+        momentum=0.95,
+        rank=args.rank,
+        world_size=args.world_size,
+        dist_impl=args.loss_dist_impl,
+        device=device,
+    )
 
     if is_master(args):
             defaults = copy.deepcopy(optimizer.defaults)
@@ -669,10 +726,10 @@ def main(args):
 
     # args.step = 0
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(model, device, train_loader, clip_loss, cosine_loss, epoch, optimizer, scaler, scheduler, writer, args)
+        train_one_epoch(model, device, train_loader, clip_loss, proto_loss, epoch, optimizer, scaler, scheduler, writer, args)
         completed_epoch = epoch + 1
         # args.step += 1
-        metrics = evaluate(model, device, valid_loader, clip_loss, cosine_loss, completed_epoch, writer, args.step, args)
+        metrics = evaluate(model, device, valid_loader, clip_loss, proto_loss, completed_epoch, writer, args.step, args)
 
         checkpoint_dict = {
             "epoch": completed_epoch,

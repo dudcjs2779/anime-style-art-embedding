@@ -397,6 +397,7 @@ def make_pretrain_dataset02(args):
 
     # train_df = train_df[train_df['target'].isin([i for i in range(60)])]
     # valid_df = valid_df[valid_df['target'].isin([i for i in range(60)])]
+    args.num_classes = train_df['target'].nunique()
 
     # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
     # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])

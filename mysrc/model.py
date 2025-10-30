@@ -588,6 +588,7 @@ class CustomMaeVisual(nn.Module):
             init_logit_scale: float = np.log(1 / 0.07),
             init_logit_bias: Optional[float] = None,
             nonscalar_logit_scale: bool = False,
+            num_classes=None,
             output_dict: bool = False,
     ):
         super().__init__()
@@ -630,6 +631,7 @@ class CustomMaeVisual(nn.Module):
         # trunc_normal_(self.content_head.weight, std=.02)
         # self.content_head.weight.data.mul_(0.001)
         # self.content_head.bias.data.mul_(0.001)
+        self.register_buffer('prototypes', torch.zeros(num_classes, visual_args['embed_dim']))
         
 
     def encode_image(self, image, mask=None, normalize: bool = False):

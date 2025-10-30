@@ -701,9 +701,9 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
                 ], p=0.2),
 
                 A.Compose([
-                    A.LongestMaxSize(max_size=max(540, 540), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
-                    A.PadIfNeeded(min_height=540, min_width=540, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
-                    A.RandomScale(scale_limit=[-0.28, 0.0], interpolation=cv2.INTER_CUBIC, p=1.0),
+                    A.LongestMaxSize(max_size=max(640, 640), interpolation=cv2.INTER_CUBIC), # 가장 긴변을 img_size에 맞춤
+                    A.PadIfNeeded(min_height=640, min_width=640, border_mode=cv2.BORDER_CONSTANT, fill=255), # 패딩
+                    A.RandomScale(scale_limit=[-0.3, 0.0], interpolation=cv2.INTER_CUBIC, p=1.0),
                     A.RandomCrop(h, w, border_mode=cv2.BORDER_CONSTANT, p=1.0),
                 ], p=0.8),
             ], p=1.0),

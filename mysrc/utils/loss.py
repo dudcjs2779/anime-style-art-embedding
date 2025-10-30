@@ -301,6 +301,97 @@ class SigLipLoss(nn.Module):
 
         return {"contrastive_loss": loss} if output_dict else loss
     
+
+class PrototypeContrastiveLoss(nn.Module):
+    def __init__(
+            self, num_classes, feat_dim, momentum, 
+            rank = 0, 
+            world_size = 1, 
+            dist_impl = None,
+            device=None, 
+        ):
+        super().__init__()
+        self.rank = rank
+        self.world_size = world_size
+        self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
+        assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
+
+        self.num_classes = num_classes
+        self.all_classes = torch.arange(num_classes, device=device, dtype=torch.float32)
+        self.feat_dim = feat_dim
+        self.momentum = momentum
+
+
+    @torch.no_grad()
+    def update_prototypes(self, features, prototypes, classes):
+        """ 배치 내 feature로 prototype 갱신 (momentum 평균) """
+        _classes = classes.unique().to(dtype=int)
+        for cls in _classes:
+            mask = (classes == cls)
+            new_proto = features[mask].mean(dim=0)
+            prototypes[cls] = (
+                self.momentum * prototypes[cls] + (1 - self.momentum) * new_proto
+            )
+
+        prototypes[_classes] = F.normalize(prototypes[_classes], dim=-1)
+
+    def get_ground_truth(
+        self, device, dtype, num_logits, classes, same_class_weight=1.0, 
+    ) -> torch.Tensor:
+        if classes is not None:
+            labels = (classes[:, None] == self.all_classes[None, :]).float()
+        else:
+            labels = torch.eye(num_logits, dtype=dtype, device=device)
+        
+        labels = labels.to(device=device, dtype=dtype)
+
+        return labels
+
+    def get_logits(self, image_features, prototypes, logit_scale, logit_bias=None):
+        # protos = F.normalize(prototypes, dim=1)
+        logits = logit_scale * image_features @ prototypes.T
+        if logit_bias is not None:
+            logits += logit_bias
+        return logits
+    
+    def _loss(
+            self, image_features, prototypes,
+            logit_scale, logit_bias=None, 
+            classes=None, same_class_weight=1.0, 
+            ):
+        logits = self.get_logits(image_features, prototypes, logit_scale, logit_bias)
+        labels = self.get_ground_truth(
+            image_features.device,
+            image_features.dtype,
+            image_features.shape[0],
+            classes,
+            same_class_weight,
+        )
+        # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
+        loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
+
+        return loss
+
+    def forward(
+            self, features, prototypes,
+            logit_scale, logit_bias, 
+            classes, same_class_weight=1.0, 
+            output_dict=False,
+            train=False,
+        ):
+        if train:
+            with torch.no_grad():
+                self.update_prototypes(features, prototypes, classes)
+
+        loss = self._loss(
+            features, prototypes,
+            logit_scale, logit_bias, 
+            classes, same_class_weight, 
+        )
+
+        return {"contrastive_loss": loss} if output_dict else loss
+
+
 class SigLipLoss2(nn.Module):
     """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
 
