@@ -3,6 +3,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from mysrc.utils.augmentation import (
+    ShiftScaleCenterCrop,
     RandomResizedCropAutoScale, 
     RandomResizedCropWithPad, 
     RandomSmallestMaxSize, 
@@ -1235,7 +1236,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
             A.OneOf([
                 RandomResizedCropWithPad(
                     size=[h, w],
-                    scale=[0.05, 1.0],
+                    scale=[0.1, 1.0],
                     ratio=[0.75, 1.3333333333333333],
                     interpolation=cv2.INTER_CUBIC,
                     border_mode=cv2.BORDER_CONSTANT,
@@ -1272,7 +1273,7 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
             A.OneOf([
                 A.RandomResizedCrop(
                     size=[h, w],
-                    scale=[0.01, 0.15],
+                    scale=[0.03, 0.15],
                     ratio=[0.75, 1.3333333333333333],
                     interpolation=cv2.INTER_CUBIC,
                     p=0.9),
