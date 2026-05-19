@@ -4,9 +4,7 @@ import numpy as np
 from PIL import Image
 import pandas as pd
 
-ext_type = (".jpg", ".png", ".jpeg")
-
-def get_files(directory, pair=True):
+def get_files(directory, ext_type=(".jpg", ".png", ".jpeg")):
     images = []
     for root, dirs, files in os.walk(directory):
         for file in files:
