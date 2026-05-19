@@ -392,7 +392,7 @@ def make_pretrain_dataset(args):
 
     return train_loader, valid_loader
 
-def make_realation_label(path, df, dtype):
+def make_relation_label(path, df, dtype):
     with open(path, 'r', encoding='utf-8') as file:
         sim_labels = yaml.safe_load(file)
 
@@ -426,7 +426,7 @@ def make_pretrain_dataset02(args):
     # train_df = train_df[train_df['target'].isin([i for i in range(20)])]
     # valid_df = valid_df[valid_df['target'].isin([i for i in range(20)])]
     args.num_classes = train_df['target'].nunique()
-    args.rel_real = make_realation_label(args.relation, train_df, torch.float32)
+    args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
     args.rel_pseudo = args.rel_real.clone()
 
     # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
