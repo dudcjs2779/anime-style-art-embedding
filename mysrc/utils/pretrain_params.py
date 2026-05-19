@@ -156,12 +156,6 @@ def setup_parser():
         help="Validate batch size."
     )
     parser.add_argument(
-        "--valid",
-        type=bool,
-        default=True,
-        help="Validate every epoch."
-    )
-    parser.add_argument(
         "--valid_size",
         type=int,
         default=2000,
@@ -288,10 +282,20 @@ def setup_parser():
         "--train",
         type=str,
         default=None,
-        help=(
-            "Training data that the type of dataframe with a .parquet extension. "
-            "it is necessary image path column and label column"
-        )
+        help="Training data that the type of dataframe with a .parquet extension."
+    )
+    parser.add_argument(
+        "--valid",
+        type=str,
+        default=None,
+        help=
+            "Validation data that the type of dataframe with a .parquet extension."
+    )
+    parser.add_argument(
+        "--relation",
+        type=str,
+        default=None,
+        help="Relation labels between classes. "
     )
     parser.add_argument(
         "--image_key",

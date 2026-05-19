@@ -6,8 +6,10 @@ import json
 import torch
 import numpy as np
 import random
+import re
+import yaml
 
-from collections import defaultdict
+from collections import defaultdict, Counter
 from copy import deepcopy
 import albumentations as A
 from functools import partial
@@ -390,14 +392,42 @@ def make_pretrain_dataset(args):
 
     return train_loader, valid_loader
 
+def make_realation_label(path, df, dtype):
+    with open(path, 'r', encoding='utf-8') as file:
+        sim_labels = yaml.safe_load(file)
+
+    sim_split_labels = []
+    for line in sim_labels:
+        temp = list(re.search("(.+)<==>(.+):[ ]*([\d].[\d]+)", line).groups())
+        temp[2] = float(temp[2])
+        sim_split_labels.append(temp)
+
+    num_classes = df['style_group'].nunique()
+    rel_matrix = torch.eye(num_classes, dtype=dtype)
+
+    class_to_target = {}
+    for class_name, target in df[['style_group', 'target']].values:
+        class_to_target[class_name] = target
+
+    for tag1, tag2, weight in sim_split_labels:
+        if tag1 in class_to_target and tag2 in class_to_target:
+            i, j = class_to_target[tag1], class_to_target[tag2]
+            rel_matrix[i, j] = rel_matrix[j, i] = weight
+
+    return rel_matrix
+
+
+
 def make_pretrain_dataset02(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
     print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    # train_df = train_df[train_df['target'].isin([i for i in range(60)])]
-    # valid_df = valid_df[valid_df['target'].isin([i for i in range(60)])]
+    # train_df = train_df[train_df['target'].isin([i for i in range(20)])]
+    # valid_df = valid_df[valid_df['target'].isin([i for i in range(20)])]
     args.num_classes = train_df['target'].nunique()
+    args.rel_real = make_realation_label(args.relation, train_df, torch.float32)
+    args.rel_pseudo = args.rel_real.clone()
 
     # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
     # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
@@ -423,6 +453,7 @@ def make_pretrain_dataset02(args):
     train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
     train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
     sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
+    # sampler = ReleationBatchSampler(train_dataset, batch_size=args.batch_size, rel_matrix=args.rel_pseudo.detach().cpu().numpy(), drop_last=True)
     train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
@@ -824,7 +855,7 @@ def make_ml_mse_dataset(args, autodtype, device, set_df=False):
 
 
 def exclude_norm_totensor(transforms):
-    transforms = [trans for trans in transforms if not isinstance(trans, (A.augmentations.transforms.Normalize, A.pytorch.transforms.ToTensorV2))]
+    transforms = [trans for trans in transforms if not isinstance(trans, (A.augmentations.pixel.transforms.Normalize, A.pytorch.transforms.ToTensorV2))]
     return A.Compose(transforms)
 
 def remove_normalize_and_totensor(transforms: A.Compose) -> A.Compose:
@@ -832,14 +863,14 @@ def remove_normalize_and_totensor(transforms: A.Compose) -> A.Compose:
         # 만약 내부에 또 Compose가 있으면 재귀적으로 처리
         if isinstance(t, A.core.composition.Compose):
             return A.Compose([_filter(inner) for inner in t.transforms 
-                              if not isinstance(inner, (A.augmentations.transforms.Normalize, A.pytorch.transforms.ToTensorV2))],
+                              if not isinstance(inner, (A.augmentations.pixel.transforms.Normalize, A.pytorch.transforms.ToTensorV2))],
                              p=t.p)
         else:
             return t
 
     filtered = [
         _filter(t) for t in transforms.transforms
-        if not isinstance(t, (A.augmentations.transforms.Normalize, A.pytorch.transforms.ToTensorV2))
+        if not isinstance(t, (A.augmentations.pixel.transforms.Normalize, A.pytorch.transforms.ToTensorV2))
     ]
     return A.Compose(filtered, p=transforms.p)
 
@@ -1512,7 +1543,163 @@ class CustomBatchSampler(Sampler[int]):
                 all_batches.append(selected)
 
         return all_batches
-    
+
+class ReleationBatchSampler(Sampler[int]):
+    r"""
+    class를 랜덤으로 하나 샘플링한뒤 해당 클래스와 같은 클래스의 샘플을 num_postive 갯수만큼 
+    1개 미니배치에 포함시킵니다. 나머지 는 선택된 class의 샘플을 제외하고 무작위로 채워집니다.
+
+    Args:
+        num_postive: 1개 미니배치에 포함하고 싶은 postive sample의 갯수 (min_num, max_num):Tuple
+            ex: (2, 4)로 설정할 경우 샘플링된 클래스가 미내배치내에 2~4개 존재합니다.
+    """
+
+    def __init__(self, dataset, batch_size, rel_matrix: np.ndarray, drop_last=True) -> None:
+        self.dataset = dataset
+        indices = [i for i in range(len(self.dataset))]
+        labels = dataset.labels.to(dtype=int).tolist()
+        self.unique_labels = dataset.labels.unique().to(dtype=int).tolist()
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.rel_matrix = rel_matrix
+
+        data_by_class = defaultdict(list)
+        for idx, label in zip(indices, labels):
+            data_by_class[label].append(idx)
+
+        self.data_by_class = data_by_class
+
+    def __iter__(self):
+        self.all_batches = self.make_batches()
+        for idxs in self.all_batches:
+            yield idxs
+        # return iter(range(len(self.data_source)))
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        else:
+            return math.ceil(len(self.dataset) / self.batch_size)
+
+    def relation_weight(self, tau=2.0):
+        means = self.rel_matrix.mean(axis=-1)
+
+        # 평균 낮을수록 높은 score
+        scores = -means
+
+        # normalize (z-score)
+        scores = (scores - scores.mean()) / (scores.std() + 1e-8)
+
+        # softmax
+        exp_scores = np.exp(scores / tau)
+        weights = exp_scores / exp_scores.sum()
+
+        return weights
+        
+    def make_batches(self):
+        data_by_class_copy = deepcopy(self.data_by_class)
+
+        remain_num = sum(len(v) for v in data_by_class_copy.values())
+        available_mask = np.ones(len(self.unique_labels), dtype=bool)
+        all_batches = []
+        # self.all_classes = []
+        # self.remain_class = []
+
+        relation_weights = self.relation_weight(2.5)
+
+        while True:
+            class_count_weight = np.array([len(data_by_class_copy[i]) for i in self.unique_labels])
+            cls = random.choices(self.unique_labels, weights=class_count_weight * relation_weights, k=1)[0]
+
+            selected_samples = []
+            # classes = []
+
+            # 선택된 클래스에서 1개 샘플 보장
+            samples = data_by_class_copy[cls]
+
+            idx = random.randrange(len(samples))
+            selected_samples.append(samples.pop(idx))
+            # classes.append(cls)
+            remain_num -= 1
+
+            if not samples:
+                available_mask[cls] = False
+
+            # batch 샘플링
+            while len(selected_samples) < self.batch_size:
+                weights=(self.rel_matrix[cls] + 0.01) * available_mask # 연관성 0인 데이터도 낮은 가중치로 보장
+                selected_cls = random.choices(self.unique_labels, weights=weights, k=self.batch_size-1)
+
+                counter = Counter([cls] + selected_cls)
+                most_freq = counter.most_common(1)[0][1]
+
+                # 과도한 같은 클래스 중복 및 다양한 클래스 샘플링을 위한 조건문
+                if 0.5 < most_freq / self.batch_size or len(counter) <= 4:
+                    weights = self.rel_matrix[cls].copy() + 0.01
+                    weights[cls] = 0
+
+                    selected_cls = random.choices(self.unique_labels, weights=weights, k=self.batch_size // 2)
+                    selected_cls = selected_cls + [cls] * (self.batch_size // 2 - 1) # 전체 batch 수가 너무 늘어나는 것 방지
+
+                    for i in selected_cls:
+                        if i == cls:
+                            samples = data_by_class_copy[i]
+                        else:
+                            samples = self.data_by_class[i]  # 전체 데이터에서 샘플링
+
+                        if samples:
+                            idx = random.randrange(len(samples))
+
+                            # 샘플링한 데이터가 cls와 같으면 제거
+                            if i == cls:
+                                selected_samples.append(samples.pop(idx))
+                                remain_num -= 1
+                                
+                                if not samples:
+                                    available_mask[i] = False
+                            else:
+                                selected_samples.append(samples[idx])
+
+                            # classes.append(i)
+
+                            if len(selected_samples) >= self.batch_size:
+                                break
+
+                else:
+                    for i in selected_cls:
+                        samples = data_by_class_copy[i]
+
+                        if samples:
+                            # random.choice + remove 대신 pop(idx)
+                            idx = random.randrange(len(samples))
+                            selected_samples.append(samples.pop(idx))
+                            remain_num -= 1
+                            # classes.append(i)
+
+                            if not samples:
+                                available_mask[i] = False
+
+                            if len(selected_samples) >= self.batch_size:
+                                break
+            
+            random.shuffle(selected_samples)
+            all_batches.append(selected_samples)
+            # self.all_classes.append(classes)
+            # self.remain_class.append(np.array(self.unique_labels)[available_mask])
+
+            if len(all_batches) >= len(self):
+                self.data_by_class_copy = data_by_class_copy
+                break
+
+            if remain_num < self.batch_size:
+                if self.drop_last:
+                    break
+                else:
+                    all_batches.append([v for value in data_by_class_copy.values() for v in value])
+                    break
+                
+        random.shuffle(all_batches)
+        return all_batches
     
 class InferDataset(Dataset):
     def __init__(self, images, transforms, df=None):

@@ -61,6 +61,25 @@ class CosineScheduler(object):
         else:
             return self.schedule[it]
 
+class StepGenerator:
+    """
+    전반부/후반부로 갈수록 이벤트가 더 자주 발생하는 step 생성
+    """
+    def __init__(self, total_steps: int, num_events: int, shape: float = 0.5, start_ratio: float = 0.0, ):
+        if start_ratio == 0.0:
+            t = np.linspace(0, 1, num_events + 2)[1:-1]
+        else:
+            t = np.linspace(0, 1, num_events + 1)[:-1]
+
+        curved = t ** shape * (1-start_ratio) + start_ratio
+        steps = curved * total_steps
+
+        self.step_list = np.unique(steps.astype(int)).tolist()
+        self.steps = set(self.step_list)
+
+    def is_update_step(self, step: int) -> bool:
+        return step in self.steps
+        
 
 class CosineAnnealingWarmUpRestarts(_LRScheduler):
     def __init__(self, optimizer, cycle_step, cy_mult=1, lr_max=0.1, lr_min = 0.0, warmup=0, gamma=1., last_epoch=-1):

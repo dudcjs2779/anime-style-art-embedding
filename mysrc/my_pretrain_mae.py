@@ -21,12 +21,12 @@ from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02, make_pretrain_dataset03
 from mysrc.utils.optim_utils import make_mae_param_groups
-from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, PrototypeContrastiveLoss
-from mysrc.utils.scheduler import CosineScheduler
+from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, PrototypeContrastiveLoss, RelationPrototypeContrastiveLoss, RelationSigLipLoss, uniform_loss
+from mysrc.utils.scheduler import CosineScheduler, StepGenerator
 from mysrc.utils.precision import get_autocast, get_input_dtype
 from mysrc.model import CustomMaeVisual
 from mysrc.utils.file_utils import pt_load
-from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics
+from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics, get_class_topk
 
 
 class AverageMeter(object):
@@ -93,8 +93,60 @@ def load_pretrain(model, path):
         logging.info(f"Loaded pretrain mode from {path}")
         logging.info(f"missing_key: {len(missing)}: {missing[:10]}")
         logging.info(f"unexpected_key: {len(unexpected)}: {unexpected[:10]}")
+    else:
+        logging.info(f"Loaded pretrain mode from {path}")
 
-def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, optimizer, scaler, scheduler, tb_writer, args):
+def update_relation(clip_loss, proto_loss, prototypes, momentum, batch_sampler, args, step=None, save=False):
+        rel_pseudo = args.rel_pseudo.to(device=prototypes.device, dtype=prototypes.dtype)
+        rel_real = args.rel_real.to(device=prototypes.device, dtype=prototypes.dtype)
+
+        # cosine similarity
+        new_rel_pseudo = torch.clamp(prototypes @ prototypes.T, 0, 1.0)
+
+        k = int(prototypes.size(0) * args.topk_rate)    # 상위 10% sim
+        topk_values, topk_indices = torch.topk(new_rel_pseudo, k=k, dim=-1)
+
+        # adaptive threshold
+        mean = topk_values.mean(dim=-1, keepdim=True)    # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+        std = topk_values.std(dim=-1, keepdim=True)  # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+        threshold = mean * args.th_mean_weight + std * args.th_std_weight
+
+        # threshold 보다 큰 sim 값만 남김 => 너무 작은 sim은 크게 의미 없는 값일 가능성이 높음
+        new_rel_pseudo = torch.where(new_rel_pseudo > threshold, new_rel_pseudo, torch.zeros_like(new_rel_pseudo))
+        new_rel_pseudo = torch.maximum(new_rel_pseudo, new_rel_pseudo.T)    # A => B, B => A 연관성 동일 보장
+
+        rel_pseudo = momentum * rel_pseudo + (1 - momentum) * new_rel_pseudo    # EMA
+
+        center = args.alpha_center
+        sharpness = args.alpha_sharpness
+        alpha = torch.sigmoid(sharpness * (rel_real - center)) # 연관성이 높을 수록 rel_real의 값을 많이 유지한다.
+
+        real_mask = rel_real != 0
+        rel_mixed = torch.where(
+            real_mask,
+            alpha * rel_real + (1 - alpha) * rel_pseudo,
+            rel_pseudo
+        )
+
+        args.rel_pseudo = rel_pseudo
+        clip_loss.rel_matrix = rel_mixed
+        proto_loss.rel_matrix = rel_mixed
+        batch_sampler.rel_matrix = rel_mixed.detach().cpu().numpy()
+
+        if save:
+            relation_dir = os.path.join(args.output_path, "relation")
+            os.makedirs(relation_dir, exist_ok=True)
+            relation_path = os.path.join(relation_dir, f"{step}_relation.pt")
+
+            rel_dict = {"step": step, "rel_pseudo": rel_mixed}
+            torch.save(rel_dict, relation_path)
+
+def train_one_epoch(
+        model, device, dataloader, 
+        clip_loss, proto_loss, epoch, optimizer, scaler, 
+        scheduler, clip_scheduler, proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, rel_update_scheduler, 
+        tb_writer, args
+    ):
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
     model.train()
@@ -114,11 +166,16 @@ def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, opt
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
+        
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
 
+        # if rel_update_scheduler.is_update_step(step):
+        #     update_relation(clip_loss, proto_loss, model.prototypes, rel_momentum_scheduler[step], dataloader.batch_sampler, args, step=step, save=True)
+
         lr = scheduler[step]
+        proto_loss.momentum = proto_momentum_scheduler[step]
         apply_optim_scheduler(optimizer, lr)
 
         images, classes, times = batch['image'], batch['label'], batch['time']
@@ -136,7 +193,7 @@ def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, opt
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
-
+        
         if args.accum_freq == 1:
             with autocast():
                 model_out = model(
@@ -151,29 +208,29 @@ def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, opt
                 }
                 logit_scale = model_out["logit_scale"]
                 logit_bias = model_out.get("logit_bias", None)
-                
-                losses = {}
-                # losses['style_loss'] = clip_loss(
-                #     cls_features['style_feat1'], cls_features['style_feat2'], 
-                #     logit_scale, logit_bias, 
-                #     classes, same_class_weight=args.same_class_weight, 
-                #     times=times, time_range=10, time_weight=0.3,
-                #     output_dict=False
-                # )
 
-                losses['style_loss'] = proto_loss(
+                losses = {}
+                losses['style_loss'] = clip_loss(
+                    cls_features['style_feat1'], cls_features['style_feat2'], 
+                    logit_scale, logit_bias, 
+                    classes, same_class_weight=args.same_class_weight, 
+                    output_dict=False
+                )
+
+                # proto_loss를 따로 계산하는 이유는 같은 anchor의 이미지끼리 loss를 계산하지 않기 위함이다.
+                losses['proto_loss'] = proto_loss(
                     cls_features['style_feat1'], model.prototypes,
                     logit_scale, logit_bias,
                     classes,
                     train=True,
-                ) * 0.5
+                )
 
-                losses['style_loss'] +=  proto_loss(
+                losses['proto_loss'] +=  proto_loss(
                     cls_features['style_feat2'], model.prototypes,
                     logit_scale, logit_bias,
                     classes,
                     train=True,
-                ) * 0.5
+                )
 
                 losses['content_loss'] = clip_loss(
                     cls_features['content_feat1'], cls_features['content_feat2'], 
@@ -187,13 +244,15 @@ def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, opt
                 label = model.decoder.patchify(images[mask_samples])
 
                 loss = mae_loss(pred, label, masks, norm_pix_loss=args.norm_pix_loss)
-                # loss = loss * args.mae_weight
-                losses['mae_loss'] = loss * 0.5
+                losses['mae_loss'] = loss
 
-                total_loss = sum(losses.values())
-                losses["loss"] = total_loss
+                losses["raw_loss"] = sum(losses.values())
+                losses["loss"] = (
+                    losses['style_loss'] * clip_scheduler[step] + losses['proto_loss'] * proto_scheduler[step] + 
+                    losses['content_loss'] + losses['mae_loss'] * 0.5
+                )
 
-            backward(total_loss, scaler)
+            backward(losses["loss"], scaler)
             losses_log.update(losses)
 
         else:
@@ -261,26 +320,27 @@ def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, opt
                         inputs[key] = torch.cat(accumulated[:j] + [cls_features[key]] + accumulated[j + 1:])
                     
                     losses = {}
-                    # losses['style_loss'] = clip_loss(
-                    #     inputs['style_feat1'], inputs['style_feat2'], 
-                    #     logit_scale, logit_bias, 
-                    #     accum_classes, same_class_weight=args.same_class_weight, 
-                    #     times=accum_times, time_range=10, time_weight=0.3,
-                    #     output_dict=False
-                    # )
-                    losses['style_loss'] = proto_loss(
+                    losses['style_loss'] = clip_loss(
+                        inputs['style_feat1'], inputs['style_feat2'], 
+                        logit_scale, logit_bias, 
+                        accum_classes, same_class_weight=args.same_class_weight, 
+                        # times=accum_times, time_range=10, time_weight=0.3,
+                        output_dict=False
+                    )
+
+                    losses['proto_loss'] = proto_loss(
                         inputs['style_feat1'], model.prototypes,
                         logit_scale, logit_bias,
                         accum_classes,
                         train=True,
-                    ) * 0.5
+                    )
 
-                    losses['style_loss'] +=  proto_loss(
+                    losses['proto_loss'] +=  proto_loss(
                         inputs['style_feat2'], model.prototypes,
                         logit_scale, logit_bias,
                         accum_classes,
                         train=True,
-                    ) * 0.5
+                    )
 
                     losses['content_loss'] = clip_loss(
                         inputs['content_feat1'], inputs['content_feat2'], 
@@ -296,20 +356,21 @@ def train_one_epoch(model, device, dataloader, clip_loss, proto_loss, epoch, opt
                     label = model.decoder.patchify(images[mask_samples])
 
                     loss = mae_loss(pred, label, masks, norm_pix_loss=args.norm_pix_loss)
-                    loss /= args.accum_freq
+                    # loss /= args.accum_freq
                     # loss = loss * args.mae_weight
                     losses['mae_loss'] = loss
 
-                    total_loss = sum(losses.values())
-                    losses["loss"] = total_loss
+                    # total_loss = sum(losses.values())
+                    losses["raw_loss"] = sum(losses.values())
+                    losses["loss"] = (
+                        losses['style_loss'] * clip_scheduler[step] + losses['proto_loss'] * proto_scheduler[step] + 
+                        losses['content_loss'] + (losses['mae_loss'] * 0.5 / args.accum_freq)
+                    )
 
-                backward(total_loss, scaler)
+                backward(losses["loss"], scaler)
                 
                 # accum_freq 때문에 mae_lossr의 기록이 왜곡되는 것 방지
                 losses_log.update(losses)
-                del losses_log["loss"]
-                losses_log['mae_loss'] = losses_log['mae_loss'] * args.accum_freq
-                losses_log['loss'] = sum(losses_log.values())
 
         if scaler is not None:
             if args.horovod:
@@ -451,24 +512,24 @@ def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer,
                     all_classes.append(classes.cpu())
 
                     losses = {}
-                    # losses['style_loss'] = clip_loss(
-                    #     cls_features['style_feat1'], cls_features['style_feat2'], 
-                    #     logit_scale, logit_bias, 
-                    #     classes=classes, same_class_weight=args.same_class_weight,
-                    #     times=times, time_range=args.time_range, time_weight=args.time_weight,
-                    #     output_dict=False
-                    # )
-                    losses['style_loss'] = proto_loss(
+                    losses['style_loss'] = clip_loss(
+                        cls_features['style_feat1'], cls_features['style_feat2'], 
+                        logit_scale, logit_bias, 
+                        classes=classes, same_class_weight=args.same_class_weight,
+                        # times=times, time_range=args.time_range, time_weight=args.time_weight,
+                        output_dict=False
+                    )
+                    losses['proto_loss'] = proto_loss(
                         cls_features['style_feat1'], model.prototypes,
                         logit_scale, logit_bias,
                         classes,
-                    ) * 0.5
+                    )
 
-                    losses['style_loss'] +=  proto_loss(
+                    losses['proto_loss'] +=  proto_loss(
                         cls_features['style_feat2'], model.prototypes,
                         logit_scale, logit_bias,
                         classes,
-                    ) * 0.5
+                    )
 
                     losses['content_loss'] = clip_loss(
                         cls_features['content_feat1'], cls_features['content_feat2'], 
@@ -485,8 +546,7 @@ def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer,
                     # loss = loss * args.mae_weight
                     losses['mae_loss'] = loss
 
-                    total_loss = sum(losses.values())
-                    losses["loss"] = total_loss
+                    losses["loss"] = sum(losses.values())
 
                 for key, val in losses.items():
                     if key not in losses_m:
@@ -518,19 +578,26 @@ def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer,
             #     classes=torch.cat(all_classes),
             # )
 
-            val_metrics = get_proto_metrics(
+            # val_metrics = get_proto_metrics(
+            #     image_features=torch.cat(all_image_features),
+            #     prototypes=model.prototypes.cpu(),
+            #     classes=torch.cat(all_classes),
+            # )
+
+            val_metrics = get_class_topk(
                 image_features=torch.cat(all_image_features),
                 prototypes=model.prototypes.cpu(),
                 classes=torch.cat(all_classes),
             )
 
             metrics.update({
-                    **val_metrics, 
-                    "style_loss": losses_m['style_loss'].avg, 
-                    "content_loss": losses_m['content_loss'].avg, 
-                    "mae_loss": losses_m['mae_loss'].avg, 
-                    "epoch": epoch, "num_samples": num_samples
-                 })
+                **val_metrics, 
+                "style_loss": losses_m['style_loss'].avg, 
+                "proto_loss": losses_m['proto_loss'].avg, 
+                "content_loss": losses_m['content_loss'].avg, 
+                "mae_loss": losses_m['mae_loss'].avg, 
+                "epoch": epoch, "num_samples": num_samples
+            })
 
     logging.info(
         f"Eval Epoch: {epoch} "
@@ -625,6 +692,10 @@ def main(args):
     ).to(device=device)
     load_pretrain(model, args.pretrain)
 
+    # 대표벡터 불러오기
+    prototypes = torch.load("datasets/pretrain01_640/proto_vectors/proto_484_01.pt")
+    model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+
     if is_master(args):
         logging.info("Model:")
         logging.info(f"{str(model)}")
@@ -642,18 +713,31 @@ def main(args):
         from torch.optim import AdamW
         optimizer = AdamW(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16으로 학습하지 말것! 모델이 nan을 출력함.
 
-    clip_loss = SigLipLoss(
+    clip_loss = RelationSigLipLoss(
+        rel_matrix=args.rel_pseudo,
         rank=args.rank,
         world_size=args.world_size,
         dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
+        device=device,
     )
 
     cosine_loss = CosineSimilarityLoss(dim=-1)
 
-    proto_loss = PrototypeContrastiveLoss(
+    # proto_loss = PrototypeContrastiveLoss(
+    #     num_classes=args.num_classes,
+    #     feat_dim=768,
+    #     momentum=0.95,
+    #     rank=args.rank,
+    #     world_size=args.world_size,
+    #     dist_impl=args.loss_dist_impl,
+    #     device=device,
+    # )
+
+    proto_loss = RelationPrototypeContrastiveLoss(
         num_classes=args.num_classes,
         feat_dim=768,
-        momentum=0.95,
+        momentum=0.99,
+        rel_matrix=args.rel_pseudo, 
         rank=args.rank,
         world_size=args.world_size,
         dist_impl=args.loss_dist_impl,
@@ -722,11 +806,23 @@ def main(args):
 
     warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
     scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
-    print(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
+    clip_scheduler = CosineScheduler(*args.style_weight, total_steps / 2, 0)    # clip_loss weight scheduler
+    proto_scheduler = CosineScheduler(*args.proto_weight, total_steps / 2, 0)    # clip_loss weight scheduler
+    proto_momentum_scheduler = CosineScheduler(*args.proto_momentum, total_steps, 0)    # relation momentum
+    rel_momentum_scheduler = CosineScheduler(*args.relation_momentum, total_steps, 0)    # relation momentum
+    rel_update_scheduler = StepGenerator(total_steps, args.rel_update_freq, args.rel_update_shape, args.rel_update_start)
+    logging.info(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
+    logging.info(f"## rel_update_scheduler \nstep_list: {rel_update_scheduler.step_list}\n")
 
     # args.step = 0
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(model, device, train_loader, clip_loss, proto_loss, epoch, optimizer, scaler, scheduler, writer, args)
+        train_one_epoch(
+            model, device, train_loader, clip_loss, proto_loss, 
+            epoch, optimizer, scaler, scheduler, clip_scheduler, 
+            proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, rel_update_scheduler,
+            writer, args
+        )
+
         completed_epoch = epoch + 1
         # args.step += 1
         metrics = evaluate(model, device, valid_loader, clip_loss, proto_loss, completed_epoch, writer, args.step, args)
@@ -767,7 +863,6 @@ def main(args):
         wandb.finish()
 
         logging.info('Finished.')
-
 
 
 

@@ -301,6 +301,308 @@ class SigLipLoss(nn.Module):
 
         return {"contrastive_loss": loss} if output_dict else loss
     
+class RelationSigLipLoss(nn.Module):
+    """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
+
+    @article{zhai2023sigmoid,
+      title={Sigmoid loss for language image pre-training},
+      author={Zhai, Xiaohua and Mustafa, Basil and Kolesnikov, Alexander and Beyer, Lucas},
+      journal={arXiv preprint arXiv:2303.15343},
+      year={2023}
+    }
+    """
+    def __init__(
+            self, rel_matrix,
+            cache_labels: bool = False,
+            rank: int = 0,
+            world_size: int = 1,
+            dist_impl: Optional[str] = None,
+            device=None,
+    ):
+        super().__init__()
+        self.cache_labels = cache_labels
+        self.rank = rank
+        self.world_size = world_size
+        self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
+        assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
+
+        # cache state FIXME cache not currently used, worthwhile?
+        self.prev_num_logits = 0
+        self.labels = {}
+        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32)
+
+
+    def get_ground_truth(
+        self, device, dtype, num_logits, classes, same_class_weight=1.0, 
+        times=None, time_range=10, time_weight=0.3, 
+        negative_only=False
+    ) -> torch.Tensor:
+        if classes is not None:
+            labels = self.rel_matrix[classes.to(torch.int)][:, classes.to(torch.int)]
+        else:
+            labels = torch.eye(num_logits, dtype=dtype, device=device)
+        
+        labels = labels.to(device=device, dtype=dtype)
+
+        return labels
+
+    def get_logits(self, image_features1, image_features2, logit_scale, logit_bias=None):
+        logits = logit_scale * image_features1 @ image_features2.T
+        if logit_bias is not None:
+            logits += logit_bias
+        return logits
+
+    def _loss(
+            self, image_features1, image_features2, 
+            logit_scale, logit_bias=None, 
+            classes=None, same_class_weight=1.0, 
+            times=None, time_range=10, time_weight=0.3, 
+            negative_only=False
+            ):
+        logits = self.get_logits(image_features1, image_features2, logit_scale, logit_bias)
+        labels = self.get_ground_truth(
+            image_features1.device,
+            image_features1.dtype,
+            image_features1.shape[0],
+            classes,
+            same_class_weight,
+            times=times, time_range=time_range, time_weight=time_weight,
+            negative_only=negative_only,
+        )
+        # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
+        if classes is not None:
+            loss  = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            
+            # # negative 데이터 영향력 낮추기
+            # weights = torch.where(labels == 0, 0.01, 1.0)
+            # loss = loss * weights
+
+            # 자기자신과의 semantic한 의미 학습 방지하기
+            mask = ~torch.eye(loss.size(0), dtype=torch.bool, device=loss.device)
+            loss = loss[mask].mean()
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
+
+        return loss
+
+    def forward(
+            self, image_features1, image_features2, 
+            logit_scale, logit_bias, 
+            classes=None, same_class_weight=1.0, 
+            times=None, time_range=10, time_weight=0.3,
+            output_dict=False
+        ):
+        loss = self._loss(
+            image_features1, image_features2, 
+            logit_scale, logit_bias, 
+            classes, same_class_weight, 
+            times, time_range, time_weight
+        )
+
+        if self.world_size > 1:
+            if self.dist_impl == 'bidir':
+                right_rank = (self.rank + 1) % self.world_size
+                left_rank = (self.rank - 1 + self.world_size) % self.world_size
+                image_features2_to_right = image_features2_to_left = image_features2
+                num_bidir, remainder = divmod(self.world_size - 1, 2)
+                for i in range(num_bidir):
+                    image_features2_recv = neighbour_exchange_bidir_with_grad(
+                        left_rank,
+                        right_rank,
+                        image_features2_to_left,
+                        image_features2_to_right,
+                    )
+                    for f in image_features2_recv:
+                        loss += self._loss(
+                            image_features1,
+                            f,
+                            logit_scale,
+                            logit_bias,
+                            negative_only=True,
+                        )
+                    image_features2_to_left, image_features2_to_right = image_features2_recv
+
+                if remainder:
+                    image_features2_recv = neighbour_exchange_with_grad(
+                        left_rank,
+                        right_rank,
+                        image_features2_to_right
+                    )
+                    loss += self._loss(
+                        image_features1,
+                        image_features2_recv,
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+            elif self.dist_impl == "shift":
+                right_rank = (self.rank + 1) % self.world_size
+                left_rank = (self.rank - 1 + self.world_size) % self.world_size
+                image_features2_to_right = image_features2
+                for i in range(self.world_size - 1):
+                    image_features2_from_left = neighbour_exchange_with_grad(
+                        left_rank,
+                        right_rank,
+                        image_features2_to_right,
+                    )
+                    loss += self._loss(
+                        image_features1,
+                        image_features2_from_left,
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+                    image_features2_to_right = image_features2_from_left
+            elif self.dist_impl == "reduce":
+                for i in range(self.world_size):
+                    image2_from_other = torch.distributed.nn.all_reduce(
+                        image_features2 * (self.rank == i),
+                        torch.distributed.ReduceOp.SUM,
+                    )
+                    loss += float(i != self.rank) * self._loss(
+                        image_features1,
+                        image2_from_other,
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+            elif self.dist_impl == "gather":
+                all_images2 = torch.distributed.nn.all_gather(image_features2)
+                for i in range(self.world_size):
+                    loss += float(i != self.rank) * self._loss(
+                        image_features1,
+                        all_images2[i],
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+            else:
+                assert False
+
+        return {"contrastive_loss": loss} if output_dict else loss
+
+class RelationPrototypeContrastiveLoss(nn.Module):
+    def __init__(
+            self, num_classes, feat_dim, momentum, rel_matrix, rel_real=None,
+            rank = 0, 
+            world_size = 1, 
+            dist_impl = None,
+            device=None, 
+        ):
+        super().__init__()
+        self.rank = rank
+        self.world_size = world_size
+        self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
+        assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
+
+        self.num_classes = num_classes
+        self.all_classes = torch.arange(num_classes, device=device, dtype=torch.float32)
+        self.feat_dim = feat_dim
+        self.momentum = momentum
+        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32)
+        self.rel_real = rel_real
+
+
+    @torch.no_grad()
+    def update_prototypes(self, features, prototypes, classes):
+        _classes = classes.to(dtype=int)
+
+        sums = torch.zeros_like(prototypes)
+        counts = torch.zeros(self.num_classes, device=features.device)
+
+        sums.index_add_(0, _classes, features)
+        counts.index_add_(0, _classes, torch.ones_like(classes, dtype=features.dtype))
+
+        mask = counts > 0
+        new_protos = torch.zeros_like(prototypes)
+        new_protos[mask] = sums[mask] / counts[mask, None]
+
+        # momentum update
+        prototypes[mask] = (
+            self.momentum * prototypes[mask] + (1 - self.momentum) * new_protos[mask]
+        )
+        prototypes[mask] = F.normalize(prototypes[mask], dim=-1)
+
+    def get_ground_truth(
+        self, device, dtype, num_logits, classes, same_class_weight=1.0, 
+    ) -> torch.Tensor:
+        if classes is not None:
+            labels = self.rel_matrix[classes.to(torch.int)]
+            # labels = (classes[:, None] == self.all_classes[None, :]).float()
+        else:
+            labels = torch.eye(num_logits, dtype=dtype, device=device)
+        
+        labels = labels.to(device=device, dtype=dtype)
+
+        return labels
+
+    def get_logits(self, image_features, prototypes, logit_scale, classes=None, logit_bias=None):
+        # protos = F.normalize(prototypes, dim=1)
+        logits = image_features @ prototypes.T
+
+        k = prototypes.size(0) // 10    # 상위 10% sim
+        topk_values, topk_indices = torch.topk(logits, k=k, dim=-1)
+
+        mean = topk_values.mean(dim=-1, keepdim=True)   # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+        std = topk_values.std(dim=-1, keepdim=True) # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+
+        threshold = mean + std
+
+        logits = torch.where(logits > threshold, logits, torch.zeros_like(logits))
+
+        # 마스크
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask.scatter_(1, topk_indices, True)    # 상위 10% mask
+        if self.rel_real is not None:
+            mask = mask | (self.rel_real[classes] != 0) # sim이 낮은 real label이 학습에 포함되도록
+
+        logits = logit_scale * logits
+        if logit_bias is not None:
+            logits += logit_bias
+
+        return {"logits": logits, "mask": mask}
+    
+    def _loss(
+            self, image_features, ema_prototypes, memory_prototypes,
+            logit_scale, logit_bias=None, 
+            classes=None, same_class_weight=1.0, 
+            ):
+        logits = self.get_logits(image_features, ema_prototypes, logit_scale, classes, logit_bias)
+        labels = self.get_ground_truth(
+            image_features.device,
+            image_features.dtype,
+            image_features.shape[0],
+            classes,
+            same_class_weight,
+        )
+        # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
+        loss = F.binary_cross_entropy_with_logits(logits['logits'], labels, reduction='none')
+        loss = (loss * logits['mask']).sum() / logits['mask'].sum()
+        
+        # # negative 데이터 영향력 낮추기
+        # weights = torch.where(labels == 0, 0.01, 1.0)
+        # loss = (loss * weights).mean()
+        return loss
+
+    def forward(
+            self, features, prototypes,
+            logit_scale, logit_bias, 
+            classes, same_class_weight=1.0, 
+            output_dict=False,
+            train=False,
+        ):
+        if train:
+            with torch.no_grad():
+                self.update_prototypes(features, prototypes, classes)
+
+        loss = self._loss(
+            features, prototypes, None,
+            logit_scale, logit_bias, 
+            classes, same_class_weight, 
+        )
+
+        return {"contrastive_loss": loss} if output_dict else loss
+    
 
 class PrototypeContrastiveLoss(nn.Module):
     def __init__(
@@ -324,16 +626,36 @@ class PrototypeContrastiveLoss(nn.Module):
 
     @torch.no_grad()
     def update_prototypes(self, features, prototypes, classes):
-        """ 배치 내 feature로 prototype 갱신 (momentum 평균) """
-        _classes = classes.unique().to(dtype=int)
-        for cls in _classes:
-            mask = (classes == cls)
-            new_proto = features[mask].mean(dim=0)
-            prototypes[cls] = (
-                self.momentum * prototypes[cls] + (1 - self.momentum) * new_proto
-            )
+        _classes = classes.to(dtype=int)
 
-        prototypes[_classes] = F.normalize(prototypes[_classes], dim=-1)
+        sums = torch.zeros_like(prototypes)
+        counts = torch.zeros(self.num_classes, device=features.device)
+
+        sums.index_add_(0, _classes, features)
+        counts.index_add_(0, _classes, torch.ones_like(classes, dtype=features.dtype))
+
+        mask = counts > 0
+        new_protos = torch.zeros_like(prototypes)
+        new_protos[mask] = sums[mask] / counts[mask, None]
+
+        # momentum update
+        prototypes[mask] = (
+            self.momentum * prototypes[mask] + (1 - self.momentum) * new_protos[mask]
+        )
+        prototypes[mask] = F.normalize(prototypes[mask], dim=-1)
+
+        # """ 배치 내 feature로 prototype 갱신 (momentum 평균) """
+        # _classes = classes.unique().to(dtype=int)
+        # for cls in _classes:
+        #     mask = (classes == cls)
+        #     new_proto = features[mask].mean(dim=0)
+        #     prototypes[cls] = (
+        #         self.momentum * prototypes[cls] + (1 - self.momentum) * new_proto
+        #     )
+
+        # prototypes[_classes] = F.normalize(prototypes[_classes], dim=-1)
+
+
 
     def get_ground_truth(
         self, device, dtype, num_logits, classes, same_class_weight=1.0, 
@@ -859,6 +1181,12 @@ class ClipLoss(nn.Module):
         ) / 2
 
         return {"contrastive_loss": total_loss} if output_dict else total_loss
+    
+def align_loss(x, y, alpha=2):
+    return (x - y).norm(p=2, dim=1).pow(alpha).mean()
+
+def uniform_loss(x, t=2):
+    return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
 
 
 
