@@ -155,6 +155,52 @@ def get_proto_metrics(image_features, prototypes, classes):
 
     return metrics
 
+def get_class_topk(image_features, prototypes, classes):
+    metrics = {}
+
+    ## TopK
+    logits_image = (image_features @ prototypes.t()).detach().cpu()
+    ranks = torch.argsort(logits_image, dim=1, descending=True)
+
+    target_pos = (ranks == classes[:, None]).float()
+    self_class_rank = target_pos.argmax(axis=1)
+    self_class_rank = self_class_rank.detach().cpu().numpy()
+
+    for k in [1, 2, 5, 10]:
+        metrics[f"Class_R@{k}"] = np.mean(self_class_rank < k)
+
+    ## 클래스별 평균 유사도 및 표준편차
+    image_features = image_features.numpy()
+    classes = classes.numpy()
+    unique_classes = np.unique(classes)
+
+    mean_list = []
+    std_list = []
+    for i in unique_classes:
+        class_features = image_features[classes == i]
+        class_sims = class_features @ class_features.T
+        np.fill_diagonal(class_sims, np.nan)
+
+        sims_mean = np.nanmean(class_sims)
+        mean_list.append(sims_mean)
+
+        stds = np.nanstd(class_sims, axis=-1)
+        stds_mean = np.nanmean(stds)
+        std_list.append(stds_mean)
+
+    metrics[f"sim_mean_by_class"] = np.mean(mean_list)
+    metrics[f"sim_stu_mean_by_class"] = np.mean(std_list)
+
+    ## silhouette_score
+    metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
+
+    kmeans = KMeans(n_clusters=len(unique_classes), random_state=42)
+    labels = kmeans.fit_predict(image_features)
+    metrics[f"silhouette_score_kmeans"] = silhouette_score(image_features, labels, metric='cosine')
+
+    return metrics
+
+
 
 def get_class_clip_metrics(features1, features2, classes):
     metrics = {}
