@@ -86,6 +86,23 @@ class ShiftScaleCenterCrop(BaseCrop):
 
         anchor_length = min(image_height, image_width)  # 가장큰 center crop size
         
+        image_aspect = max(image_width / image_height, image_height / image_width)
+
+        # 종횡비 차이가 클수록 padding 증가
+        pad_factor = max(0.0, image_aspect - 1.2)
+
+        # 너무 과도해지지 않도록 제한
+        pad_factor = min(pad_factor * 0.25, 1.0)
+
+        base_anchor = min(image_height, image_width)
+
+        adaptive_pad = round(base_anchor * pad_factor)
+
+        virtual_height = image_height + adaptive_pad * 2
+        virtual_width = image_width + adaptive_pad * 2
+
+        anchor_length = min(virtual_height, virtual_width)
+
         # shift 어그멘테이션
         shift_x, shift_y = self.py_random.uniform(*self.shift_limit), self.py_random.uniform(*self.shift_limit)
         crop_height, crop_width = self.height, self.width
@@ -95,7 +112,7 @@ class ShiftScaleCenterCrop(BaseCrop):
         center_x = center_x + round(anchor_length * shift_x)
         center_y = center_y + round(anchor_length * shift_y)
 
-        scale = self.py_random.uniform(*self.scale_limit)
+        scale = math.sqrt(self.py_random.uniform(*self.scale_limit))
         # scale = 1.0
         crop_size = round(anchor_length * scale)
 
