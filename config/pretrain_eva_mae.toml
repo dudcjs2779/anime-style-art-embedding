@@ -60,9 +60,10 @@ style_weight = [0.05, 0.05]
 proto_weight = [1.0, 1.0]
 proto_momentum = [0.9, 0.999]
 relation_momentum = [0.9, 0.99]
-rel_update_freq = 300
-rel_update_shape = 0.5
-rel_update_start = 0.4
+rel_update_freq = 1000
+rel_update_shape = 1.0
+rel_update_start = 0.33
+loss_weight_start_epoch = 10
 
 [relation_EMA]
 th_mean_weight = 0.8

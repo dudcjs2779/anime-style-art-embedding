@@ -97,49 +97,50 @@ def load_pretrain(model, path):
         logging.info(f"Loaded pretrain mode from {path}")
 
 def update_relation(clip_loss, proto_loss, prototypes, momentum, batch_sampler, args, step=None, save=False):
-        rel_pseudo = args.rel_pseudo.to(device=prototypes.device, dtype=prototypes.dtype)
-        rel_real = args.rel_real.to(device=prototypes.device, dtype=prototypes.dtype)
+    rel_pseudo = args.rel_pseudo.to(device=prototypes.device, dtype=prototypes.dtype)
+    rel_real = args.rel_real.to(device=prototypes.device, dtype=prototypes.dtype)
 
-        # cosine similarity
-        new_rel_pseudo = torch.clamp(prototypes @ prototypes.T, 0, 1.0)
+    # cosine similarity
+    new_rel_pseudo = torch.clamp(prototypes @ prototypes.T, 0, 1.0)
 
-        k = int(prototypes.size(0) * args.topk_rate)    # 상위 10% sim
-        topk_values, topk_indices = torch.topk(new_rel_pseudo, k=k, dim=-1)
+    k = int(prototypes.size(0) * args.topk_rate)    # 상위 10% sim
+    topk_values, topk_indices = torch.topk(new_rel_pseudo, k=k, dim=-1)
 
-        # adaptive threshold
-        mean = topk_values.mean(dim=-1, keepdim=True)    # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
-        std = topk_values.std(dim=-1, keepdim=True)  # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
-        threshold = mean * args.th_mean_weight + std * args.th_std_weight
+    # adaptive threshold
+    mean = topk_values.mean(dim=-1, keepdim=True)    # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+    std = topk_values.std(dim=-1, keepdim=True)  # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+    threshold = mean * args.th_mean_weight + std * args.th_std_weight
 
-        # threshold 보다 큰 sim 값만 남김 => 너무 작은 sim은 크게 의미 없는 값일 가능성이 높음
-        new_rel_pseudo = torch.where(new_rel_pseudo > threshold, new_rel_pseudo, torch.zeros_like(new_rel_pseudo))
-        new_rel_pseudo = torch.maximum(new_rel_pseudo, new_rel_pseudo.T)    # A => B, B => A 연관성 동일 보장
+    # threshold 보다 큰 sim 값만 남김 => 너무 작은 sim은 크게 의미 없는 값일 가능성이 높음
+    new_rel_pseudo = torch.where(new_rel_pseudo > threshold, new_rel_pseudo, torch.zeros_like(new_rel_pseudo))
+    new_rel_pseudo = torch.maximum(new_rel_pseudo, new_rel_pseudo.T)    # A => B, B => A 연관성 동일 보장
 
-        rel_pseudo = momentum * rel_pseudo + (1 - momentum) * new_rel_pseudo    # EMA
+    rel_pseudo = momentum * rel_pseudo + (1 - momentum) * new_rel_pseudo    # EMA
 
-        center = args.alpha_center
-        sharpness = args.alpha_sharpness
-        alpha = torch.sigmoid(sharpness * (rel_real - center)) # 연관성이 높을 수록 rel_real의 값을 많이 유지한다.
+    center = args.alpha_center
+    sharpness = args.alpha_sharpness
+    alpha = torch.sigmoid(sharpness * (rel_real - center)) # 연관성이 높을 수록 rel_real의 값을 많이 유지한다.
 
-        real_mask = rel_real != 0
-        rel_mixed = torch.where(
-            real_mask,
-            alpha * rel_real + (1 - alpha) * rel_pseudo,
-            rel_pseudo
-        )
+    real_mask = rel_real != 0
+    rel_mixed = torch.where(
+        real_mask,
+        alpha * rel_real + (1 - alpha) * rel_pseudo,
+        rel_pseudo
+    )
 
-        args.rel_pseudo = rel_pseudo
-        clip_loss.rel_matrix = rel_mixed
-        proto_loss.rel_matrix = rel_mixed
-        batch_sampler.rel_matrix = rel_mixed.detach().cpu().numpy()
+    args.rel_pseudo = rel_pseudo
+    clip_loss.rel_matrix = rel_mixed
+    proto_loss.rel_matrix = rel_mixed
+    batch_sampler.rel_real = rel_mixed.detach().cpu().numpy()
+    batch_sampler.rel_pseudo = rel_mixed.detach().cpu().numpy()
 
-        if save:
-            relation_dir = os.path.join(args.output_path, "relation")
-            os.makedirs(relation_dir, exist_ok=True)
-            relation_path = os.path.join(relation_dir, f"{step}_relation.pt")
+    if save:
+        relation_dir = os.path.join(args.output_path, "relation")
+        os.makedirs(relation_dir, exist_ok=True)
+        relation_path = os.path.join(relation_dir, f"{step}_relation.pt")
 
-            rel_dict = {"step": step, "rel_pseudo": rel_mixed}
-            torch.save(rel_dict, relation_path)
+        rel_dict = {"step": step, "rel_pseudo": rel_mixed}
+        torch.save(rel_dict, relation_path)
 
 def train_one_epoch(
         model, device, dataloader, 
@@ -173,6 +174,14 @@ def train_one_epoch(
 
         # if rel_update_scheduler.is_update_step(step):
         #     update_relation(clip_loss, proto_loss, model.prototypes, rel_momentum_scheduler[step], dataloader.batch_sampler, args, step=step, save=True)
+
+        if rel_update_scheduler.is_update_step(step):
+            sim_matrix = model.prototypes @ model.prototypes.T
+            sim_matrix = torch.clip(sim_matrix, 0, 1.0)
+            sim_matrix.fill_diagonal_(1.0)
+
+            dataloader.batch_sampler.rel_pseudo = sim_matrix.detach().cpu().numpy()
+            dataloader.batch_sampler.update_weights()
 
         lr = scheduler[step]
         proto_loss.momentum = proto_momentum_scheduler[step]
@@ -686,7 +695,7 @@ def main(args):
         decoder_name=args.decoder_name, 
         model_kargs=args.model_kargs,
         init_logit_scale=math.log(10), 
-        init_logit_bias=-10, 
+        init_logit_bias=-8, 
         output_dict=True,
         num_classes=args.num_classes,
     ).to(device=device)
@@ -694,7 +703,10 @@ def main(args):
 
     # 대표벡터 불러오기
     prototypes = torch.load("datasets/pretrain01_640/proto_vectors/proto_484_01.pt")
-    model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+    if prototypes.shape == model.prototypes.shape:
+        model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+    else:
+        logging.warning(f"Loaded prototypes shape {prototypes.shape} does not match model prototypes shape {model.prototypes.shape}. Skipping prototype loading.")
 
     if is_master(args):
         logging.info("Model:")
@@ -714,7 +726,8 @@ def main(args):
         optimizer = AdamW(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16으로 학습하지 말것! 모델이 nan을 출력함.
 
     clip_loss = RelationSigLipLoss(
-        rel_matrix=args.rel_pseudo,
+        rel_matrix=args.rel_real,
+        rel_real=args.rel_real,
         rank=args.rank,
         world_size=args.world_size,
         dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
@@ -737,7 +750,9 @@ def main(args):
         num_classes=args.num_classes,
         feat_dim=768,
         momentum=0.99,
-        rel_matrix=args.rel_pseudo, 
+        rel_matrix=args.rel_real, 
+        rel_real=args.rel_real,
+        topk_rate=args.topk_rate,
         rank=args.rank,
         world_size=args.world_size,
         dist_impl=args.loss_dist_impl,
@@ -806,8 +821,8 @@ def main(args):
 
     warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
     scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
-    clip_scheduler = CosineScheduler(*args.style_weight, total_steps / 2, 0)    # clip_loss weight scheduler
-    proto_scheduler = CosineScheduler(*args.proto_weight, total_steps / 2, 0)    # clip_loss weight scheduler
+    clip_scheduler = CosineScheduler(*args.style_weight, total_steps // 2, 0)    # clip_loss weight scheduler
+    proto_scheduler = CosineScheduler(*args.proto_weight, total_steps // 2, 0)    # clip_loss weight scheduler
     proto_momentum_scheduler = CosineScheduler(*args.proto_momentum, total_steps, 0)    # relation momentum
     rel_momentum_scheduler = CosineScheduler(*args.relation_momentum, total_steps, 0)    # relation momentum
     rel_update_scheduler = StepGenerator(total_steps, args.rel_update_freq, args.rel_update_shape, args.rel_update_start)
@@ -816,6 +831,10 @@ def main(args):
 
     # args.step = 0
     for epoch in range(start_epoch, args.epochs):
+        if args.loss_weight_start_epoch <= epoch:
+            clip_loss.loss_weight_on = True
+            proto_loss.loss_weight_on = True
+
         train_one_epoch(
             model, device, train_loader, clip_loss, proto_loss, 
             epoch, optimizer, scaler, scheduler, clip_scheduler, 

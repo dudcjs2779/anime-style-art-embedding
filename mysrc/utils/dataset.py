@@ -452,8 +452,13 @@ def make_pretrain_dataset02(args):
     train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
     train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
     train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
-    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
+    # sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
     # sampler = ReleationBatchSampler(train_dataset, batch_size=args.batch_size, rel_matrix=args.rel_pseudo.detach().cpu().numpy(), drop_last=True)
+    sampler = HardGaussBatchSampler(
+        train_dataset, batch_size=args.batch_size, 
+        rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+        hard_num=[1, 2], same_num=[1, 2],
+    )
     train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
@@ -1701,6 +1706,147 @@ class ReleationBatchSampler(Sampler[int]):
         random.shuffle(all_batches)
         return all_batches
     
+
+class HardGaussBatchSampler(Sampler[int]):
+    """
+    모델이 잘 맞추지 못하는 클래스 일수록 기준 클래스로 선택됩니다.
+    기준 클래스에서 샘플하나, 그리고 hard_num 만큼 잘 못 맞추고 있는 클래스,
+    나머지는 pseudo sim 기반의 asymmetric_gaussian 분포에 따라 샘플링 됩니다.
+
+    모델이 잘 맞추지 못하는 클래스에 집중하고 이미 잘 맞추고 있는 클래스보다는
+    가까워질 수 있는 후보에 클래스에 더 집중하도록 의도했습니다.
+    """
+
+    def __init__(self, dataset, batch_size, rel_real: np.ndarray, rel_pseudo: np.ndarray, hard_num=[1, 2], same_num=[1, 2]) -> None:
+        self.dataset = dataset
+        indices = [i for i in range(len(self.dataset))]
+        labels = dataset.labels.to(dtype=int).tolist()
+        self.unique_labels = dataset.labels.unique().to(dtype=int).tolist()
+        self.batch_size = batch_size
+        self.rel_real = rel_real
+        self.rel_pseudo = rel_pseudo
+        self.gt_mask = rel_real != 0
+        self.hard_num = hard_num
+        self.same_num = same_num
+        self.cls_diff_weights = np.ones(len(self.unique_labels))
+        self.sample_diff_weights = np.ones(len(self.unique_labels))
+        self.sample_gauss_weights = np.ones(len(self.unique_labels))
+
+        data_by_class = defaultdict(list)
+        for idx, label in zip(indices, labels):
+            data_by_class[label].append(idx)
+
+        self.data_by_class = data_by_class
+
+    def __iter__(self):
+        self.data_by_class_copy = deepcopy(self.data_by_class)
+        # self.remain_num = sum(len(v) for v in self.data_by_class.values())
+        self.available_mask = np.ones(len(self.unique_labels), dtype=bool)
+        # self.all_batches = []
+        # self.all_classes = []
+        # self.remain_class = []
+
+        for i in range(len(self)):
+            idxs = self.make_one_batch()
+
+            yield idxs
+            
+        # for idxs in self.all_batches:
+        #     yield idxs
+
+    def __len__(self) -> int:
+        return len(self.dataset) // self.batch_size
+        
+    def cls_diff_weight(self, rel_real, rel_pseudo, eps, temp):
+        # axis=1 기준 평균 절대 오차
+        diff_weight = np.abs(rel_real - rel_pseudo).sum(axis=1, where=self.gt_mask) / self.gt_mask.sum(axis=1)
+
+        weights = np.power(diff_weight + eps, temp)
+        weights /= weights.sum()
+
+        return weights
+
+    def sample_diff_weight(self, rel_real, rel_pseudo, mask, eps, temp):
+        diff_weight = np.abs(rel_real - rel_pseudo) * mask
+
+        weights = np.power(diff_weight + eps, temp)
+        weights /= weights.sum(axis=1, keepdims=True)
+
+        return weights
+        
+    def asymmetric_gaussian_weight(self, similarity, center=0.55, left_sigma=0.15, right_sigma=0.1):
+        """
+        center를 중심으로 한 비대칭 정규분포
+        args:
+            similarity: 분포
+            center: 중심, 최빈값
+            left_sigma: 왼쪽 분포의 sigma
+            right_sigma: 오른쪽 분포의 sigma
+        """
+        weights = np.zeros_like(similarity)
+
+        left_mask = similarity < center
+        right_mask = ~left_mask
+
+        weights[left_mask] = np.exp(-((similarity[left_mask] - center) ** 2) / (2 * left_sigma ** 2))
+        weights[right_mask] = np.exp(-((similarity[right_mask] - center) ** 2) / (2 * right_sigma ** 2))
+
+        return weights
+
+    def update_weights(self):
+        self.cls_diff_weights = self.cls_diff_weight(self.rel_real, self.rel_pseudo, 0.1, 1.0)
+        self.sample_diff_weights = self.sample_diff_weight(self.rel_real, self.rel_pseudo, self.gt_mask, 0.1, 1.2)
+        self.sample_gauss_weights = self.asymmetric_gaussian_weight(self.rel_pseudo, center=0.55, left_sigma=0.13, right_sigma=0.10) + 0.1
+    
+    def make_one_batch(self):
+        same_k = random.randint(*self.same_num)
+        cls = random.choices(self.unique_labels, weights=self.cls_diff_weights * self.available_mask, k=1)[0]
+        selected_samples = []
+        classes = []
+
+        for _ in range(same_k):
+            samples = self.data_by_class_copy[cls]
+
+            idx = random.randrange(len(samples))
+            selected_samples.append(samples.pop(idx))
+            classes.append(cls)
+
+            if not samples:
+                self.available_mask[cls] = False
+                same_k = len(selected_samples)
+                break
+
+        while len(selected_samples) < self.batch_size:
+            hard_k = random.randint(*self.hard_num)
+            gaus_k = self.batch_size - same_k - hard_k
+
+            selected_cls = (
+                random.choices(self.unique_labels, weights=self.sample_gauss_weights[cls] * self.available_mask, k=gaus_k)
+                + random.choices(self.unique_labels, weights=self.sample_diff_weights[cls] * self.available_mask, k=hard_k)
+            )
+
+            for sel_cls in selected_cls:
+                samples = self.data_by_class_copy[sel_cls]
+
+                if samples:
+                    idx = random.randrange(len(samples))
+                    selected_samples.append(samples.pop(idx))
+                    classes.append(sel_cls)
+
+                    if not samples:
+                        self.available_mask[sel_cls] = False
+
+                    if len(selected_samples) >= self.batch_size:
+                        break
+
+        random.shuffle(selected_samples)
+        # self.all_batches.append(selected_samples)
+        # self.all_classes.append(classes)
+        # self.remain_class.append(np.array(self.unique_labels)[self.available_mask])
+
+        return selected_samples
+
+
 class InferDataset(Dataset):
     def __init__(self, images, transforms, df=None):
         self.df = df
