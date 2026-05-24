@@ -1232,16 +1232,29 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
             A.VerticalFlip(p=0.1),
             A.RandomRotate90(p=0.4),
             A.Rotate(limit=(-15, 15), p=0.5, border_mode=cv2.BORDER_CONSTANT, fill=[255, 255, 255]),
+            # A.CenterCrop(h, w),
 
             A.OneOf([
+                ShiftScaleCenterCrop(
+                    height=h,
+                    width=w,
+                    shift_limit=(-0.2, 0.2),
+                    scale_limit=(0.33, 1.0),
+                    ratio=(0.75, 1.3333333333333333),
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=255,
+                    p=0.3,
+                ),
+
                 RandomResizedCropWithPad(
                     size=[h, w],
-                    scale=[0.1, 1.0],
+                    scale=[0.3, 1.0],
                     ratio=[0.75, 1.3333333333333333],
                     interpolation=cv2.INTER_CUBIC,
                     border_mode=cv2.BORDER_CONSTANT,
                     fill=255,
-                    p=0.6),
+                    p=0.4),
 
                 A.Compose([
                     AutoPad(border_mode=cv2.BORDER_CONSTANT, fill=255),
@@ -1251,19 +1264,29 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
                         ratio=[0.75, 1.3333333333333333],
                         interpolation=cv2.INTER_CUBIC,
                         p=1.0),
-                ], p=0.4),
+                ], p=0.3),
             ], p=1.0),
 
-            A.ColorJitter(
-                brightness=0.4,
-                contrast=0.4,
-                saturation=0.2,
-                hue=0.1,
-                p=0.8
-            ),
+            A.OneOf([
+                A.ColorJitter(
+                    brightness=0.2, # 0.2
+                    contrast=0.2,   # 0.2
+                    saturation=0.2, # 0.2
+                    hue=0.0,
+                    p=0.9
+                ),
+
+                A.ColorJitter(
+                    brightness=0.2, # 0.2
+                    contrast=0.2,   # 0.2
+                    saturation=0.2, # 0.2
+                    hue=0.5,
+                    p=0.1
+                ),
+            ], p=0.5),
             A.ToGray(p=0.2),
         ])
-        
+
         crop2 = A.Compose([
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.1),
@@ -1273,28 +1296,50 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
             A.OneOf([
                 A.RandomResizedCrop(
                     size=[h, w],
-                    scale=[0.03, 0.15],
+                    scale=[0.1, 0.3],
                     ratio=[0.75, 1.3333333333333333],
                     interpolation=cv2.INTER_CUBIC,
-                    p=0.9),
+                    p=0.5),
 
-                RandomResizedCropWithPad(
-                    size=[h, w],
-                    scale=[0.15, 1.0],
-                    ratio=[0.75, 1.3333333333333333],
+                ShiftScaleCenterCrop(
+                    height=h,
+                    width=w,
+                    shift_limit=(-0.2, 0.2),
+                    scale_limit=(0.1, 0.33),
+                    ratio=(0.75, 1.3333333333333333),
                     interpolation=cv2.INTER_CUBIC,
                     border_mode=cv2.BORDER_CONSTANT,
                     fill=255,
-                    p=0.1),
+                    p=0.5,
+                ),
+
+                # RandomResizedCropWithPad(
+                #     size=[h, w],
+                #     scale=[0.15, 1.0],
+                #     ratio=[0.75, 1.3333333333333333],
+                #     interpolation=cv2.INTER_CUBIC,
+                #     border_mode=cv2.BORDER_CONSTANT,
+                #     fill=255,
+                #     p=0.1),
             ], p=1.0),
 
-            A.ColorJitter(
-                brightness=0.4,
-                contrast=0.4,
-                saturation=0.2,
-                hue=0.2,
-                p=0.8
-            ),
+            A.OneOf([
+                A.ColorJitter(
+                    brightness=0.2, # 0.2
+                    contrast=0.2,   # 0.2
+                    saturation=0.2, # 0.2
+                    hue=0.0,
+                    p=0.9
+                ),
+
+                A.ColorJitter(
+                    brightness=0.2, # 0.2
+                    contrast=0.2,   # 0.2
+                    saturation=0.2, # 0.2
+                    hue=0.5,
+                    p=0.1
+                ),
+            ], p=0.5),
             A.ToGray(p=0.2),
         ])
 
@@ -1309,25 +1354,23 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
 
             A.OneOf([
                 A.AdvancedBlur(
-                    blur_limit=[5, 15],
-                    sigma_x_limit=[0.5, 2.2],
-                    sigma_y_limit=[0.5, 2.2],
+                    blur_limit=[3, 15],
+                    sigma_x_limit=[0.3, 1.6],
+                    sigma_y_limit=[0.3, 1.6],
                     rotate_limit=[-90, 90],
                     beta_limit=[0.5, 8.0],
-                    noise_limit=[0.75, 1.25],
-                    p=0.5
+                    noise_limit=[0.9, 1.1],
+                    p=0.7
                 ),
                 A.GaussianBlur(
                     blur_limit=0,
                     sigma_limit=[0.5, 2.0],
-                    p=0.5
+                    p=0.3
                 ),
-            ], p=0.5),
+            ], p=0.4),
 
             A.Solarize([0.5, 0.5], p=0.1),
         ], p=1.0)
-
-
 
         aug_trans2 = A.Compose([
             A.AdditiveNoise(
@@ -1340,20 +1383,20 @@ def get_preset(preset_name, image_size=[448, 448], mean=None, std=None):
 
             A.OneOf([
                 A.AdvancedBlur(
-                    blur_limit=[5, 15],
-                    sigma_x_limit=[0.5, 2.2],
-                    sigma_y_limit=[0.5, 2.2],
+                    blur_limit=[3, 15],
+                    sigma_x_limit=[0.3, 1.6],
+                    sigma_y_limit=[0.3, 1.6],
                     rotate_limit=[-90, 90],
                     beta_limit=[0.5, 8.0],
-                    noise_limit=[0.75, 1.25],
-                    p=0.5
+                    noise_limit=[0.9, 1.1],
+                    p=0.7
                 ),
                 A.GaussianBlur(
                     blur_limit=0,
                     sigma_limit=[0.5, 2.0],
-                    p=0.5
+                    p=0.3
                 ),
-            ], p=0.5),
+            ], p=0.4),
 
             A.Solarize([0.5, 0.5], p=0.1),
         ], p=1.0)
