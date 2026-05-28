@@ -191,6 +191,15 @@ def get_class_topk(image_features, prototypes, classes):
     metrics[f"sim_mean_by_class"] = np.mean(mean_list)
     metrics[f"sim_stu_mean_by_class"] = np.mean(std_list)
 
+    # topk 평균 유사도 => 과도하게 뭉치는 정도 계산
+    sim_matrix = prototypes @ prototypes.T
+    sim_matrix.fill_diagonal_(-1)
+
+    k = int(prototypes.size(0) * 0.1)    # 상위 topk_rate sim
+    topk_values, _ = torch.topk(sim_matrix, k=k, dim=-1)
+    
+    metrics[f"topk_mean_sim"] = topk_values.mean().item()
+
     ## silhouette_score
     metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
 
