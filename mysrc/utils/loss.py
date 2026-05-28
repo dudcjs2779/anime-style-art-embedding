@@ -501,7 +501,7 @@ class RelationSigLipLoss(nn.Module):
 class RelationPrototypeContrastiveLoss(nn.Module):
     def __init__(
             self, num_classes, feat_dim, momentum, rel_matrix, rel_real=None, topk_rate=0.1,
-            loss_weight_on=False,
+            loss_weight_on=False, ema_threshold=-1.0,
             rank = 0, 
             world_size = 1, 
             dist_impl = None,
@@ -522,27 +522,41 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         self.rel_real = rel_real.to(device=device, dtype=torch.float32)
         self.gt_mask = self.rel_real != 0
         self.loss_weight_on = loss_weight_on
+        self.ema_threshold = ema_threshold
 
 
     @torch.no_grad()
     def update_prototypes(self, features, prototypes, classes):
-        _classes = classes.to(dtype=int)
+        _classes = classes.to(device=features.device, dtype=torch.long)
+
+        proto_sims = (features * prototypes[_classes]).sum(dim=-1)
+        selected = proto_sims >= self.ema_threshold
+
+        if not selected.any():
+            return
+
+        selected_classes = _classes[selected]
+        selected_features = features[selected]
 
         sums = torch.zeros_like(prototypes)
-        counts = torch.zeros(self.num_classes, device=features.device)
+        counts = torch.zeros(self.num_classes, device=features.device, dtype=features.dtype)
 
-        sums.index_add_(0, _classes, features)
-        counts.index_add_(0, _classes, torch.ones_like(classes, dtype=features.dtype))
+        sums.index_add_(0, selected_classes, selected_features)
+        counts.index_add_(
+            0,
+            selected_classes,
+            torch.ones_like(selected_classes, dtype=features.dtype),
+        )
 
         mask = counts > 0
-        new_protos = torch.zeros_like(prototypes)
-        new_protos[mask] = sums[mask] / counts[mask, None]
+        new_protos = sums[mask] / counts[mask, None]
 
         # momentum update
         prototypes[mask] = (
-            self.momentum * prototypes[mask] + (1 - self.momentum) * new_protos[mask]
+            self.momentum * prototypes[mask] + (1 - self.momentum) * new_protos
         )
-        prototypes[mask] = F.normalize(prototypes[mask], dim=-1)
+        prototypes[mask] = torch.nn.functional.normalize(prototypes[mask], dim=-1)
+
 
     def get_ground_truth(
         self, device, dtype, num_logits, classes, same_class_weight=1.0, 
@@ -574,15 +588,20 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         mask = (logits > threshold) | (self.gt_mask[_classes])
         output["mask"] = mask
 
-        # logits = torch.where(logits > threshold, logits, torch.zeros_like(logits))
-        # logits = torch.where(threshold_mask, logits, torch.zeros_like(logits))
 
+        # 연관성 라벨이 없음에도 높은 sim 값을 가진 경우 loss의 영향력을 낮춰준다.
         if self.loss_weight_on:
-            # 연관성 라벨이 없음에도 높은 sim 값을 가진 경우 loss의 영향력을 낮춰준다.
+            # sim 값이 0.7 이상인 경우의 loss 감쇄할 class의 갯수를 제한한다. => 무분별하게 전부 sim 값이 높아지도록 학습하는 것 방지
+            w_k = int(k * 0.2)    # 상위 topk_rate sim
+            top_wk_indices = topk_indices[:, :w_k]
+
+            top_wk_mask = torch.zeros_like(logits, dtype=torch.bool)
+            top_wk_mask.scatter_(dim=-1, index=top_wk_indices, value=True)
+
             loss_weights = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
             neg_mask = ~self.gt_mask[_classes]   # 연관성 라벨이 없는 경우
             loss_weights[neg_mask & (logits > 0.5)] = 0.5
-            loss_weights[neg_mask & (logits > 0.7)] = 0.1
+            loss_weights[top_wk_mask & neg_mask & (logits > 0.7)] = 0.1
             output["loss_weights"] = loss_weights
 
         logits = logit_scale * logits

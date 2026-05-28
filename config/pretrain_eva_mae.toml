@@ -60,10 +60,12 @@ style_weight = [0.05, 0.05]
 proto_weight = [1.0, 1.0]
 proto_momentum = [0.9, 0.999]
 relation_momentum = [0.9, 0.99]
-rel_update_freq = 1000
-rel_update_shape = 1.0
-rel_update_start = 0.33
+BS_update_freq = 1000
+BS_update_shape = 1.0
+BS_update_start = 0.33
 loss_weight_start_epoch = 10
+proto_ema_threshold_start_epoch = 15
+proto_ema_threshold = 0.6
 
 [relation_EMA]
 th_mean_weight = 0.8
@@ -71,7 +73,6 @@ th_std_weight = 1.5
 alpha_center = 0.5
 alpha_sharpness = 4
 topk_rate = 0.1
-
 
 [data]
 train = 'datasets/pretrain01_640/csv_like/train07.parquet'
@@ -85,9 +86,12 @@ image_size = [224, 224]
 patch_size = 14
 train_aug = "pretrain_global_loacl"
 valid_aug = "simple_center_crop"
+prototype_path = "datasets/pretrain01_640/proto_vectors/proto_484_01.pt" # datasets/pretrain01_640/proto_vectors/proto_484_01.pt
 
 [sampler]
-num_postive = [2, 3]
+# num_postive = [2, 3]
+hard_num = [1, 2]
+same_num = [1, 2]
 
 [logger]
 report_to = 'wandb'    # tensorboard, wandb

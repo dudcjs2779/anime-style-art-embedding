@@ -145,7 +145,7 @@ def update_relation(clip_loss, proto_loss, prototypes, momentum, batch_sampler, 
 def train_one_epoch(
         model, device, dataloader, 
         clip_loss, proto_loss, epoch, optimizer, scaler, 
-        scheduler, clip_scheduler, proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, rel_update_scheduler, 
+        scheduler, clip_scheduler, proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, batch_sampler_scheduler, 
         tb_writer, args
     ):
     autocast = get_autocast(args.precision, device_type=device.type)
@@ -175,7 +175,7 @@ def train_one_epoch(
         # if rel_update_scheduler.is_update_step(step):
         #     update_relation(clip_loss, proto_loss, model.prototypes, rel_momentum_scheduler[step], dataloader.batch_sampler, args, step=step, save=True)
 
-        if rel_update_scheduler.is_update_step(step):
+        if batch_sampler_scheduler.is_update_step(step):
             sim_matrix = model.prototypes @ model.prototypes.T
             sim_matrix = torch.clip(sim_matrix, 0, 1.0)
             sim_matrix.fill_diagonal_(1.0)
@@ -702,9 +702,10 @@ def main(args):
     load_pretrain(model, args.pretrain)
 
     # 대표벡터 불러오기
-    prototypes = torch.load("datasets/pretrain01_640/proto_vectors/proto_484_01.pt")
+    prototypes = torch.load(args.prototype_path)
     if prototypes.shape == model.prototypes.shape:
         model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+        logging.info(f"Loaded prototypes from {args.prototype_path} with shape {prototypes.shape}")
     else:
         logging.warning(f"Loaded prototypes shape {prototypes.shape} does not match model prototypes shape {model.prototypes.shape}. Skipping prototype loading.")
 
@@ -734,7 +735,7 @@ def main(args):
         device=device,
     )
 
-    cosine_loss = CosineSimilarityLoss(dim=-1)
+    # cosine_loss = CosineSimilarityLoss(dim=-1)
 
     # proto_loss = PrototypeContrastiveLoss(
     #     num_classes=args.num_classes,
@@ -825,20 +826,27 @@ def main(args):
     proto_scheduler = CosineScheduler(*args.proto_weight, total_steps // 2, 0)    # clip_loss weight scheduler
     proto_momentum_scheduler = CosineScheduler(*args.proto_momentum, total_steps, 0)    # relation momentum
     rel_momentum_scheduler = CosineScheduler(*args.relation_momentum, total_steps, 0)    # relation momentum
-    rel_update_scheduler = StepGenerator(total_steps, args.rel_update_freq, args.rel_update_shape, args.rel_update_start)
+    batch_sampler_scheduler = StepGenerator(total_steps, args.BS_update_freq, args.BS_update_shape, args.BS_update_start)
     logging.info(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
-    logging.info(f"## rel_update_scheduler \nstep_list: {rel_update_scheduler.step_list}\n")
+    logging.info(f"## batch_sampler_scheduler \nstep_list: {batch_sampler_scheduler.step_list[:10]} ... {batch_sampler_scheduler.step_list[-10:]}\n")
 
     # args.step = 0
     for epoch in range(start_epoch, args.epochs):
         if args.loss_weight_start_epoch <= epoch:
+            if not clip_loss.loss_weight_on:
+                logging.info("The False Negative loss reduction feature for clip_loss and proto_loss has been enabled.")
             clip_loss.loss_weight_on = True
             proto_loss.loss_weight_on = True
+        
+        if args.proto_ema_threshold_start_epoch <= epoch:
+            if proto_loss.ema_threshold == -1.0:
+                logging.info("The proto_loss_ema_threshold feature is turned on.")
+            proto_loss.ema_threshold = args.proto_ema_threshold
 
         train_one_epoch(
             model, device, train_loader, clip_loss, proto_loss, 
             epoch, optimizer, scaler, scheduler, clip_scheduler, 
-            proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, rel_update_scheduler,
+            proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, batch_sampler_scheduler,
             writer, args
         )
 
