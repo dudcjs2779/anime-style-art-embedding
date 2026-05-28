@@ -457,7 +457,7 @@ def make_pretrain_dataset02(args):
     sampler = HardGaussBatchSampler(
         train_dataset, batch_size=args.batch_size, 
         rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
-        hard_num=[1, 2], same_num=[1, 2],
+        hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
     )
     train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
@@ -1717,12 +1717,13 @@ class HardGaussBatchSampler(Sampler[int]):
     가까워질 수 있는 후보에 클래스에 더 집중하도록 의도했습니다.
     """
 
-    def __init__(self, dataset, batch_size, rel_real: np.ndarray, rel_pseudo: np.ndarray, hard_num=[1, 2], same_num=[1, 2]) -> None:
+    def __init__(self, dataset, batch_size, rel_real: np.ndarray, rel_pseudo: np.ndarray, hard_num=[1, 2], same_num=[1, 2], accum=1) -> None:
         self.dataset = dataset
         indices = [i for i in range(len(self.dataset))]
         labels = dataset.labels.to(dtype=int).tolist()
         self.unique_labels = dataset.labels.unique().to(dtype=int).tolist()
         self.batch_size = batch_size
+        self.accum = accum
         self.rel_real = rel_real
         self.rel_pseudo = rel_pseudo
         self.gt_mask = rel_real != 0
@@ -1747,7 +1748,7 @@ class HardGaussBatchSampler(Sampler[int]):
         # self.remain_class = []
 
         for i in range(len(self)):
-            idxs = self.make_one_batch()
+            idxs = self.make_one_batch(i)
 
             yield idxs
             
@@ -1798,23 +1799,30 @@ class HardGaussBatchSampler(Sampler[int]):
         self.sample_diff_weights = self.sample_diff_weight(self.rel_real, self.rel_pseudo, self.gt_mask, 0.1, 1.2)
         self.sample_gauss_weights = self.asymmetric_gaussian_weight(self.rel_pseudo, center=0.55, left_sigma=0.13, right_sigma=0.10) + 0.1
     
-    def make_one_batch(self):
-        same_k = random.randint(*self.same_num)
-        cls = random.choices(self.unique_labels, weights=self.cls_diff_weights * self.available_mask, k=1)[0]
+    def make_one_batch(self, step):
         selected_samples = []
-        classes = []
+        # classes = []
 
-        for _ in range(same_k):
-            samples = self.data_by_class_copy[cls]
+        if step % self.accum == 0:
+            same_k = random.randint(*self.same_num)
+            cls = random.choices(self.unique_labels, weights=self.cls_diff_weights * self.available_mask, k=1)[0]
+            self.cls = cls
 
-            idx = random.randrange(len(samples))
-            selected_samples.append(samples.pop(idx))
-            classes.append(cls)
+            for _ in range(same_k):
+                samples = self.data_by_class_copy[cls]
 
-            if not samples:
-                self.available_mask[cls] = False
-                same_k = len(selected_samples)
-                break
+                idx = random.randrange(len(samples))
+                selected_samples.append(samples.pop(idx))
+                # classes.append(cls)
+
+                if not samples:
+                    self.available_mask[cls] = False
+                    same_k = len(selected_samples)
+                    break
+        else:
+            same_k = 0
+            cls = self.cls
+
 
         while len(selected_samples) < self.batch_size:
             hard_k = random.randint(*self.hard_num)
@@ -1831,7 +1839,7 @@ class HardGaussBatchSampler(Sampler[int]):
                 if samples:
                     idx = random.randrange(len(samples))
                     selected_samples.append(samples.pop(idx))
-                    classes.append(sel_cls)
+                    # classes.append(sel_cls)
 
                     if not samples:
                         self.available_mask[sel_cls] = False
