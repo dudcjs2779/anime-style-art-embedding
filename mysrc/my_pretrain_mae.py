@@ -21,7 +21,7 @@ from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02, make_pretrain_dataset03
 from mysrc.utils.optim_utils import make_mae_param_groups
-from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, PrototypeContrastiveLoss, RelationPrototypeContrastiveLoss, RelationSigLipLoss, uniform_loss
+from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, PrototypeContrastiveLoss, RelationPrototypeContrastiveLoss, RelationSigLipLoss, uniform_loss, similarity_mse_loss
 from mysrc.utils.scheduler import CosineScheduler, StepGenerator
 from mysrc.utils.precision import get_autocast, get_input_dtype
 from mysrc.model import CustomMaeVisual
@@ -46,6 +46,7 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
@@ -189,7 +190,7 @@ def train_one_epoch(
 
         images, classes, times = batch['image'], batch['label'], batch['time']
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-        classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
+        classes = classes.to(device=device, dtype=torch.long, non_blocking=True)
         times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
         crop_masks, mask_indices, none_mask_indices, mask_samples = batch['crop_masks'], batch['mask_indices'], batch['none_mask_indices'], batch['mask_samples']
@@ -226,7 +227,7 @@ def train_one_epoch(
                     output_dict=False
                 )
 
-                # proto_loss를 따로 계산하는 이유는 같은 anchor의 이미지끼리 loss를 계산하지 않기 위함이다.
+                # proto_loss를 따로 계산하는 이유는 accum 사용시 꼬일 수 있기 때문에 일관성을 유지하기 위함
                 losses['proto_loss'] = proto_loss(
                     cls_features['style_feat1'], model.prototypes,
                     logit_scale, logit_bias,
@@ -247,6 +248,13 @@ def train_one_epoch(
                     output_dict=False
                 )
 
+                # similarity mse loss
+                losses['mse_loss'] = similarity_mse_loss(
+                    torch.cat((cls_features['style_feat1'], cls_features['style_feat2']), dim=0), 
+                    torch.cat((classes, classes), dim=0).long(), 
+                    model.prototypes, args.rel_real
+                )
+                
                 ## Reconstruction loss
                 pred = model_out['im_pred']
                 masks = model_out['masks']
@@ -257,8 +265,8 @@ def train_one_epoch(
 
                 losses["raw_loss"] = sum(losses.values())
                 losses["loss"] = (
-                    losses['style_loss'] * clip_scheduler[step] + losses['proto_loss'] * proto_scheduler[step] + 
-                    losses['content_loss'] + losses['mae_loss'] * 0.5
+                    losses['style_loss'] * clip_scheduler[step] + losses['proto_loss'] * proto_scheduler[step] 
+                    + losses['content_loss'] + losses['mse_loss'] * 1.0 + losses['mae_loss'] * 0.5
                 )
 
             backward(losses["loss"], scaler)
@@ -357,6 +365,13 @@ def train_one_epoch(
                         output_dict=False
                     )
 
+                    # similarity mse loss
+                    losses['mse_loss'] = similarity_mse_loss(
+                        torch.cat((inputs['style_feat1'], inputs['style_feat2']), dim=0), 
+                        torch.cat((accum_classes, accum_classes), dim=0).long(), 
+                        model.prototypes, args.rel_real
+                    )
+
                     del inputs
 
                     ## Reconstruction loss
@@ -372,8 +387,8 @@ def train_one_epoch(
                     # total_loss = sum(losses.values())
                     losses["raw_loss"] = sum(losses.values())
                     losses["loss"] = (
-                        losses['style_loss'] * clip_scheduler[step] + losses['proto_loss'] * proto_scheduler[step] + 
-                        losses['content_loss'] + (losses['mae_loss'] * 0.5 / args.accum_freq)
+                        losses['style_loss'] * clip_scheduler[step] + losses['proto_loss'] * proto_scheduler[step]
+                        + losses['content_loss'] + losses['mse_loss'] * 1.0 + (losses['mae_loss'] * 0.5 / args.accum_freq)
                     )
 
                 backward(losses["loss"], scaler)
@@ -492,7 +507,7 @@ def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer,
                 images, image_eval, classes, times = batch['image'], batch['image_eval'], batch['label'], batch['time']
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)   # aug1
                 image_eval = image_eval.to(device=device, dtype=input_dtype, non_blocking=True)   # non aug
-                classes = classes.to(device=device, dtype=input_dtype, non_blocking=True)
+                classes = classes.to(device=device, dtype=torch.long, non_blocking=True)
                 times = times.to(device=device, dtype=input_dtype, non_blocking=True)
 
                 crop_masks, mask_indices, none_mask_indices, mask_samples = batch['crop_masks'], batch['mask_indices'], batch['none_mask_indices'], batch['mask_samples']
@@ -546,6 +561,13 @@ def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer,
                         output_dict=False
                     )
 
+                    # similarity mse loss
+                    losses['mse_loss'] = similarity_mse_loss(
+                        torch.cat((cls_features['style_feat1'], cls_features['style_feat2']), dim=0), 
+                        torch.cat((classes, classes), dim=0).long(), 
+                        model.prototypes, args.rel_real
+                    )
+
                     ## Reconstruction loss
                     pred = model_out['im_pred']
                     masks = model_out['masks']
@@ -597,6 +619,7 @@ def evaluate(model, device, dataloader, clip_loss, proto_loss, epoch, tb_writer,
                 image_features=torch.cat(all_image_features),
                 prototypes=model.prototypes.cpu(),
                 classes=torch.cat(all_classes),
+                rel_real=args.rel_real,
             )
 
             metrics.update({
@@ -702,12 +725,13 @@ def main(args):
     load_pretrain(model, args.pretrain)
 
     # 대표벡터 불러오기
-    prototypes = torch.load(args.prototype_path)
-    if prototypes.shape == model.prototypes.shape:
-        model.prototypes = prototypes.to(device=device, dtype=torch.float32)
-        logging.info(f"Loaded prototypes from {args.prototype_path} with shape {prototypes.shape}")
-    else:
-        logging.warning(f"Loaded prototypes shape {prototypes.shape} does not match model prototypes shape {model.prototypes.shape}. Skipping prototype loading.")
+    if args.prototype_path is not None:
+        prototypes = torch.load(args.prototype_path)
+        if prototypes.shape == model.prototypes.shape:
+            model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+            logging.info(f"Loaded prototypes from {args.prototype_path} with shape {prototypes.shape}")
+        else:
+            logging.warning(f"Loaded prototypes shape {prototypes.shape} does not match model prototypes shape {model.prototypes.shape}. Skipping prototype loading.")
 
     if is_master(args):
         logging.info("Model:")
@@ -785,6 +809,9 @@ def main(args):
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
         
+        if 'proto_mean' in checkpoint:
+            proto_loss.statics.mean = checkpoint["proto_mean"].to(device=device)
+        
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
@@ -839,9 +866,9 @@ def main(args):
             proto_loss.loss_weight_on = True
         
         if args.proto_ema_threshold_start_epoch <= epoch:
-            if proto_loss.ema_threshold == -1.0:
+            if not proto_loss.ema_threshold_on:
                 logging.info("The proto_loss_ema_threshold feature is turned on.")
-            proto_loss.ema_threshold = args.proto_ema_threshold
+            proto_loss.ema_threshold_on = True
 
         train_one_epoch(
             model, device, train_loader, clip_loss, proto_loss, 
@@ -859,6 +886,7 @@ def main(args):
             "name": args.model_name,
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "proto_mean": proto_loss.statics.mean,
             'torch_rng_state': torch.random.get_rng_state(),
             'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
             'numpy_rng_state': np.random.get_state(),
