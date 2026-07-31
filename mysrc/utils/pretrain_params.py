@@ -377,6 +377,12 @@ def setup_parser():
         default="long_max_pad_valid",
         help="Valid dataset transforms."
     )
+    parser.add_argument(
+        "--prototype_path",
+        type=str,
+        default=None,
+        help="Each class prototopye vectors path for initialize."
+    )
 
     ## debug
     parser.add_argument(
