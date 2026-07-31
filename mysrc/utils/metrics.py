@@ -155,7 +155,7 @@ def get_proto_metrics(image_features, prototypes, classes):
 
     return metrics
 
-def get_class_topk(image_features, prototypes, classes):
+def get_class_topk(image_features, prototypes, classes, rel_real):
     metrics = {}
 
     ## TopK
@@ -199,6 +199,14 @@ def get_class_topk(image_features, prototypes, classes):
     topk_values, _ = torch.topk(sim_matrix, k=k, dim=-1)
     
     metrics[f"topk_mean_sim"] = topk_values.mean().item()
+
+    # args.rel_real
+    proto_matrix = (prototypes @ prototypes.t()).detach().cpu()
+    labeled = rel_real != 0
+    labeled.fill_diagonal_(False)
+
+    mae_error = np.abs(proto_matrix[labeled] - rel_real[labeled]).mean()
+    metrics[f"mae_error"] = mae_error.item()
 
     ## silhouette_score
     metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
