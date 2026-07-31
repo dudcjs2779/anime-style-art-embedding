@@ -627,8 +627,8 @@ class CustomMaeVisual(nn.Module):
         # embed_head_kargs['scale_mlp'] = visual_args['scale_mlp']
         # self.embed_head = EmbeddingHead(**embed_head_kargs)
 
-        self.style_head = nn.Linear(visual_args['embed_dim'], visual_args['embed_dim'])
-        self.content_head = nn.Linear(visual_args['embed_dim'], visual_args['embed_dim'])
+        self.style_head = nn.Linear(visual_args['embed_dim'], 512)
+        self.content_head = nn.Linear(visual_args['embed_dim'], 512)
 
         # trunc_normal_(self.style_head.weight, std=.02)
         # self.style_head.weight.data.mul_(0.001)
@@ -637,7 +637,7 @@ class CustomMaeVisual(nn.Module):
         # trunc_normal_(self.content_head.weight, std=.02)
         # self.content_head.weight.data.mul_(0.001)
         # self.content_head.bias.data.mul_(0.001)
-        self.register_buffer('prototypes', torch.zeros(num_classes, visual_args['embed_dim']))
+        self.register_buffer('prototypes', torch.zeros(num_classes, 512))
         
 
     def encode_image(self, image, mask=None, normalize: bool = False):
