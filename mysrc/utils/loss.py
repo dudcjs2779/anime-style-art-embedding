@@ -34,6 +34,7 @@ def growth_function(x, midpoint=0.5, steepness=10, max_y=0.5, tolerance=0.1):
     return  y
     # return 1 / (1 + np.exp(-steepness * (x - midpoint)))
 
+
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):
     tensor_recv = torch.zeros_like(tensor)
     send_op = torch.distributed.P2POp(
@@ -115,6 +116,55 @@ class NeighbourExchangeBidir(torch.autograd.Function):
     
 def neighbour_exchange_bidir_with_grad(left_rank, right_rank, tensor_to_left, tensor_to_right, group=None):
     return NeighbourExchangeBidir.apply(left_rank, right_rank, group, tensor_to_left, tensor_to_right)
+
+
+class SimilarityStatisticsEMA:
+    def __init__(self, momentum, num_classes, device):
+        self.momentum = momentum
+        self.num_classes = num_classes
+        self.mean = torch.zeros(
+            num_classes,
+            device=device,
+        )
+
+        # self.second_moment = torch.zeros(
+        #     num_classes,
+        #     device=device,
+        # )
+
+    @torch.no_grad()
+    def update(self, similaritys, classes):
+        sums = torch.zeros(self.num_classes, device=similaritys.device, dtype=similaritys.dtype)
+        # sum_sq = torch.zeros_like(sums)
+        counts = torch.zeros_like(sums)
+
+        sums.index_add_(0, classes, similaritys)
+        # sum_sq.index_add_(0, classes, similaritys * similaritys)
+        counts.index_add_(0, classes, torch.ones_like(classes, dtype=similaritys.dtype))
+
+        mask = counts > 0
+        new_mean = sums[mask] / counts[mask]
+        # new_secnond = sum_sq[mask] / counts[mask]
+
+        # momentum update
+        self.mean[mask] = (
+            self.momentum * self.mean[mask] + (1 - self.momentum) * new_mean
+        )
+
+        # self.second_moment[mask] = (
+        #     self.momentum * self.second_moment[mask] + (1 - self.momentum) * new_secnond
+        # )
+
+    # def variance(self, classes):
+    #     return torch.clamp(
+    #         self.second_moment[classes] - self.mean[classes] ** 2,
+    #         min=1e-8,
+    #     )
+
+    # def std(self, classes):
+    #     return torch.sqrt(self.variance(classes))
+
+
 
 
 class SigLipLoss(nn.Module):
@@ -340,8 +390,7 @@ class RelationSigLipLoss(nn.Module):
         negative_only=False
     ) -> torch.Tensor:
         if classes is not None:
-            _classes = classes.to(dtype=int)
-            labels = self.rel_matrix[_classes][:, _classes]
+            labels = self.rel_matrix[classes][:, classes]
         else:
             labels = torch.eye(num_logits, dtype=dtype, device=device)
         
@@ -353,15 +402,13 @@ class RelationSigLipLoss(nn.Module):
         output = {}
         logits = image_features1 @ image_features2.T
 
-        if classes is not None and self.loss_weight_on:
-            _classes = classes.to(dtype=int)
-            
-            loss_weights = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
-            neg_mask = ~self.gt_mask[_classes][:, _classes]
-            loss_weights[neg_mask & (logits > 0.5)] = 0.5
-            loss_weights[neg_mask & (logits > 0.7)] = 0.1
+        # if classes is not None and self.loss_weight_on:
+        #     loss_weights = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
+        #     neg_mask = ~self.gt_mask[classes][:, classes]
+        #     loss_weights[neg_mask & (logits > 0.5)] = 0.5
+        #     loss_weights[neg_mask & (logits > 0.7)] = 0.1
 
-            output["loss_weights"] = loss_weights
+        #     output["loss_weights"] = loss_weights
 
         logits = logit_scale * logits
         if logit_bias is not None:
@@ -391,8 +438,8 @@ class RelationSigLipLoss(nn.Module):
         if classes is not None:
             loss  = F.binary_cross_entropy_with_logits(logits["logits"], labels, reduction='none')
 
-            if self.loss_weight_on:
-                loss = loss * logits["loss_weights"]
+            # if self.loss_weight_on:
+            #     loss = loss * logits["loss_weights"]
 
             # 자기자신과의 semantic한 의미 학습 방지하기
             mask = ~torch.eye(loss.size(0), dtype=torch.bool, device=loss.device)
@@ -501,7 +548,7 @@ class RelationSigLipLoss(nn.Module):
 class RelationPrototypeContrastiveLoss(nn.Module):
     def __init__(
             self, num_classes, feat_dim, momentum, rel_matrix, rel_real=None, topk_rate=0.1,
-            loss_weight_on=False, ema_threshold=-1.0,
+            loss_weight_on=False, ema_threshold_on=False,
             rank = 0, 
             world_size = 1, 
             dist_impl = None,
@@ -522,20 +569,21 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         self.rel_real = rel_real.to(device=device, dtype=torch.float32)
         self.gt_mask = self.rel_real != 0
         self.loss_weight_on = loss_weight_on
-        self.ema_threshold = ema_threshold
+        self.ema_threshold_on = ema_threshold_on
+        self.statics = SimilarityStatisticsEMA(0.99, num_classes, device)
 
 
     @torch.no_grad()
     def update_prototypes(self, features, prototypes, classes):
-        _classes = classes.to(device=features.device, dtype=torch.long)
-
-        proto_sims = (features * prototypes[_classes]).sum(dim=-1)
-        selected = proto_sims >= self.ema_threshold
+        proto_sims = (features * prototypes[classes]).sum(dim=-1)
+        sim_means = self.statics.mean[classes]
+        threshold = sim_means * 0.85 if self.ema_threshold_on else -1
+        selected = proto_sims >= threshold
 
         if not selected.any():
             return
 
-        selected_classes = _classes[selected]
+        selected_classes = classes[selected]
         selected_features = features[selected]
 
         sums = torch.zeros_like(prototypes)
@@ -559,13 +607,16 @@ class RelationPrototypeContrastiveLoss(nn.Module):
 
 
     def get_ground_truth(
-        self, device, dtype, num_logits, classes, same_class_weight=1.0, 
+        self, device, dtype, num_logits, classes, same_class_weight=1.0, label_adjust=None,
     ) -> torch.Tensor:
         if classes is not None:
-            labels = self.rel_matrix[classes.to(torch.int)]
+            labels = self.rel_matrix[classes]
             # labels = (classes[:, None] == self.all_classes[None, :]).float()
         else:
             labels = torch.eye(num_logits, dtype=dtype, device=device)
+
+        if label_adjust is not None:
+            labels = torch.clamp(labels + label_adjust, min=0, max=1.0)
         
         labels = labels.to(device=device, dtype=dtype)
 
@@ -573,36 +624,65 @@ class RelationPrototypeContrastiveLoss(nn.Module):
 
     def get_logits(self, image_features, prototypes, logit_scale, classes=None, logit_bias=None):
         output = {}
-        _classes = classes.to(dtype=int)
-
         # protos = F.normalize(prototypes, dim=1)
         logits = image_features @ prototypes.T
 
+        self_indices = (torch.arange(logits.size(0), device=logits.device), classes)
+        sims_self = logits[self_indices]
+
+        if self.loss_weight_on:
+            with torch.no_grad():
+                proto_sims = prototypes[classes] @ prototypes.T
+                rel_mask = self.gt_mask[classes]
+
+                sub_style_weight = torch.clamp(1 + (sims_self - self.statics.mean[classes]), min=0.8, max=1.0)[:, None] # 선택된 샘플이 본인 클래스의 평균 유사도보다 조금 작은 경우 보정
+
+                label_adjust = (logits - (proto_sims * sub_style_weight))
+                label_adjust = torch.clamp(label_adjust, min=-0.1, max=0.1)
+                label_adjust = torch.where(rel_mask, label_adjust, torch.zeros_like(label_adjust))
+                label_adjust[self_indices] = 0
+
+                output["label_adjust"] = label_adjust
+
+        self.statics.update(sims_self, classes)
+
         k = int(prototypes.size(0) * self.topk_rate)    # 상위 topk_rate sim
         topk_values, topk_indices = torch.topk(logits, k=k, dim=-1)
+        
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask.scatter_(1, topk_indices, True)
 
-        mean = topk_values.mean(dim=-1, keepdim=True)   # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
-        std = topk_values.std(dim=-1, keepdim=True) # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
-
-        threshold = mean + std
-        mask = (logits > threshold) | (self.gt_mask[_classes])
+        mask = mask | self.gt_mask[classes]
         output["mask"] = mask
 
+        # if self.loss_weight_on:
+        #     diff = torch.clamp(1 + self.statics.mean[classes] - sims_self, min=1.0).to(dtype=sims_self.dtype)
+        #     loss_weights = torch.ones_like(logits)
+        #     loss_weights[self_indices] = diff
+        #     output["loss_weights"] = loss_weights
 
-        # 연관성 라벨이 없음에도 높은 sim 값을 가진 경우 loss의 영향력을 낮춰준다.
-        if self.loss_weight_on:
-            # sim 값이 0.7 이상인 경우의 loss 감쇄할 class의 갯수를 제한한다. => 무분별하게 전부 sim 값이 높아지도록 학습하는 것 방지
-            w_k = int(k * 0.2)    # 상위 topk_rate sim
-            top_wk_indices = topk_indices[:, :w_k]
 
-            top_wk_mask = torch.zeros_like(logits, dtype=torch.bool)
-            top_wk_mask.scatter_(dim=-1, index=top_wk_indices, value=True)
+        # mean = topk_values.mean(dim=-1, keepdim=True)   # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+        # std = topk_values.std(dim=-1, keepdim=True) # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
 
-            loss_weights = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
-            neg_mask = ~self.gt_mask[_classes]   # 연관성 라벨이 없는 경우
-            loss_weights[neg_mask & (logits > 0.5)] = 0.5
-            loss_weights[top_wk_mask & neg_mask & (logits > 0.7)] = 0.1
-            output["loss_weights"] = loss_weights
+        # threshold = mean + std
+        # mask = (logits > threshold) | (self.gt_mask[classes])
+        # output["mask"] = mask
+
+        # # 연관성 라벨이 없음에도 높은 sim 값을 가진 경우 loss의 영향력을 낮춰준다.
+        # if self.loss_weight_on:
+        #     # sim 값이 0.7 이상인 경우의 loss 감쇄할 class의 갯수를 제한한다. => 무분별하게 전부 sim 값이 높아지도록 학습하는 것 방지
+        #     w_k = int(k * 0.2)    # 상위 topk_rate sim
+        #     top_wk_indices = topk_indices[:, :w_k]
+
+        #     top_wk_mask = torch.zeros_like(logits, dtype=torch.bool)
+        #     top_wk_mask.scatter_(dim=-1, index=top_wk_indices, value=True)
+
+        #     loss_weights = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
+        #     neg_mask = ~self.gt_mask[classes]   # 연관성 라벨이 없는 경우
+        #     loss_weights[neg_mask & (logits > 0.5)] = 0.5
+        #     loss_weights[top_wk_mask & neg_mask & (logits > 0.7)] = 0.1
+        #     output["loss_weights"] = loss_weights
 
         logits = logit_scale * logits
         if logit_bias is not None:
@@ -623,12 +703,15 @@ class RelationPrototypeContrastiveLoss(nn.Module):
             image_features.shape[0],
             classes,
             same_class_weight,
+            label_adjust=logits.get('label_adjust')
         )
         # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
         loss = F.binary_cross_entropy_with_logits(logits['logits'], labels, reduction='none')
 
-        if self.loss_weight_on:
-            loss = loss * logits['loss_weights']
+        # if self.loss_weight_on:
+        #     loss = loss * logits['loss_weights']
+
+        # loss = loss.mean()
 
         loss = (loss * logits['mask']).sum() / logits['mask'].sum() # 마스킹된 부분만 평균내기
         
@@ -646,6 +729,13 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         ):
         if train:
             with torch.no_grad():
+                # self_sims = (features * prototypes).sum(dim=-1)
+
+                # self.statics.update(self_sims, classes)
+                # z_score = self.statics.z_score(self_sims, classes)
+                # mask = z_score < -3
+
+                
                 self.update_prototypes(features, prototypes, classes)
 
         loss = self._loss(
@@ -679,13 +769,11 @@ class PrototypeContrastiveLoss(nn.Module):
 
     @torch.no_grad()
     def update_prototypes(self, features, prototypes, classes):
-        _classes = classes.to(dtype=int)
-
         sums = torch.zeros_like(prototypes)
         counts = torch.zeros(self.num_classes, device=features.device)
 
-        sums.index_add_(0, _classes, features)
-        counts.index_add_(0, _classes, torch.ones_like(classes, dtype=features.dtype))
+        sums.index_add_(0, classes, features)
+        counts.index_add_(0, classes, torch.ones_like(classes, dtype=features.dtype))
 
         mask = counts > 0
         new_protos = torch.zeros_like(prototypes)
@@ -1071,6 +1159,23 @@ def mae_loss(pred, label, mask, norm_pix_loss=False):
     loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
 
     return loss
+
+def mse_loss(pred, label, mask):
+    loss = F.mse_loss(pred, label, reduction='none')
+    loss = (loss * mask).sum() / mask.sum()
+
+    return loss
+
+def similarity_mse_loss(features, classes, prototypes, rel_real):
+    proto_targets = prototypes[classes]
+    pred = features @ proto_targets.T
+
+    rel = rel_real.to(device=features.device, dtype=features.dtype)
+    # label = 2 * rel[classes][:, classes] - 1
+    label = rel[classes][:, classes]
+    mask = rel[classes][:, classes] != 0
+
+    return mse_loss(pred, label, mask)
 
 def gather_features(
         image_features,
