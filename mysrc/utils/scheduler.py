@@ -137,4 +137,63 @@ class CosineAnnealingWarmUpRestarts(_LRScheduler):
         for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
             param_group['lr'] = lr
 
-    
+
+class InterpolationScheduler(object):
+    def __init__(
+        self,
+        base_value,
+        final_value,
+        total_iters,
+        warmup_iters=0,
+        start_warmup_value=None,
+        freeze_iters=0,
+        power=1.0,
+    ):
+        super().__init__()
+
+        self.final_value = final_value
+        self.total_iters = total_iters
+
+        if start_warmup_value is None:
+            start_warmup_value = base_value
+
+        freeze_schedule = np.full(
+            (freeze_iters,),
+            start_warmup_value,
+            dtype=np.float64,
+        )
+
+        warmup_schedule = np.linspace(
+            start_warmup_value,
+            base_value,
+            warmup_iters,
+        )
+
+        schedule_iters = total_iters - warmup_iters - freeze_iters
+
+        iters = np.arange(schedule_iters)
+
+        # 0 ~ 1
+        t = iters / max(schedule_iters - 1, 1)
+        t = t ** power
+
+        schedule = (
+            base_value
+            + (final_value - base_value) * t
+        )
+
+        self.schedule = np.concatenate(
+            (
+                freeze_schedule,
+                warmup_schedule,
+                schedule,
+            )
+        )
+
+        assert len(self.schedule) == self.total_iters
+
+    def __getitem__(self, it):
+        if it >= self.total_iters:
+            return self.final_value
+        else:
+            return self.schedule[it]

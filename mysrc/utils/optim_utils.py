@@ -133,7 +133,7 @@ def make_mae_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
 
     vit_depth = len(model.visual.blocks)
     # vit_depth = len(model.encoder.blocks)
-    decoder_depth = len(model.decoder.decoder_blocks)
+    # decoder_depth = len(model.decoder.decoder_blocks)
     for name, param in model.named_parameters():
         if "visual" in name:    # encoder, visual
             if not param.requires_grad:
@@ -150,21 +150,21 @@ def make_mae_param_groups(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
             
             param_groups.append(d)
 
-        elif "decoder" in name:
-            if not param.requires_grad:
-                continue
+        # elif "decoder" in name:
+        #     if not param.requires_grad:
+        #         continue
 
-            decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, decoder_depth)
-            d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
-            # d = {"params": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
+        #     decay_rate = get_transformer_lr_decay_rate(name, lr_decay_rate, decoder_depth)
+        #     d = {"params": param, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
+        #     # d = {"params": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
 
-            if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
-                d.update({"wd_multiplier": 0.0})
+        #     if name.endswith(".bias") or "norm" in name or "gamma" in name or "logit" in name:
+        #         d.update({"wd_multiplier": 0.0})
 
-            if "patch_embed" in name:
-                d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
+        #     if "patch_embed" in name:
+        #         d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
             
-            param_groups.append(d)
+        #     param_groups.append(d)
         else:
             if not param.requires_grad:
                 continue

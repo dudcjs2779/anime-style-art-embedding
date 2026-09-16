@@ -1,0 +1,108 @@
+[model]
+model_name = 'eva02_base_patch14_448.mim_in22k_ft_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+precision = 'amp'  # amp, float16
+resume = 'pretrain_log/26-09-15_21-58-45_eva02_base_patch14_448.mim_in22k_ft_in22k/checkpoint/epoch_10.pt'
+# pretrain = 'pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/checkpoint/epoch_29.pt' # pretrain/my_eva_decoder_512.pt
+# pretrain = 'pretrain/my_eva_decoder_512.pt' # pretrain/my_eva_decoder_512.pt
+save_frequency = 1
+max_save_count = 10
+
+[model_kargs]
+num_classes = 0
+global_pool = ''    # avg, map, token(cls_token)
+drop_path_rate = 0.1
+# img_size = 448
+
+[decoder]
+decoder_name = "eva_decoder"
+
+[distributed]
+horovod = false
+
+[train]
+seed = 42
+epochs = 30 
+batch_size = 8
+accum_freq = 8
+# drop_path = 0.1
+grad_clip_norm = 3.0
+time_range = 10 # n years
+time_weight = 0.3
+recon_weight = 1.0
+size_per_mask_range = [1, 4]
+
+[loss]
+same_class_weight = 1.0
+mae_weight = 0.5
+norm_pix_loss = false
+
+[validation]
+valid_batch_size = 24
+val_frequency = 1
+
+[optimizer]
+opt_name = 'adamw8bit'  # adamw, adamw8bit, dadaptation, prodigy
+lr = 1e-04
+wd = 1e-04
+beta1 = 0.9
+beta2 = 0.95
+esp = 1e-8
+lr_decay = 0.9  # 0.7, 0.8
+patch_embed_lr_mult = 1.0
+
+[schaduler]
+sch_name = 'cos'  # cos, cos_restart
+min_lr = 1e-8
+warmup = 0
+cycles = 5
+cycle_multiplier = 1.0
+re_g = 0.9
+warmup_ratio = 0
+loss_dist_impl = 'bidir'
+style_weight = [0.05, 0.05]
+proto_weight = [1.0, 1.0]
+proto_momentum = [0.9, 0.999]
+relation_momentum = [0.9, 0.99]
+BS_update_freq = 1000
+BS_update_shape = 1.0
+BS_update_start = 0.1
+loss_weight_start_epoch = 10
+proto_ema_threshold_start_epoch = 10
+
+[relation_EMA]
+th_mean_weight = 0.8
+th_std_weight = 1.5
+alpha_center = 0.5
+alpha_sharpness = 4
+topk_rate = 0.5
+
+[data]
+train = 'datasets/pretrain01_640/csv_like/tag_pretrain_train_tag_01.parquet'
+valid = 'datasets/pretrain01_640/csv_like/tag_pretrain_valid_tag_01.parquet'
+relation = 'datasets/pretrain01_640/class_similarity_weight_list.yaml'
+image_key = 'image'
+workers = 8
+
+[dataset]
+image_size = [448, 448]
+patch_size = 14
+train_aug = "tag_preset2"    # "pretrain_global_loacl"
+valid_aug = "long_max_pad_valid"
+prototype_path = "pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/26-08-10_18-26-19_prototypes_add04_HardGauss more_similar_sample_by_class topk mse accum_05.pt" # datasets/pretrain01_640/proto_vectors/proto_484_01.pt
+tag_class_weights_path = "datasets/pretrain01_640/weight/pretrain_tag_class_weights.npy"
+tag_pos_weights_path = "datasets/pretrain01_640/weight/pretrain_tag_pos_weights.npy"
+
+[sampler]
+# num_postive = [2, 3]
+hard_num = [1, 2]
+same_num = [1, 2]
+
+[logger]
+report_to = 'wandb'    # tensorboard, wandb
+wandb_project_name = 'pretrain_quality'  # nkoma-greyscale
+run_id = 'qet15rr4'
+log_every_n_steps = 10
+log_local = false
+
+[debug]
+debug = false

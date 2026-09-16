@@ -63,60 +63,6 @@ def balanced_sampleing(df, target_key):
 
     return df_balanced
 
-def style_collate(batch):
-    output = {}
-    styled = torch.stack([data['styled'] for data in batch])
-    content = torch.stack([data['content'] for data in batch])
-    output['image'] = torch.concat((styled, content), dim=0)
-
-    styled_tokens = torch.stack([data['styled_tokens'] for data in batch])
-    content_tokens = torch.stack([data['content_tokens'] for data in batch])
-    output['text'] = torch.concat((styled_tokens, content_tokens), dim=0)
-
-    styled_tags_onehot = torch.stack([data['styled_tags_onehot'] for data in batch])
-    content_tags_onehot = torch.stack([data['content_tags_onehot'] for data in batch])
-    output['tags'] = torch.concat((styled_tags_onehot, content_tags_onehot), dim=0)
-
-    styled_keep_tags_onehot = torch.stack([data['styled_keep_tags_onehot'] for data in batch])
-    content_keep_tags_onehot = torch.stack([data['content_keep_tags_onehot'] for data in batch])
-    output['keep_tags'] = torch.concat((styled_keep_tags_onehot, content_keep_tags_onehot), dim=0)
-
-    styled_label = torch.stack([data['label'] for data in batch])
-    content_label = torch.tensor([0.0] * len(batch), dtype=styled_label.dtype)
-    output['label'] = torch.cat((styled_label, content_label), dim=0)
-    output['artist'] = [data['artist'] for data in batch]
-
-    output['styled_label_token'] = torch.concat([data['styled_label_token'] for data in batch], dim=0)
-    output['content_label_token'] = torch.concat([data['content_label_token'] for data in batch], dim=0)
-
-    if 'time' in batch[0]:
-        styled_times = torch.stack([data['time'] for data in batch])
-        content_times = torch.tensor([0.0] * len(batch), dtype=styled_times.dtype)
-        output['time'] = torch.cat((styled_times, content_times), dim=0)
-    
-    return output
-
-def style_collate02(batch):
-    output = {}
-    styled1 = torch.stack([data['styled1'] for data in batch])
-    content1 = torch.stack([data['content1'] for data in batch])
-    output['image1'] = torch.concatenate((styled1, content1), dim=0)
-
-    styled2 = torch.stack([data['styled2'] for data in batch])
-    content2 = torch.stack([data['content2'] for data in batch])
-    output['image2'] = torch.concatenate((styled2, content2), dim=0)
-
-    output['label'] = torch.stack([data['label'] for data in batch])
-
-    if 'time' in batch[0]:
-        output['time'] = torch.stack([data['time'] for data in batch])
-
-    if 'styled_valid' in batch[0]:
-        styled_valid = torch.stack([data['styled_valid'] for data in batch])
-        content_valid = torch.stack([data['content_valid'] for data in batch])
-        output['image_valid'] = torch.concatenate((styled_valid, content_valid), dim=0)
-    
-    return output
 
 def pretrain_collate(batch, mask_ratio_tuple, mask_probability, n_tokens=None, mask_generator=None):
     output = {}
@@ -167,6 +113,8 @@ def pretrain_collate(batch, mask_ratio_tuple, mask_probability, n_tokens=None, m
 
 def pretrain_collate02(batch, patch_size, size_per_mask_range, mask_probability, mask_generator=None):
     output = {}
+    output['index'] = torch.stack([data['index'] for data in batch])
+
     image1 = torch.stack([data['image1'] for data in batch])
     image2 = torch.stack([data['image2'] for data in batch])
     output['image'] = torch.concat((image1, image2), dim=0)
@@ -174,6 +122,15 @@ def pretrain_collate02(batch, patch_size, size_per_mask_range, mask_probability,
     output['label'] = torch.stack([data['label'] for data in batch])
     if 'time' in batch[0]:
         output['time'] = torch.stack([data['time'] for data in batch])
+
+    if 'hard' in batch[0]:
+        output['hard'] = torch.stack([data['hard'] for data in batch])
+
+    if 'center' in batch[0]:
+        output['center'] = torch.stack([data['center'] for data in batch])
+
+    if 'not_far' in batch[0]:
+        output['not_far'] = torch.stack([data['not_far'] for data in batch])
 
     if 'image3' in batch[0]:
         output['image_eval'] = torch.stack([data['image3'] for data in batch])
@@ -224,6 +181,104 @@ def pretrain_collate02(batch, patch_size, size_per_mask_range, mask_probability,
 
     return output
 
+def pretrain_collate03(batch, mask_ratio_tuple, mask_probability, n_tokens=None, mask_generator=None):
+    output = {}
+    output['index'] = torch.stack([data['index'] for data in batch])
+
+    image1 = torch.stack([data['image1'] for data in batch])
+    image2 = torch.stack([data['image2'] for data in batch])
+    output['image'] = torch.concat((image1, image2), dim=0)
+
+    output['label'] = torch.stack([data['label'] for data in batch])
+    if 'hard' in batch[0]:
+        output['hard'] = torch.stack([data['hard'] for data in batch])
+
+    if 'center' in batch[0]:
+        output['center'] = torch.stack([data['center'] for data in batch])
+
+    if 'not_far' in batch[0]:
+        output['not_far'] = torch.stack([data['not_far'] for data in batch])
+
+    if 'image_eval' in batch[0]:
+        output['image_eval'] = torch.stack([data['image_eval'] for data in batch])
+
+    B = len(image1)
+    N = n_tokens
+    n_samples_masked = int(B * mask_probability)
+    probs = torch.linspace(*mask_ratio_tuple, n_samples_masked + 1)
+    upperbound = 0
+
+    global_crop_masks = []
+    for i in range(0, n_samples_masked):
+        prob_min = probs[i]
+        prob_max = probs[i + 1]
+        global_crop_masks.append(torch.BoolTensor(mask_generator(int(N * random.uniform(prob_min, prob_max)))))
+    for i in range(n_samples_masked, B):
+        global_crop_masks.append(torch.BoolTensor(mask_generator(0)))
+
+    random.shuffle(global_crop_masks)
+
+    local_crop_masks = []
+    for i in range(0, n_samples_masked):
+        prob_min = probs[i]
+        prob_max = probs[i + 1]
+        local_crop_masks.append(torch.BoolTensor(mask_generator(int(N * random.uniform(prob_min, prob_max)))))
+    for i in range(n_samples_masked, B):
+        local_crop_masks.append(torch.BoolTensor(mask_generator(0)))
+
+    random.shuffle(local_crop_masks)
+
+    # masks_list = global_crop_masks + local_crop_masks
+
+    global_crop_masks = torch.stack(global_crop_masks).flatten(1)
+    global_mask_indices = global_crop_masks.flatten().nonzero().flatten()
+    global_none_mask_indices = (global_crop_masks == False).flatten().nonzero().flatten()
+    global_masks_weight = global_crop_masks.sum(-1)
+    global_mask_samples = global_masks_weight.nonzero().flatten()
+    global_masks_weight = (1 / global_masks_weight.clamp(min=1.0)).unsqueeze(-1).expand_as(global_crop_masks)[global_crop_masks]
+    
+    local_crop_masks = torch.stack(local_crop_masks).flatten(1)
+    local_mask_indices = local_crop_masks.flatten().nonzero().flatten()
+    local_none_mask_indices = (local_crop_masks == False).flatten().nonzero().flatten()
+    local_masks_weight = local_crop_masks.sum(-1)
+    local_mask_samples = local_masks_weight.nonzero().flatten()
+    local_masks_weight = (1 / local_masks_weight.clamp(min=1.0)).unsqueeze(-1).expand_as(local_crop_masks)[local_crop_masks]
+
+    output['crop_masks'] = torch.concat((global_crop_masks, local_crop_masks), dim=0)
+    output['mask_indices'] = torch.concat((global_mask_indices, local_mask_indices), dim=0)
+    output['none_mask_indices'] = torch.concat((global_none_mask_indices, local_none_mask_indices), dim=0)
+    output['mask_samples'] = torch.concat((global_mask_samples, local_mask_samples + len(image1)), dim=0)
+    output['masks_weight'] = torch.concat((global_masks_weight, local_masks_weight), dim=0)
+
+    return output
+
+def pretrain_collate04(batch):
+    output = {}
+    output['index'] = torch.stack([data['index'] for data in batch])
+
+    output['image'] = torch.stack([data['image'] for data in batch])
+
+    output['label'] = torch.stack([data['label'] for data in batch])
+
+    output['tag'] = torch.stack([data['tags'] for data in batch])
+    # output['greytag'] = torch.stack([data['greytags'] for data in batch])
+    output['raw_tags'] = [data['raw_tags'] for data in batch]
+    # output['raw_greytags'] = [data['raw_greytags'] for data in batch]
+
+    if 'hard' in batch[0]:
+        output['hard'] = torch.stack([data['hard'] for data in batch])
+
+    if 'center' in batch[0]:
+        output['center'] = torch.stack([data['center'] for data in batch])
+
+    if 'not_far' in batch[0]:
+        output['not_far'] = torch.stack([data['not_far'] for data in batch])
+
+    # if 'image_eval' in batch[0]:
+    #     output['image_eval'] = torch.stack([data['image_eval'] for data in batch])
+
+    return output
+
 def make_mae_dataset(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
@@ -248,102 +303,6 @@ def make_mae_dataset(args):
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
-
-def make_style_dataset(args):
-    train_df = pd.read_parquet(args.train)
-    valid_df = pd.read_parquet(args.valid)
-
-    transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
-    # artist_tokens = [f"<artist_{target}>" for target in train_df.target.unique()]
-    artist_tokens = ["<artist_0>"] + [f"<artist_{target}>" for target in train_df.target.unique()]
-    tokenizer = get_tokenizer('hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k', additional_special_tokens=artist_tokens)
-    args.tokenizer = tokenizer
-
-    with open(args.tag2id, 'r', encoding='utf-8') as f:
-        tag2id = json.load(f)
-
-    with open(args.token2tag, 'r', encoding='utf-8') as f:
-        token2tag = json.load(f)
- 
-    # train_df = train_df[0:100]
-    # valid_df = valid_df[0:100]
-    # train_df = train_df[train_df['target'].isin([i for i in range(80)])]
-    # valid_df = valid_df[valid_df['target'].isin([i for i in range(80)])]
-
-    train_dataset = StyleClipDataset(
-        styleds=train_df.image.tolist(),
-        contents=train_df.im_content.tolist(),
-        labels=train_df.target.tolist(),
-        artists=train_df.artist.tolist(),
-        styled_tags=train_df.tags.tolist(),
-        styled_grey_tags=train_df.grey_tags.tolist(),
-        content_tags=train_df.content_tags.tolist(),
-        transforms=transforms,
-        tokenizer=tokenizer,
-        tag2id=tag2id,
-        token2tag=token2tag,
-        grey_p=0.2,
-        times=train_df.years_passed.tolist(),
-    )
-    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
-    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=style_collate, pin_memory=True, num_workers=args.workers)
-    train_loader.num_samples = len(train_dataset)
-    train_loader.num_batches = len(train_loader)
-
-    valid_dataset = StyleClipDataset(
-        styleds=valid_df.image.tolist(),
-        contents=valid_df.im_content.tolist(),
-        labels=valid_df.target.tolist(),
-        artists=valid_df.artist.tolist(),
-        styled_tags=valid_df.tags.tolist(),
-        styled_grey_tags=valid_df.grey_tags.tolist(),
-        content_tags=valid_df.content_tags.tolist(),
-        transforms=transforms,
-        tokenizer=tokenizer,
-        tag2id=tag2id,
-        token2tag=token2tag,
-        grey_p=0,
-        times=valid_df.years_passed.tolist(),
-    )
-    valid_loader = DataLoader(valid_dataset, collate_fn=style_collate, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
-    valid_loader.num_samples = len(valid_dataset)
-    valid_loader.num_batches = len(valid_loader)
-
-    return train_loader, valid_loader
-
-
-def make_style_dataset02(args):
-    train_df = pd.read_parquet(args.train)
-    valid_df = pd.read_parquet(args.valid)
-
-    train_transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
-
-    train_dataset = StyleDataset(
-        styleds=train_df.image.tolist(),
-        contents=train_df.im_content.tolist(),
-        labels=train_df.target.tolist(),
-        transforms=train_transforms,
-        times=train_df.years_passed.tolist(),
-    )
-    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
-    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=style_collate02, pin_memory=True, num_workers=args.workers)
-    train_loader.num_samples = len(train_dataset)
-    train_loader.num_batches = len(train_loader)
-
-    valid_dataset = StyleDataset(
-        styleds=valid_df.image.tolist(),
-        contents=valid_df.im_content.tolist(),
-        labels=valid_df.target.tolist(),
-        transforms=train_transforms,
-        times=valid_df.years_passed.tolist(),
-        is_valid=True,
-    )
-    valid_loader = DataLoader(valid_dataset, collate_fn=style_collate02, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
-    valid_loader.num_samples = len(valid_dataset)
-    valid_loader.num_batches = len(valid_loader)
-
-    return train_loader, valid_loader
-
 
 def make_pretrain_dataset(args):
     train_df = pd.read_parquet(args.train)
@@ -414,17 +373,24 @@ def make_relation_label(path, df, dtype):
             i, j = class_to_target[tag1], class_to_target[tag2]
             rel_matrix[i, j] = rel_matrix[j, i] = weight
 
-    return rel_matrix
+    def remap(x, src_min, src_max, dst_min, dst_max):
+        return dst_min + (x - src_min) * (dst_max - dst_min) / (src_max - src_min)
 
+    # rel_matrix = remap(rel_matrix, 0, 1.0, 0.3, 1.0)
+    # rel_matrix[rel_matrix == 0.3] = 0
+    rel_matrix = torch.clamp(rel_matrix, min=0.0, max=0.9)
+
+    return rel_matrix
 
 
 def make_pretrain_dataset02(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
-    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    # train_df = train_df[train_df['target'].isin([i for i in range(20)])]
-    # valid_df = valid_df[valid_df['target'].isin([i for i in range(20)])]
+    train_df = train_df[train_df['target'].isin([i for i in range(100)])]
+    valid_df = valid_df[valid_df['target'].isin([i for i in range(100)])]
+
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
     args.num_classes = train_df['target'].nunique()
     args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
     args.rel_pseudo = args.rel_real.clone()
@@ -439,26 +405,48 @@ def make_pretrain_dataset02(args):
     logging.info(f"Valid Image Processor: ")
     logging.info(f"{valid_trans}")
 
-    mask_generator = CustomMaskingGenerator()
-
-    collate_fn = partial(
-        pretrain_collate02,
-        patch_size=args.patch_size,
-        size_per_mask_range=args.size_per_mask_range,
-        mask_probability=0.7,
-        mask_generator=mask_generator,
+    img_size = args.image_size[0]
+    patch_size = args.patch_size
+    n_tokens = (img_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
     )
 
+    # collate_fn = partial(
+    #     pretrain_collate02,
+    #     patch_size=args.patch_size,
+    #     size_per_mask_range=args.size_per_mask_range,
+    #     mask_probability=0.7,
+    #     mask_generator=mask_generator,
+    # )
+    collate_fn = partial(
+        pretrain_collate03,
+        mask_ratio_tuple=(0.2, 0.5),
+        mask_probability=0.5,
+        n_tokens=n_tokens,
+        mask_generator=mask_generator,
+    )
+    
     train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
     train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
-    train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times)
+    train_hards = torch.tensor(train_df.hard_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_centers = torch.tensor(train_df.center_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_not_fars = torch.tensor(train_df.not_far_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_dataset = PretrainDataset(train_df.image.tolist(), train_labels, transforms, times=train_times, hards=train_hards, centers=train_centers, not_fars=train_not_fars)
     # sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
     # sampler = ReleationBatchSampler(train_dataset, batch_size=args.batch_size, rel_matrix=args.rel_pseudo.detach().cpu().numpy(), drop_last=True)
-    sampler = HardGaussBatchSampler(
+    # sampler = HardGaussBatchSampler(
+    #     train_dataset, batch_size=args.batch_size, 
+    #     rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+    #     hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
+    # )
+    sampler = HardLossSampler(
         train_dataset, batch_size=args.batch_size, 
         rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
         hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
     )
+    
     train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
@@ -476,129 +464,213 @@ def make_pretrain_dataset02(args):
 def make_pretrain_dataset03(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
-    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464 ], std=[0.25763473, 0.26254627, 0.25369588])
-    valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464 ], std=[0.25763473, 0.26254627, 0.25369588])
+    train_df = train_df[train_df['target'].isin([i for i in range(100)])]
+    valid_df = valid_df[valid_df['target'].isin([i for i in range(100)])]
+
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+    args.num_classes = train_df['target'].nunique()
+    args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
+    args.rel_pseudo = args.rel_real.clone()
+
+    # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
 
     logging.info(f"Train Image Processor:")
     logging.info(f"{transforms}")
     logging.info(f"Valid Image Processor: ")
     logging.info(f"{valid_trans}")
 
-    mask_generator = CustomMaskingGenerator(
-        input_size=args.image_size[0],
-        patch_size=args.patch_size,
+    img_size = args.image_size[0]
+    patch_size = args.patch_size
+    n_tokens = (img_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
     )
 
     collate_fn = partial(
-        pretrain_collate02,
-        patch_size=args.patch_size,
-        size_per_mask_range=args.size_per_mask_range,
-        mask_probability=0.5,
+        pretrain_collate03,
+        mask_ratio_tuple=(0.2, 0.5),
+        mask_probability=0.7,
+        n_tokens=n_tokens,
         mask_generator=mask_generator,
     )
-
+    
     train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
-    train_times = torch.tensor(train_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
-    train_dataset = PretrainLocalCrops(train_df.image.tolist(), train_labels, transforms, num_crops=args.num_crops, times=train_times)
-    sampler = CustomBatchSampler(train_dataset, batch_size=args.batch_size, num_postive=args.num_postive, drop_last=True)
+    train_bboxes = [np.stack(bbox) if len(bbox) > 0 else [] for bbox in train_df.bbox.tolist()]
+    train_bb_masks = train_df.bb_bi_mask.tolist()
+    train_bg_masks = train_df.bg_mask.tolist()
+    train_hards = torch.tensor(train_df.hard_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_centers = torch.tensor(train_df.center_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_not_fars = torch.tensor(train_df.not_far_sample.tolist(), dtype=torch.bool, device='cpu')
+
+    train_dataset = PretrainBboxDataset(
+        train_df.image.tolist(), train_labels,
+        train_bboxes, train_bb_masks, train_bg_masks,
+        transforms, hards=train_hards, centers=train_centers, not_fars=train_not_fars)
+    
+    sampler = HardLossSampler(
+        train_dataset, batch_size=args.batch_size, 
+        rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+        hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
+    )
+    
     train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
     valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
-    valid_times = torch.tensor(valid_df.years_passed.tolist(), dtype=torch.float32, device='cpu')
-    valid_dataset = PretrainValidDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans, times=valid_times)
+    valid_dataset = PretrainValidBboxDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans)
     valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
     valid_loader.num_samples = len(valid_dataset)
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
 
-def make_dataset(args):
-    df = pd.read_parquet(args.train)
+def make_pretrain_tag_dataset(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
 
-    encoder = LabelEncoder()
-    df['target'] = encoder.fit_transform(df[args.label_key])
+    args.tag_class_weights = torch.tensor(np.load(args.tag_class_weights_path))
+    args.tag_pos_weights = torch.tensor(np.load(args.tag_pos_weights_path))
+    # args.tag_pos_weights = None
+    args.tag_num_classes = args.tag_class_weights.size(0)
 
-    train_df, valid_df = train_test_split(df, test_size=args.valid_size, stratify=df[args.label_key], random_state=42)
+    train_df = train_df[:2000]
+    valid_df = valid_df[:500]
+    # train_df = train_df[train_df['target'].isin([i for i in range(100)])]
+    # valid_df = valid_df[valid_df['target'].isin([i for i in range(100)])]
 
-    print(f"Total Data: {len(df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+    args.num_classes = train_df['target'].nunique()
+    args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
+    args.rel_pseudo = args.rel_real.clone()
 
-    args.num_classes = df['target'].nunique()
-
+    # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
     transforms = get_preset(args.train_aug, image_size=args.image_size)
     valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
+
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transforms}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
     
-    train_dataset = TrainDataset(train_df.image.tolist(), train_df.target.tolist(), transforms)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
+    train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
+    train_tags = [torch.tensor(tags, dtype=torch.long, device='cpu') for tags in train_df.encoded_tags.values]
+    train_greytags = [torch.tensor(tags, dtype=torch.long, device='cpu') for tags in train_df.encoded_grey_tags.values] 
+    train_tags_list = train_df.final_tags.tolist()
+    train_greytags_list = train_df.grey_tags.tolist()
+    train_hards = torch.tensor(train_df.hard_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_centers = torch.tensor(train_df.center_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_not_fars = torch.tensor(train_df.not_far_sample.tolist(), dtype=torch.bool, device='cpu')
+
+    train_dataset = PretrainTagDataset(
+        train_df.image.tolist(), train_labels,
+        train_tags, train_greytags, args.tag_num_classes,
+        transforms, raw_tags=train_tags_list, raw_greytags=train_greytags_list,
+        hards=train_hards, centers=train_centers, not_fars=train_not_fars)
+    
+    sampler = HardLossSampler(
+        train_dataset, batch_size=args.batch_size, 
+        rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+        hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=pretrain_collate04, pin_memory=True, num_workers=args.workers)
+    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
-    valid_dataset = TrainDataset(valid_df.image.tolist(), valid_df.target.tolist(), valid_trans)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
+    valid_tags = [torch.tensor(tags, dtype=torch.long, device='cpu') for tags in valid_df.encoded_tags.values]
+    # valid_greytags = torch.tensor(np.stack(valid_df.encoded_grey_tags.values), dtype=torch.float32, device='cpu')
+    valid_tags_list = valid_df.final_tags.tolist()
+    # valid_greytags_list = valid_df.grey_tags.tolist()
+    valid_dataset = PretrainValidTagDataset(
+        valid_df.image.tolist(), valid_labels, valid_tags, args.tag_num_classes, valid_trans,
+        raw_tags=valid_tags_list, 
+    )
+    valid_loader = DataLoader(valid_dataset, collate_fn=pretrain_collate04, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
     valid_loader.num_samples = len(valid_dataset)
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
 
-def make_multilabel_dataset(args, autodtype, device, set_df=False):
-    df = pd.read_parquet(args.train)
 
-    # train_test_split 함수의 stratify인자를 활용하기 위해 빈도수 1개인 클래스를 제외
-    df['target_str'] = df[args.target_key].astype(str)
-    value_counts = df.value_counts(subset='target_str')
+def make_pretrain_tag_dataset_pretrain(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
 
-    single_sample_classes = value_counts[value_counts == 1].index
-    multi_sample_classes = value_counts[value_counts > 1].index
+    args.tag_class_weights = torch.tensor(np.load(args.tag_class_weights_path))
+    args.tag_pos_weights = torch.tensor(np.load(args.tag_pos_weights_path))
+    # args.tag_pos_weights = None
+    args.tag_num_classes = args.tag_class_weights.size(0)
 
-    single_sample_df = df[df['target_str'].isin(single_sample_classes)]
-    multi_sample_df = df[df['target_str'].isin(multi_sample_classes)]
-    train_df, valid_df = train_test_split(multi_sample_df, test_size=args.valid_size, stratify=multi_sample_df['target_str'], random_state=42)
-    train_df = pd.concat([train_df, single_sample_df])  # 빈도수가 1인 라벨은 train에 포함
-    del df['target_str'], train_df['target_str'], valid_df['target_str']
+    # train_df = train_df[:2000]
+    # valid_df = valid_df[:500]
 
-    print(f"Total Data: {len(df)}, Train: {len(train_df)}, Valid: {len(valid_df)}\n")
-    args.num_classes = len(df.loc[0, args.target_key])
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+    args.num_classes = train_df['target'].nunique()
+    # args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
+    # args.rel_pseudo = args.rel_real.clone()
 
-    # Loss function weight
-    # class weight
-    class_counts = torch.tensor(train_df[args.target_key].sum(), dtype=autodtype, device=device)
-    class_weights = 1.0 / torch.log1p(class_counts + 2)
-    # class_weights = 1.0 / class_counts
-    args.class_weight_val = (class_weights / class_weights.mean()) ** args.class_weight
-    if args.label_json:
-        with open(args.label_json, 'r') as f:
-            class_list = json.load(f)
+    # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
 
-    # pos weight
-    label_count = torch.tensor(len(train_df) * args.num_classes, dtype=autodtype, device=device)
-    args.pos_weight_val = (label_count - class_counts.sum()) / class_counts.sum() * args.pos_weight
-
-    print(f"## Class weight")
-    if args.label_json: print(f"Class: {class_list}")
-    print(f"Weight: {[weight.item() for weight in args.class_weight_val]}")
-    print(f"Pos Weight: {[args.pos_weight_val.item()]}")
-
-
-    transforms = get_preset(args.train_aug)
-    valid_trans = get_preset(args.valid_aug)
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transforms}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
     
-    train_labels = torch.tensor(train_df[args.target_key].tolist(), dtype=autodtype, device='cpu')
-    train_dataset = MLDataset(train_df[args.image_key].tolist(), train_labels, transforms, train_df if set_df else None)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
+    train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
+    train_tags = [torch.tensor(tags, dtype=torch.long, device='cpu') for tags in train_df.encoded_tags.values]
+    train_greytags = [torch.tensor(tags, dtype=torch.long, device='cpu') for tags in train_df.encoded_grey_tags.values] 
+    train_tags_list = train_df.final_tags.tolist()
+    train_greytags_list = train_df.grey_tags.tolist()
+    train_hards = torch.tensor(train_df.hard_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_centers = torch.tensor(train_df.center_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_not_fars = torch.tensor(train_df.not_far_sample.tolist(), dtype=torch.bool, device='cpu')
+
+    train_dataset = PretrainTagDataset(
+        train_df.image.tolist(), train_labels,
+        train_tags, train_greytags, args.tag_num_classes,
+        transforms, raw_tags=train_tags_list, raw_greytags=train_greytags_list,
+        hards=train_hards, centers=train_centers, not_fars=train_not_fars)
+    
+    sampler = HardLossSampler(
+        train_dataset, batch_size=args.batch_size, 
+        # rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+        rel_real=None, rel_pseudo=None, 
+        hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=pretrain_collate04, pin_memory=True, num_workers=args.workers)
+    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
     train_loader.num_samples = len(train_dataset)
     train_loader.num_batches = len(train_loader)
 
-    valid_labels = torch.tensor(valid_df[args.target_key].tolist(), dtype=autodtype, device='cpu')
-    valid_dataset = MLDataset(valid_df[args.image_key].tolist(), valid_labels, valid_trans, valid_df if set_df else None)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
+    valid_tags = [torch.tensor(tags, dtype=torch.long, device='cpu') for tags in valid_df.encoded_tags.values]
+    # valid_greytags = torch.tensor(np.stack(valid_df.encoded_grey_tags.values), dtype=torch.float32, device='cpu')
+    valid_tags_list = valid_df.final_tags.tolist()
+    # valid_greytags_list = valid_df.grey_tags.tolist()
+    valid_dataset = PretrainValidTagDataset(
+        valid_df.image.tolist(), valid_labels, valid_tags, args.tag_num_classes, valid_trans,
+        raw_tags=valid_tags_list, 
+    )
+    valid_loader = DataLoader(valid_dataset, collate_fn=pretrain_collate04, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
     valid_loader.num_samples = len(valid_dataset)
     valid_loader.num_batches = len(valid_loader)
 
     return train_loader, valid_loader
+
 
 def mse_label_to_binary(mse_labels:np.array) -> np.array:
     # 이진 라벨과 연속형 라벨을 이진 형식으로 합칩니다.
@@ -629,50 +701,6 @@ def combine_binary_and_mse(bin_labels:np.array, mse_labels:np.array) -> np.array
     combined = np.concatenate([bin_labels, bin_mse_labels], axis=-1)
 
     return combined
-
-def make_mse_dataset(args, autodtype, device, set_df=False):
-    df = pd.read_parquet(args.train)
-    args.min_mos = min(args.mos_range)
-    args.max_mos = max(args.mos_range)
-
-    mse_labels = np.stack(df[args.target_key].values)
-
-    bin_mse_label = mse_label_to_binary(mse_labels)
-    df['bin_mse_label'] = bin_mse_label.tolist()
-
-    # 점수를 기반으로 split
-    df['target_str'] = df['bin_mse_label'].astype(str)
-    value_counts = df.value_counts(subset='target_str')
-
-    # train_test_split 함수의 stratify인자를 활용하기 위해 빈도수 1개인 클래스를 제외
-    single_sample_classes = value_counts[value_counts == 1].index
-    multi_sample_classes = value_counts[value_counts > 1].index
-
-    single_sample_df = df[df['target_str'].isin(single_sample_classes)]
-    multi_sample_df = df[df['target_str'].isin(multi_sample_classes)]
-    train_df, valid_df = train_test_split(multi_sample_df, test_size=args.valid_size, stratify=multi_sample_df['target_str'], random_state=42)
-    train_df = pd.concat([train_df, single_sample_df])  # 빈도수가 1인 라벨은 train에 포함
-    del df['target_str'], train_df['target_str'], valid_df['target_str'], df['bin_mse_label'], train_df['bin_mse_label'], valid_df['bin_mse_label']
-
-    print(f"Total Data: {len(df)}, Train: {len(train_df)}, Valid: {len(valid_df)}\n")
-    args.num_classes = len(df.loc[0, args.target_key])
-
-    transforms = get_preset(args.train_aug, image_size=args.image_size)
-    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
-    
-    train_labels = (torch.tensor(train_df[args.target_key].tolist(), dtype=autodtype, device='cpu') / args.max_mos).to(dtype=autodtype)
-    train_dataset = MSEDataset(train_df[args.image_key].tolist(), train_labels, transforms, train_df if set_df else None)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
-    train_loader.num_samples = len(train_dataset)
-    train_loader.num_batches = len(train_loader)
-
-    valid_labels = (torch.tensor(valid_df[args.target_key].tolist(), dtype=autodtype, device='cpu') / args.max_mos).to(dtype=autodtype)
-    valid_dataset = MSEDataset(valid_df[args.image_key].tolist(), valid_labels, valid_trans, valid_df if set_df else None)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
-    valid_loader.num_samples = len(valid_dataset)
-    valid_loader.num_batches = len(valid_loader)
-
-    return train_loader, valid_loader
 
 def make_mse_dataset02(args, device, set_df=False):
     df = pd.read_parquet(args.train)
@@ -791,74 +819,6 @@ def make_prefer_dataset(args, autodtype, device, set_df=False):
     return train_loader, valid_loader
 
 
-def make_ml_mse_dataset(args, autodtype, device, set_df=False):
-    df = pd.read_parquet(args.train)
-    args.mse_ranges = np.stack(df["mse_label"].values).max(axis=0).astype(int)
-
-    # 이진 라벨과 연속형 라벨을 이진 형식으로 합칩니다.
-    bin_labels = np.stack(df['label'].values)
-    mse_labels = np.stack(df['mse_label'].values)
-
-    combined_label = combine_binary_and_mse(bin_labels, mse_labels)
-    df['combined_label'] = combined_label.tolist()
-
-    # train_test_split 함수의 stratify인자를 활용하기 위해 빈도수 1개인 클래스를 제외
-    df['target_str'] = df['combined_label'].astype(str)
-    value_counts = df.value_counts(subset='target_str')
-
-    single_sample_classes = value_counts[value_counts == 1].index
-    multi_sample_classes = value_counts[value_counts > 1].index
-
-    single_sample_df = df[df['target_str'].isin(single_sample_classes)]
-    multi_sample_df = df[df['target_str'].isin(multi_sample_classes)]
-    train_df, valid_df = train_test_split(multi_sample_df, test_size=args.valid_size, stratify=multi_sample_df['target_str'], random_state=42)
-    train_df = pd.concat([train_df, single_sample_df])  # 빈도수가 1인 라벨은 train에 포함
-    del df['target_str'], train_df['target_str'], valid_df['target_str']
-
-    print(f"Total Data: {len(df)}, Train: {len(train_df)}, Valid: {len(valid_df)}\n")
-    args.num_classes = len(df.loc[0, args.target_key]) + len(df.loc[0, args.mse_target_key])
-
-    # Loss function weight
-    # class weight
-    class_counts = torch.tensor(train_df[args.target_key].sum(), dtype=autodtype, device=device)
-    class_weights = 1.0 / torch.log1p(class_counts + 2)
-    # class_weights = 1.0 / class_counts
-    args.class_weight_val = (class_weights / class_weights.mean()) ** args.class_weight
-    if args.label_json:
-        with open(args.label_json, 'r') as f:
-            class_list = json.load(f)
-
-    # pos weight
-    bce_num_classes = len(df.loc[0, args.target_key])
-    label_count = torch.tensor(len(train_df) * bce_num_classes, dtype=autodtype, device=device)
-    args.pos_weight_val = (label_count - class_counts.sum()) / class_counts.sum() * args.pos_weight
-
-    print(f"## Class weight")
-    if args.label_json: print(f"Class: {class_list}")
-    print(f"Weight: {[weight.item() for weight in args.class_weight_val]}")
-    print(f"Pos Weight: {[args.pos_weight_val.item()]}")
-
-
-    transforms = get_preset(args.train_aug)
-    valid_trans = get_preset(args.valid_aug)
-    
-    train_labels = torch.tensor(train_df[args.target_key].tolist(), dtype=autodtype, device='cpu')
-    train_mse_labels = (torch.tensor(train_df[args.mse_target_key].tolist(), dtype=autodtype, device='cpu') / args.mse_ranges).to(dtype=autodtype)
-    train_dataset = MLMSEDataset(train_df[args.image_key].tolist(), train_labels, train_mse_labels, transforms, train_df if set_df else None)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
-    train_loader.num_samples = len(train_dataset)
-    train_loader.num_batches = len(train_loader)
-
-    valid_labels = torch.tensor(valid_df[args.target_key].tolist(), dtype=autodtype, device='cpu')
-    valid_mse_labels = (torch.tensor(valid_df[args.mse_target_key].tolist(), dtype=autodtype, device='cpu') / args.mse_ranges).to(dtype=autodtype)
-    valid_dataset = MLMSEDataset(valid_df[args.image_key].tolist(), valid_labels, valid_mse_labels, valid_trans, valid_df if set_df else None)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
-    valid_loader.num_samples = len(valid_dataset)
-    valid_loader.num_batches = len(valid_loader)
-
-    return train_loader, valid_loader
-
-
 def exclude_norm_totensor(transforms):
     transforms = [trans for trans in transforms if not isinstance(trans, (A.augmentations.pixel.transforms.Normalize, A.pytorch.transforms.ToTensorV2))]
     return A.Compose(transforms)
@@ -937,44 +897,6 @@ class NoLabelDataset(TrainDataset):
         return image
     
 
-class MLDataset(Dataset):
-    def __init__(self, images, labels, transforms, df=None):
-        self.df = df
-        self.images = images
-        self.labels = labels
-        self.transforms = transforms
-        self.test_transforms = exclude_norm_totensor(transforms)
-
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, idx):
-        image = cv2.imread(self.images[idx])
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = self.transforms(image=image)['image']
-        label = self.labels[idx]
-        
-        return image, label
-    
-    def get_pil(self, idx, pixels=None):
-        image =Image.open(self.images[idx])
-        if pixels:
-            width, height = image.size
-
-            aspect_ratio = width / height
-            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
-            resize_w = math.ceil(resize_h * aspect_ratio)
-
-            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
-
-        return image
-    
-    def get_trnasformed(self, idx):
-        image = cv2.imread(self.images[idx])
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = self.test_transforms(image=image)['image']
-
-        return Image.fromarray(image)
 
 
 class MSEDataset(Dataset):
@@ -1016,46 +938,17 @@ class MSEDataset(Dataset):
 
         return Image.fromarray(image)
     
-class MLMSEDataset(Dataset):
-    def __init__(self, images, labels, mse_labels, transforms, df=None):
-        self.df = df
-        self.images = images
-        self.labels = labels
-        self.mse_labels = mse_labels
-        self.transforms = transforms
-        self.test_transforms = exclude_norm_totensor(transforms)
-
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, idx):
-        image = cv2.imread(self.images[idx])
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = self.transforms(image=image)['image']
-        label = self.labels[idx]
-        mse_label = self.mse_labels[idx]
-        
-        return image, label, mse_label
-    
-    def get_pil(self, idx, pixels=None):
-        image =Image.open(self.images[idx])
-        if pixels:
-            width, height = image.size
-
-            aspect_ratio = width / height
-            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
-            resize_w = math.ceil(resize_h * aspect_ratio)
-
-            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
-
-        return image
     
 class PretrainDataset(Dataset):
-    def __init__(self, images, labels, transforms, times=None, df=None):
+    def __init__(self, images, labels, transforms, times=None, hards=None, centers=None, not_fars=None, df=None):
         self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
         self.images = images
         self.labels = labels
         self.times = times
+        self.hards = hards
+        self.centers = centers
+        self.not_fars = not_fars
         self.trans1 = transforms['trans1']
         self.trans2 = transforms['trans2']
         self.test_trans1 = remove_normalize_and_totensor(self.trans1)
@@ -1072,10 +965,11 @@ class PretrainDataset(Dataset):
         image2 = self.trans2(image=image)['image']
 
         label = self.labels[idx]
-        output = {'image1': image1, 'image2': image2, 'label': label}
-
-        if self.times is not None:
-            output['time'] = self.times[idx]
+        time = self.times[idx]
+        hard = self.hards[idx]
+        center = self.centers[idx]
+        not_far = self.not_fars[idx]
+        output = {'index': self.indices[idx], 'image1': image1, 'image2': image2, 'label': label, 'time': time, 'hard': hard, 'center': center, 'not_far': not_far}
 
         return output
     
@@ -1121,7 +1015,7 @@ class PretrainValidDataset(PretrainDataset):
 
         label = self.labels[idx]
 
-        output= {'image1': image1, 'image2': image2, 'image3':image3, 'label': label}
+        output= {'index': self.indices[idx], 'image1': image1, 'image2': image2, 'image3':image3, 'label': label}
 
         if self.times is not None:
             output['time'] = self.times[idx]
@@ -1172,18 +1066,21 @@ class PretrainInferDataset(PretrainDataset):
         image = self.test_trans1(image=image)['image']
 
         return Image.fromarray(image)
-    
-class PretrainLocalCrops(Dataset):
-    def __init__(self, images, labels, transforms, num_crops, times=None, df=None):
+
+class PretrainBboxDataset(Dataset):
+    def __init__(self, images, labels, bboxes, bb_masks, bg_masks, transforms, hards=None, centers=None, not_fars=None, df=None):
         self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
         self.images = images
         self.labels = labels
-        self.num_crops = num_crops
-        self.times = times
-        self.trans1 = transforms['trans1']
-        self.trans2 = transforms['trans2']
-        self.test_trans1 = remove_normalize_and_totensor(self.trans1)
-        self.test_trans2 = remove_normalize_and_totensor(self.trans2)
+        self.bboxes = bboxes
+        self.bb_masks = bb_masks
+        self.bg_masks = bg_masks
+        self.hards = hards
+        self.centers = centers
+        self.not_fars = not_fars
+        self.transforms = transforms
+        self.test_trans1 = remove_normalize_and_totensor(self.transforms)
 
     def __len__(self):
         return len(self.images)
@@ -1192,19 +1089,34 @@ class PretrainLocalCrops(Dataset):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        image1 = self.trans1(image=image)['image']
+        bb_mask = self.bb_masks[idx]
+        if bb_mask is not None:
+            bb_mask = cv2.imread(self.bb_masks[idx], cv2.IMREAD_GRAYSCALE)
 
-        crops = []
-        for i in range(self.num_crops):
-            crops.append(self.trans2(image=image)['image'])
-
-        image2 = torch.stack(crops, dim=0)
+        bg_mask = self.bg_masks[idx]
+        if bg_mask is not None:
+            bg_mask = cv2.imread(self.bg_masks[idx], cv2.IMREAD_GRAYSCALE)
 
         label = self.labels[idx]
-        output = {'image1': image1, 'image2': image2, 'label': label}
+        bbox = self.bboxes[idx]
+        hard = self.hards[idx]
+        center = self.centers[idx]
+        not_far = self.not_fars[idx]
 
-        if self.times is not None:
-            output['time'] = self.times[idx]
+        transformed1 = self.transforms(
+            image=image,
+            mask=bb_mask,
+            bg_mask=bg_mask,
+            bboxes=bbox,
+        )
+
+        transformed2 = self.transforms(
+            image=image,
+            mask=bb_mask,
+            bg_mask=bg_mask,
+            bboxes=bbox,
+        )
+        output = {'index': self.indices[idx], 'image1': transformed1['image'], 'image2': transformed2['image'], 'label': label, 'hard': hard, 'center': center, 'not_far': not_far}
 
         return output
     
@@ -1221,19 +1133,153 @@ class PretrainLocalCrops(Dataset):
 
         return image
     
-    def get_transform1(self, idx):
+    def get_transform(self, idx):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = self.test_trans1(image=image)['image']
+        bb_mask = cv2.imread(self.bboxes[idx], cv2.IMREAD_GRAYSCALE)
+        bg_mask = cv2.imread(self.bg_masks[idx], cv2.IMREAD_GRAYSCALE)
+        bbox = self.bboxes[idx]
+        
+        transformed = self.transforms(
+            image=image,
+            mask=bb_mask,
+            bg_mask=bg_mask,
+            bboxes=bbox,
+        )
 
-        return Image.fromarray(image)
+        return Image.fromarray(transformed['image'])
+
+class PretrainValidBboxDataset(Dataset):
+    def __init__(self, images, labels, transforms, valid_transforms, df=None):
+        self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
+        self.images = images
+        self.labels = labels
+        self.transforms = transforms
+        self.valid_transforms = valid_transforms
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image1 = self.transforms(image=image)['image']
+        image2 = self.transforms(image=image)['image']
+        image_eval = self.valid_transforms(image=image)['image']
+        label = self.labels[idx]
+
+        output= {'index': self.indices[idx], 'image1': image1, 'image2': image2, 'image_eval': image_eval, 'label': label}
+        return output
+
+class PretrainTagDataset(Dataset):
+    def __init__(self, images, labels, tags, greytags, tag_num, transforms, raw_tags=None, raw_greytags=None, hards=None, centers=None, not_fars=None, df=None):
+        self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
+        self.images = images
+        self.labels = labels
+        self.tags = tags
+        self.greytags = greytags
+        self.tag_num = tag_num
+        self.raw_tags = raw_tags
+        self.raw_greytags = raw_greytags
+        self.hards = hards
+        self.centers = centers
+        self.not_fars = not_fars
+        self.transforms = transforms
+        self.test_trans = remove_normalize_and_totensor(self.transforms)
+
+    def __len__(self):
+        return len(self.images)
     
-    def get_transform2(self, idx):
+    def __getitem__(self, idx):
         image = cv2.imread(self.images[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = self.test_trans2(image=image)['image']
 
-        return Image.fromarray(image)
+        label = self.labels[idx]
+        
+        hard = self.hards[idx]
+        center = self.centers[idx]
+        not_far = self.not_fars[idx]
+
+        transformed = self.transforms(image=image)
+
+        applied = transformed["applied_transforms"]
+        is_grey = any(name == "ToGray" for name, params in applied)
+
+        tag_indices = self.greytags[idx] if is_grey else self.tags[idx]
+        tags = torch.zeros(self.tag_num, dtype=torch.float32)
+        tags[tag_indices] = 1.0
+
+        if is_grey:
+            if self.raw_greytags is not None:
+                raw_tags = self.raw_greytags[idx]
+        else:
+            if self.raw_tags is not None:
+                raw_tags = self.raw_tags[idx]
+
+        output = {
+            'index': self.indices[idx], 'image': transformed['image'], 'label': label, 
+            'tags': tags, 'raw_tags': raw_tags,
+            'hard': hard, 'center': center, 'not_far': not_far}
+
+        return output
+    
+    def get_pil(self, idx, pixels=None):
+        image =Image.open(self.images[idx])
+        if pixels:
+            width, height = image.size
+
+            aspect_ratio = width / height
+            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
+            resize_w = math.ceil(resize_h * aspect_ratio)
+
+            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
+
+        return image
+    
+    def get_transform(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        transformed = self.transforms(image=image)
+
+        return Image.fromarray(transformed['image'])
+
+class PretrainValidTagDataset(Dataset):
+    def __init__(self, images, labels, tags, tag_num, transforms, raw_tags=None, df=None):
+        self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
+        self.images = images
+        self.labels = labels
+        self.tags = tags
+        self.tag_num = tag_num
+        self.raw_tags = raw_tags
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image = self.transforms(image=image)['image']
+        label = self.labels[idx]
+
+        tag_indices = self.tags[idx]
+        tags = torch.zeros(self.tag_num, dtype=torch.float32)
+        tags[tag_indices] = 1.0
+
+        if self.raw_tags is not None:
+            raw_tags = self.raw_tags[idx]
+
+        output= {
+            'index': self.indices[idx], 'image': image, 'label': label, 
+            'tags': tags, 'raw_tags': raw_tags}
+        return output
+    
     
 class StyleClipDataset(Dataset):
     def __init__(self, styleds, contents, labels, artists, styled_tags, styled_grey_tags, content_tags, transforms, tokenizer, tag2id=None, token2tag=None, grey_p=0.2, times=None, df=None):
@@ -1388,87 +1434,6 @@ class StyleClipDataset(Dataset):
         return Image.fromarray(styled), Image.fromarray(content)
     
 
-class StyleDataset(Dataset):
-    def __init__(self, styleds, contents, labels, transforms, is_valid=False, times=None, df=None):
-        self.df = df
-        self.is_valid = is_valid
-        self.styleds = styleds
-        self.contents = contents
-        self.labels = torch.tensor(labels, dtype=torch.float32, device='cpu') if not isinstance(labels, torch.Tensor) else labels
-        self.times = torch.tensor(times, dtype=torch.float32, device='cpu') if not isinstance(times, torch.Tensor) else times
-        self.shared_trans = transforms['shared_trans']
-        self.style_trans = transforms['style_trans']
-        self.end_trans = transforms['end_trans']
-        self.valid_trans = transforms['valid_trans']
-
-    def __len__(self):
-        return len(self.styleds)
-    
-    def __getitem__(self, idx):
-        styled = cv2.imread(self.styleds[idx], cv2.IMREAD_COLOR)
-        styled = cv2.cvtColor(styled, cv2.COLOR_BGR2RGB)
-        content = cv2.imread(self.contents[idx], cv2.IMREAD_COLOR)
-        
-        # Augmentation
-        shared1 = self.shared_trans(image=styled, image2=content)    # 둘이 완전히 동일한 처리를 적용함. (Random한 Aumgentation이 포함되어 있어도 두 이미지는 완전히 동일한 처리가 적용됨.)
-        styled1, content1 = shared1['image'], shared1['image2']
-        styled1 = self.style_trans(image=styled1)['image']
-        styled1 = self.end_trans(image=styled1)['image']
-        content1 = self.end_trans(image=content1)['image']
-
-        shared2 = self.shared_trans(image=styled, image2=content)
-        styled2, content2 = shared2['image'], shared2['image2']
-        styled2 = self.style_trans(image=styled2)['image']
-        styled2 = self.end_trans(image=styled2)['image']
-        content2 = self.end_trans(image=content2)['image']
-
-        label = self.labels[idx]
-
-        output = {
-            'styled1': styled1,
-            'content1': content1, 
-            'styled2': styled2,
-            'content2': content2, 
-            'label': label, 
-        }
-
-        if self.times is not None:
-            output['time'] = self.times[idx]
-
-        if self.is_valid:
-            shared_valid = self.valid_trans(image=styled, image2=content)
-            styled_valid, content_valid = shared_valid['image'], shared_valid['image2']
-            output['styled_valid'] = styled_valid
-            output['content_valid'] = content_valid
-
-        return output
-    
-    def get_pil(self, idx, pixels=None):
-        image =Image.open(self.images[idx])
-        if pixels:
-            width, height = image.size
-
-            aspect_ratio = width / height
-            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
-            resize_w = math.ceil(resize_h * aspect_ratio)
-
-            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
-
-        return image
-    
-    def get_transform(self, idx) -> tuple:
-        styled = cv2.imread(self.styleds[idx], cv2.IMREAD_COLOR)
-        styled = cv2.cvtColor(styled, cv2.COLOR_BGR2RGB)
-
-        content = cv2.imread(self.contents[idx], cv2.IMREAD_COLOR)
-        
-        shared = self.shared_trans(image=styled, image2=content)    # 둘이 완전히 동일한 처리를 적용함. (Random한 Aumgentation이 포함되어 있어도 두 이미지는 완전히 동일한 처리가 적용됨.)
-        styled, content = shared['image'], shared['image2']
-        styled = self.style_trans(image=styled)['image']
-
-        return Image.fromarray(styled), Image.fromarray(content)
-    
-
 class CustomBatchSampler(Sampler[int]):
     r"""
     class를 랜덤으로 하나 샘플링한뒤 해당 클래스와 같은 클래스의 샘플을 num_postive 갯수만큼 
@@ -1550,15 +1515,6 @@ class CustomBatchSampler(Sampler[int]):
         return all_batches
 
 class ReleationBatchSampler(Sampler[int]):
-    r"""
-    class를 랜덤으로 하나 샘플링한뒤 해당 클래스와 같은 클래스의 샘플을 num_postive 갯수만큼 
-    1개 미니배치에 포함시킵니다. 나머지 는 선택된 class의 샘플을 제외하고 무작위로 채워집니다.
-
-    Args:
-        num_postive: 1개 미니배치에 포함하고 싶은 postive sample의 갯수 (min_num, max_num):Tuple
-            ex: (2, 4)로 설정할 경우 샘플링된 클래스가 미내배치내에 2~4개 존재합니다.
-    """
-
     def __init__(self, dataset, batch_size, rel_matrix: np.ndarray, drop_last=True) -> None:
         self.dataset = dataset
         indices = [i for i in range(len(self.dataset))]
@@ -1705,8 +1661,224 @@ class ReleationBatchSampler(Sampler[int]):
                 
         random.shuffle(all_batches)
         return all_batches
-    
 
+    
+class HardLossSampler(Sampler[int]):
+    """
+    score가 높은 샘플을 우선적으로 기준 클래스로 설정하며 batch에 반드시 포함됩니다.
+    score 샘플링 이후 모델이 잘 맞추지 못하는 클래스 일수록 기준 클래스로 선택됩니다.
+    기준 클래스에서 샘플하나, 그리고 hard_num 만큼 잘 못 맞추고 있는 클래스,
+    나머지는 유니폼 샘플링을 합니다.
+
+    모델이 잘 맞추지 못하는 클래스 및 샘플에 집중하도록 의도했습니다.
+    """
+
+    def __init__(self, dataset, batch_size, rel_real: np.ndarray = None, rel_pseudo: np.ndarray = None, hard_num=[1, 2], same_num=[1, 2], accum=1) -> None:
+        self.dataset = dataset
+        self.indices = [i for i in range(len(self.dataset))]
+        labels = dataset.labels.to(dtype=int).tolist()
+        self.unique_labels = dataset.labels.unique().to(dtype=int).tolist()
+        n_classes = len(self.unique_labels)
+        self.batch_size = batch_size
+        self.accum = accum
+        self.rel_real = rel_real if rel_real is not None else np.eye(n_classes)
+        self.rel_pseudo = rel_pseudo if rel_pseudo is not None else np.eye(n_classes)
+        self.gt_mask = rel_real != 0
+        self.hard_num = hard_num
+        self.same_num = same_num
+        self.cls_diff_weights = np.ones(n_classes)
+        self.sample_diff_weights = np.ones(n_classes)
+        self.sample_gauss_weights = np.ones(n_classes)
+        self.sample_score = np.zeros(len(self.dataset))
+        self.score_sampling_limit = 0
+
+        data_by_class = defaultdict(list)
+        for idx, label in zip(self.indices, labels):
+            data_by_class[label].append(idx)
+
+        self.data_by_class = data_by_class
+
+        data_to_class = dict()
+        for idx, label in zip(self.indices, labels):
+            data_to_class[idx] = label
+
+        self.data_to_class = data_to_class
+
+    def __iter__(self):
+        self.data_by_class_copy = deepcopy(self.data_by_class)
+        # self.remain_num = sum(len(v) for v in self.data_by_class.values())
+        self.available_mask = np.ones(len(self.unique_labels), dtype=bool)
+        self.sample_available_mask = np.ones(len(self.indices), dtype=bool)
+
+        if self.sample_score.sum() > 0:
+            self.score_sampling_limit = len(self) * 0.1
+
+        # self.all_batches = []
+        # self.all_classes = []
+        # self.remain_class = []
+
+        for i in range(len(self)):
+            idxs = self.make_one_batch(i)
+            yield idxs
+            
+        # for idxs in self.all_batches:
+        #     yield idxs
+
+    def __len__(self) -> int:
+        return len(self.dataset) // self.batch_size
+        
+    def cls_diff_weight(self, rel_real, rel_pseudo, eps, temp):
+        # axis=1 기준 평균 절대 오차
+        diff_weight = np.abs(rel_real - rel_pseudo).sum(axis=1, where=self.gt_mask) / self.gt_mask.sum(axis=1)
+
+        weights = np.power(diff_weight + eps, temp)
+        weights /= weights.sum()
+
+        return weights
+
+    def sample_diff_weight(self, rel_real, rel_pseudo, mask, eps, temp):
+        diff_weight = np.abs(rel_real - rel_pseudo)
+
+        weights = np.where(
+            mask,
+            np.power(diff_weight + eps, temp),
+            1e-6
+        )
+
+        weights /= weights.sum(axis=1, keepdims=True)
+        return weights
+        
+    def asymmetric_gaussian_weight(self, similarity, center=0.55, left_sigma=0.15, right_sigma=0.1):
+        """
+        center를 중심으로 한 비대칭 정규분포
+        args:
+            similarity: 분포
+            center: 중심, 최빈값
+            left_sigma: 왼쪽 분포의 sigma
+            right_sigma: 오른쪽 분포의 sigma
+        """
+        weights = np.zeros_like(similarity)
+
+        left_mask = similarity < center
+        right_mask = ~left_mask
+
+        weights[left_mask] = np.exp(-((similarity[left_mask] - center) ** 2) / (2 * left_sigma ** 2))
+        weights[right_mask] = np.exp(-((similarity[right_mask] - center) ** 2) / (2 * right_sigma ** 2))
+
+        return weights
+
+    def update_weights(self):
+        self.cls_diff_weights = self.cls_diff_weight(self.rel_real, self.rel_pseudo, 0.1, 1.0)
+        self.sample_diff_weights = self.sample_diff_weight(self.rel_real, self.rel_pseudo, self.gt_mask, 0.1, 1.2)
+        self.sample_gauss_weights = self.asymmetric_gaussian_weight(self.rel_pseudo, center=0.75, left_sigma=0.20, right_sigma=0.15) + 0.1
+
+    def update_score(self, scores, top_p=10):
+        scores = scores.detach().cpu().numpy()
+
+        k = max(1, int(len(scores) * top_p / 100))
+
+        indices = np.argpartition(scores, -k)[-k:]
+
+        result = np.zeros_like(scores)
+        result[indices] = scores[indices]
+
+        self.sample_score = result
+    
+    def make_one_batch(self, step):
+        selected_samples = []
+        # classes = []
+
+        if step % self.accum == 0:
+            same_k = random.randint(*self.same_num)
+
+            if self.score_sampling_limit > 0:
+                score_sample = random.choices(self.indices, weights=self.sample_score * self.sample_available_mask, k=1)[0]
+                cls = self.data_to_class[score_sample]
+                self.score_sampling_limit -= 1
+
+                self.cls = cls
+
+                samples = self.data_by_class_copy[cls]
+                samples.remove(score_sample)
+                selected_samples.append(score_sample)
+                self.sample_available_mask[score_sample] = False
+                # classes.append(cls)
+
+                if not samples:
+                    self.available_mask[cls] = False
+                    same_k = len(selected_samples)
+
+                for _ in range(same_k-1):
+                    samples = self.data_by_class_copy[cls]
+
+                    idx = random.randrange(len(samples))
+                    selected_sample = samples.pop(idx)
+                    selected_samples.append(selected_sample)
+                    self.sample_available_mask[selected_sample] = False
+                    # classes.append(cls)
+
+                    if not samples:
+                        self.available_mask[cls] = False
+                        same_k = len(selected_samples)
+                        break
+
+            else:
+                cls = random.choices(self.unique_labels, weights=self.cls_diff_weights * self.available_mask, k=1)[0]
+                self.cls = cls  
+
+                for _ in range(same_k):
+                    samples = self.data_by_class_copy[cls]
+
+                    idx = random.randrange(len(samples))
+                    # selected_samples.append(samples.pop(idx))
+                    selected_sample = samples.pop(idx)
+                    selected_samples.append(selected_sample)
+                    self.sample_available_mask[selected_sample] = False
+                    # classes.append(cls)
+
+                    if not samples:
+                        self.available_mask[cls] = False
+                        same_k = len(selected_samples)
+                        break
+        else:
+            same_k = 0
+            cls = self.cls
+
+
+        while len(selected_samples) < self.batch_size:
+            hard_k = random.randint(*self.hard_num)
+            gaus_k = self.batch_size - same_k - hard_k
+
+            selected_cls = (
+                # random.choices(self.unique_labels, weights=self.sample_gauss_weights[cls] * self.available_mask, k=gaus_k)
+                random.choices(self.unique_labels, k=gaus_k)
+                + random.choices(self.unique_labels, weights=self.sample_diff_weights[cls] * self.available_mask, k=hard_k)
+            )
+
+            for sel_cls in selected_cls:
+                samples = self.data_by_class_copy[sel_cls]
+
+                if samples:
+                    idx = random.randrange(len(samples))
+                    # selected_samples.append(samples.pop(idx))
+                    selected_sample = samples.pop(idx)
+                    selected_samples.append(selected_sample)
+                    self.sample_available_mask[selected_sample] = False
+                    # classes.append(sel_cls)
+
+                    if not samples:
+                        self.available_mask[sel_cls] = False
+
+                    if len(selected_samples) >= self.batch_size:
+                        break
+
+        random.shuffle(selected_samples)
+        # self.all_batches.append(selected_samples)
+        # self.all_classes.append(classes)
+        # self.remain_class.append(np.array(self.unique_labels)[self.available_mask])
+
+        return selected_samples
+    
 class HardGaussBatchSampler(Sampler[int]):
     """
     모델이 잘 맞추지 못하는 클래스 일수록 기준 클래스로 선택됩니다.
@@ -1829,7 +2001,8 @@ class HardGaussBatchSampler(Sampler[int]):
             gaus_k = self.batch_size - same_k - hard_k
 
             selected_cls = (
-                random.choices(self.unique_labels, weights=self.sample_gauss_weights[cls] * self.available_mask, k=gaus_k)
+                # random.choices(self.unique_labels, weights=self.sample_gauss_weights[cls] * self.available_mask, k=gaus_k)
+                random.choices(self.unique_labels, weights=self.available_mask, k=gaus_k)
                 + random.choices(self.unique_labels, weights=self.sample_diff_weights[cls] * self.available_mask, k=hard_k)
             )
 

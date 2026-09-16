@@ -1,0 +1,988 @@
+import json
+import re
+import logging
+import os
+import shutil
+from datetime import datetime
+import time
+import math
+import torch
+import numpy as np
+import random
+import copy
+import wandb
+
+import torch.utils.tensorboard as tensorboard
+
+from open_clip_train.distributed import is_master, init_distributed_device
+from open_clip_train.logger import setup_logging
+
+from mysrc.utils.pretrain_params import setup_parser
+from mysrc.utils.config import read_config
+from mysrc.utils.dataset import make_pretrain_tag_dataset
+from mysrc.utils.optim_utils import make_mae_param_groups
+from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, RelationPrototypeContrastiveLoss, RelationSigLipLoss2, BCELoss, similarity_mse_loss, content_style_sim_loss
+from mysrc.utils.scheduler import CosineScheduler, StepGenerator
+from mysrc.utils.precision import get_autocast, get_input_dtype
+from mysrc.model import CustomVisual2
+from mysrc.utils.file_utils import pt_load
+from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics, get_class_topk, get_tag_metrics
+
+from sklearn.metrics import accuracy_score, f1_score
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+class SampleManager:
+    def __init__(self, n_samples, momentum=0.9):
+        self.loss = torch.zeros(n_samples)
+        self.count = torch.zeros(n_samples)
+
+        self.seen = torch.zeros(
+            n_samples,
+            dtype=torch.bool
+        )
+
+        self.momentum = momentum
+        self.total_count = 0
+
+    @torch.no_grad()
+    def update(self, indices, loss):
+        indices = indices.cpu()
+        new = loss.detach().cpu()
+
+        old = self.loss[indices]
+        first = ~self.seen[indices]
+
+        self.loss[indices] = torch.where(
+            first,
+            new,
+            self.momentum * old
+            + (1 - self.momentum) * new
+        )
+
+        self.count[indices] += 1
+        self.seen[indices] = True
+
+        self.total_count += len(indices)
+
+    @torch.no_grad()
+    def get_score(self, alpha=0.9):
+        mean_count = self.total_count / len(self.loss)
+
+        hardness = self.loss
+
+        exploration = (
+            np.sqrt(mean_count + 1)
+            / (self.count + 1).sqrt()
+        )
+
+        score = (
+            alpha * hardness
+            + (1 - alpha) * exploration
+        )
+
+        return score
+
+
+def random_seed(seed=42, rank=0):
+    torch.manual_seed(seed + rank)
+    if torch.cuda.is_available(): 
+        torch.cuda.manual_seed_all(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
+
+def load_random_state(checkpoint):
+    torch.random.set_rng_state(checkpoint['torch_rng_state'])
+    if torch.cuda.is_available() and checkpoint['cuda_rng_state'] is not None: 
+        torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+    np.random.set_state(checkpoint['numpy_rng_state'])
+    random.setstate(checkpoint['random_state'])
+
+def unwrap_model(model):
+    if hasattr(model, 'module'):
+        return model.module
+    else:
+        return model
+
+def backward(total_loss, scaler):
+    if scaler is not None:
+        scaler.scale(total_loss).backward()
+    else:
+        total_loss.backward()
+
+def apply_optim_scheduler(optimizer, lr):
+    for param_group in optimizer.param_groups:
+        lr_multiplier = param_group["lr_multiplier"]
+
+        # if isinstance(optimizer, Prodigy):
+            # return
+        param_group["lr"] =  lr * lr_multiplier
+
+def load_pretrain(model, path):
+    if path is not None and os.path.exists(path):
+        checkpoint = torch.load(path, weights_only=False)
+
+        if 'state_dict' in checkpoint:
+            if checkpoint['state_dict']['prototypes'].shape != model.prototypes.shape:
+                logging.info(f"The model of the prototpye shape not matches pretrain prototype shape. {model.prototypes.shape}(model) != {checkpoint['state_dict']['prototypes'].shape}(pretrained). Therefore, the prototype vector is excluded.")
+                del checkpoint['state_dict']['prototypes']
+
+            missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
+        else:
+            if checkpoint.get('prototypes') and checkpoint['prototypes'].shape != model.prototypes.shape:
+                logging.info(f"The model of the prototpye shape not matches pretrain prototype shape. {model.prototypes.shape}(model) != {checkpoint['prototypes'].shape}(pretrained). Therefore, the prototype vector is excluded.")
+                del checkpoint['state_dict']['prototypes']
+
+            missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+            
+        logging.info(f"Loaded pretrain model from {path}")
+        logging.info(f"missing_key: {len(missing)}: {missing[:10]}")
+        logging.info(f"unexpected_key: {len(unexpected)}: {unexpected[:10]}")
+
+def update_relation(clip_loss, proto_loss, prototypes, momentum, batch_sampler, args, step=None, save=False):
+    rel_pseudo = args.rel_pseudo.to(device=prototypes.device, dtype=prototypes.dtype)
+    rel_real = args.rel_real.to(device=prototypes.device, dtype=prototypes.dtype)
+
+    # cosine similarity
+    new_rel_pseudo = torch.clamp(prototypes @ prototypes.T, 0, 1.0)
+
+    k = int(prototypes.size(0) * args.topk_rate)    # 상위 10% sim
+    topk_values, topk_indices = torch.topk(new_rel_pseudo, k=k, dim=-1)
+
+    # adaptive threshold
+    mean = topk_values.mean(dim=-1, keepdim=True)    # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+    std = topk_values.std(dim=-1, keepdim=True)  # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
+    threshold = mean * args.th_mean_weight + std * args.th_std_weight
+
+    # threshold 보다 큰 sim 값만 남김 => 너무 작은 sim은 크게 의미 없는 값일 가능성이 높음
+    new_rel_pseudo = torch.where(new_rel_pseudo > threshold, new_rel_pseudo, torch.zeros_like(new_rel_pseudo))
+    new_rel_pseudo = torch.maximum(new_rel_pseudo, new_rel_pseudo.T)    # A => B, B => A 연관성 동일 보장
+
+    rel_pseudo = momentum * rel_pseudo + (1 - momentum) * new_rel_pseudo    # EMA
+
+    center = args.alpha_center
+    sharpness = args.alpha_sharpness
+    alpha = torch.sigmoid(sharpness * (rel_real - center)) # 연관성이 높을 수록 rel_real의 값을 많이 유지한다.
+
+    real_mask = rel_real != 0
+    rel_mixed = torch.where(
+        real_mask,
+        alpha * rel_real + (1 - alpha) * rel_pseudo,
+        rel_pseudo
+    )
+
+    args.rel_pseudo = rel_pseudo
+    clip_loss.rel_matrix = rel_mixed
+    proto_loss.rel_matrix = rel_mixed
+    batch_sampler.rel_real = rel_mixed.detach().cpu().numpy()
+    batch_sampler.rel_pseudo = rel_mixed.detach().cpu().numpy()
+
+    if save:
+        relation_dir = os.path.join(args.output_path, "relation")
+        os.makedirs(relation_dir, exist_ok=True)
+        relation_path = os.path.join(relation_dir, f"{step}_relation.pt")
+
+        rel_dict = {"step": step, "rel_pseudo": rel_mixed}
+        torch.save(rel_dict, relation_path)
+
+def train_one_epoch(
+        model, device, dataloader, clip_loss, proto_loss, content_loss, epoch, 
+        optimizer, scaler, 
+        scheduler, clip_scheduler, proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, batch_sampler_scheduler, 
+        tb_writer, sample_manager, args
+    ):
+    autocast = get_autocast(args.precision, device_type=device.type)
+    input_dtype = get_input_dtype(args.precision)
+    model.train()
+
+    num_batches_per_epoch = dataloader.num_batches // args.accum_freq
+    sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
+
+    if epoch >= 1:
+        scores = sample_manager.get_score(alpha=0.9)
+        dataloader.batch_sampler.update_score(scores, top_p=10)
+
+    if args.accum_freq > 1:
+        accum_images, accum_classes = [], []
+        accum_not_fars = []
+        accum_index = []
+        accum_tags = []
+        # accum_mask_indices, accum_nm_indices, accum_mask_samples = [], [], []
+        accum_features = {}
+
+    losses_m = {}
+    losses_log = {}
+    # total_m = AverageMeter()
+    # clip_loss_m = AverageMeter()
+    batch_time_m = AverageMeter()
+    data_time_m = AverageMeter()
+    end = time.time()
+        
+    for i, batch in enumerate(dataloader):
+        i_accum = i // args.accum_freq
+        step = num_batches_per_epoch * epoch + i_accum
+
+        # if rel_update_scheduler.is_update_step(step):
+        #     update_relation(clip_loss, proto_loss, model.prototypes, rel_momentum_scheduler[step], dataloader.batch_sampler, args, step=step, save=True)
+
+        if batch_sampler_scheduler.is_update_step(step):
+            sim_matrix = model.prototypes @ model.prototypes.T
+            sim_matrix = torch.clip(sim_matrix, 0, 1.0)
+            sim_matrix.fill_diagonal_(1.0)
+
+            dataloader.batch_sampler.rel_pseudo = sim_matrix.detach().cpu().numpy()
+            dataloader.batch_sampler.update_weights()
+            
+        lr = scheduler[step]
+        proto_loss.momentum = proto_momentum_scheduler[step]
+        apply_optim_scheduler(optimizer, lr)
+
+        index, images, classes, hards, centers, not_fars = batch['index'], batch['image'], batch['label'], batch['hard'], batch['center'], batch['not_far']
+        index = index.to(device='cpu', dtype=torch.long, non_blocking=True)
+        images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+        classes = classes.to(device=device, dtype=torch.long, non_blocking=True)
+        hards = hards.to(device=device, dtype=torch.bool, non_blocking=True)
+        centers = centers.to(device=device, dtype=torch.bool, non_blocking=True)
+        not_fars = not_fars.to(device=device, dtype=torch.bool, non_blocking=True)
+
+        tags = batch['tag']
+        tags = tags.to(device=device, dtype=torch.float32, non_blocking=True)
+        # greytags = greytags.to(device=device, dtype=torch.float32, non_blocking=True)
+
+        # mask_indices = mask_indices.to(device=device, non_blocking=True)
+        # none_mask_indices = none_mask_indices.to(device=device, non_blocking=True)
+        # mask_samples = mask_samples.to(device=device, non_blocking=True)
+
+        # dataloader.batch_sampler.all_batches[-1]
+        # dataloader.batch_sampler.all_classes[-1]
+        # dataloader.batch_sampler.sample_diff_weights
+
+        data_time_m.update(time.time() - end)
+        optimizer.zero_grad()
+        
+        if args.accum_freq == 1:
+            with autocast():
+                model_out = model(
+                    images, 
+                    # mask_indices, none_mask_indices, mask_samples,
+                )
+                cls_features = {
+                    'style_feat': model_out['style_feat'],
+                    'content_feat': model_out['content_feat'],
+                    'content_tag_feat': model_out['content_tag_feat'],
+                }
+                logit_scale = model_out["logit_scale"]
+                logit_bias = model_out.get("logit_bias", None)
+
+                losses = {}
+                losses['style_loss'] = clip_loss(
+                    cls_features['style_feat'], 
+                    logit_scale, logit_bias, 
+                    classes, same_class_weight=args.same_class_weight, 
+                    not_fars=not_fars,
+                    output_dict=False
+                )
+
+                losses['proto_loss'] = proto_loss(
+                    cls_features['style_feat'], model.prototypes,
+                    logit_scale, logit_bias,
+                    classes,
+                    hards=hards, centers=centers, not_fars=not_fars,
+                    index=index, sample_manager=sample_manager,
+                    train=True,
+                )
+
+                losses['content_loss'] = content_loss(cls_features['content_tag_feat'], tags)
+
+                # content style sim loss
+                losses['content_style_cosine_loss'] = content_style_sim_loss(
+                    cls_features['content_feat'], 
+                    cls_features['style_feat'],
+                )
+
+                # similarity mse loss
+                losses['mse_loss'] = similarity_mse_loss(
+                    torch.cat((cls_features['style_feat1'][~not_fars], cls_features['style_feat2'][~not_fars]), dim=0), 
+                    torch.cat((classes[~not_fars], classes[~not_fars]), dim=0).long(), 
+                    model.prototypes, args.rel_real,
+                )
+                
+                losses["raw_loss"] = sum(losses.values())
+                losses["loss"] = (
+                    losses['style_loss'] * clip_scheduler[step] 
+                    + losses['proto_loss'] * proto_scheduler[step] 
+                    + losses['content_loss'] 
+                    + losses['content_style_cosine_loss'] 
+                    # + losses['mse_loss'] * 1.0 
+                    # + losses['mae_loss'] * 0.5
+                )
+
+            backward(losses["loss"], scaler)
+            losses_log.update(losses)
+
+        else:
+            # First, cache the features without any gradient tracking.
+            with torch.no_grad():
+                with autocast():
+                    model_out = model(images)
+                    cls_features = {
+                        'style_feat': model_out['style_feat'],
+                        'content_feat': model_out['content_feat'],
+                        'content_tag_feat': model_out['content_tag_feat'],
+                    }
+
+                    for key, val in cls_features.items():
+                        if key in accum_features:
+                            accum_features[key].append(val)
+                        else:
+                            accum_features[key] = [val]
+                    
+                accum_images.append(images)
+                accum_classes.append(classes)
+                accum_index.append(index)
+                accum_not_fars.append(not_fars)
+                accum_tags.append(tags)
+
+            # If (i + 1) % accum_freq is not zero, move on to the next batch.
+            if ((i + 1) % args.accum_freq) > 0:
+                # FIXME this makes data time logging unreliable when accumulating
+                continue
+
+            # Now, ready to take gradients for the last accum_freq batches.
+            # Re-do the forward pass for those batches, and use the cached features from the other batches as negatives.
+            # Call backwards each time, but only step optimizer at the end.
+            optimizer.zero_grad()
+            accum_classes = torch.concat(accum_classes, dim=-1)
+            accum_not_fars = torch.concat(accum_not_fars, dim=-1)
+            accum_index = torch.concat(accum_index, dim=-1)
+            accum_tags = torch.concat(accum_tags, dim=0)
+            for j in range(args.accum_freq):
+                images = accum_images[j]
+                tags = accum_tags[j]
+                # mask_indices = accum_mask_indices[j]
+                # none_mask_indices = accum_nm_indices[j]
+                # mask_samples = accum_mask_samples[j]
+
+                with autocast():
+                    model_out = model(
+                        images, 
+                        # mask_indices, none_mask_indices, mask_samples,
+                    )
+                    cls_features = {
+                        'style_feat': model_out['style_feat'],
+                        'content_feat': model_out['content_feat'],
+                    }
+                    content_tag_feat = model_out['content_tag_feat'],
+                    
+                    logit_scale = model_out["logit_scale"]
+                    logit_bias = model_out.get("logit_bias", None)
+
+                    inputs = {}
+                    for key, val in accum_features.items():
+                        accumulated = accum_features[key]
+                        inputs[key] = torch.cat(accumulated[:j] + [cls_features[key]] + accumulated[j + 1:])
+                    
+                    losses = {}
+                    losses['style_loss'] = clip_loss(
+                        inputs['style_feat'], 
+                        logit_scale, logit_bias, 
+                        accum_classes, same_class_weight=args.same_class_weight, 
+                        not_fars=accum_not_fars,
+                        output_dict=False
+                    )
+
+                    losses['proto_loss'] = proto_loss(
+                        inputs['style_feat'], model.prototypes,
+                        logit_scale, logit_bias,
+                        accum_classes,
+                        not_fars=accum_not_fars,
+                        index=accum_index,
+                        sample_manager=sample_manager,
+                        sample_manager_update=(j==0),
+                        train=True,
+                    )
+
+                    # no need stack
+                    if j == 0:
+                        losses['content_loss'] = content_loss(
+                            content_tag_feat,
+                            tags
+                        ) / args.accum_freq
+
+                        # content style sim loss
+                        losses['content_style_cosine_loss'] = content_style_sim_loss(
+                            cls_features['content_feat'],
+                            cls_features['style_feat'],
+                        ) / args.accum_freq
+                    else:
+                        losses['content_loss'] += content_loss(
+                            content_tag_feat,
+                            tags
+                        ) / args.accum_freq
+
+                        # content style sim loss
+                        losses['content_style_cosine_loss'] += content_style_sim_loss(
+                            cls_features['content_feat'],
+                            cls_features['style_feat'],
+                        ) / args.accum_freq
+
+                    # # similarity mse loss
+                    # losses['mse_loss'] = similarity_mse_loss(
+                    #     torch.cat((inputs['style_feat1'], inputs['style_feat2']), dim=0), 
+                    #     torch.cat((accum_classes, accum_classes), dim=0).long(), 
+                    #     model.prototypes, args.rel_real
+                    # )
+
+                    del inputs
+
+                    # total_loss = sum(losses.values())
+                    losses["raw_loss"] = sum(losses.values())
+                    losses["loss"] = (
+                        losses['style_loss'] * clip_scheduler[step] + 
+                        losses['proto_loss'] * proto_scheduler[step] +
+                        losses['content_loss'] + 
+                        losses['content_style_cosine_loss']
+                        # losses['mse_loss'] * 1.0 + 
+                        # (losses['mae_loss'] * 0.5 / args.accum_freq)
+                    )
+
+                backward(losses["loss"], scaler)
+                
+                # accum_freq 때문에 mae_lossr의 기록이 왜곡되는 것 방지
+                losses_log.update(losses)
+
+        if scaler is not None:
+            if args.horovod:
+                optimizer.synchronize()
+                scaler.unscale_(optimizer)
+                if args.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                with optimizer.skip_synchronize():
+                    scaler.step(optimizer)
+            else:
+                if args.grad_clip_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                scaler.step(optimizer)
+            scaler.update()
+        else:
+            if args.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+            optimizer.step()
+
+        # reset gradient accum, if enabled
+        if args.accum_freq > 1:
+            accum_images, accum_classes  = [], []
+            accum_index = []
+            accum_not_fars = []
+            accum_tags = []
+            accum_features = {}
+
+        # Note: we clamp to 4.6052 = ln(100), as in the original paper.
+        with torch.no_grad():
+            unwrap_model(model).logit_scale.clamp_(0, math.log(100))
+
+        batch_time_m.update(time.time() - end)
+        end = time.time()
+        batch_count = i_accum + 1
+
+        if is_master(args) and (i_accum % args.log_every_n_steps == 0 or batch_count == num_batches_per_epoch):
+            batch_size = len(images)
+            num_samples = batch_count * batch_size * args.accum_freq * args.world_size
+            samples_per_epoch = dataloader.num_samples
+            percent_complete = 100.0 * batch_count / num_batches_per_epoch
+
+            # NOTE loss is coarsely sampled, just master node and per log update
+            for key, val in losses_log.items():
+                if key not in losses_m:
+                    losses_m[key] = AverageMeter()
+                losses_m[key].update(val.item(), batch_size)
+
+            logit_scale_scalar = logit_scale.item()
+            loss_log = " ".join(
+                [
+                    f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
+                    for loss_name, loss_m in losses_m.items()
+                ]
+            )
+            samples_per_second = args.accum_freq * args.batch_size * args.world_size / batch_time_m.val
+            samples_per_second_per_gpu = args.accum_freq * args.batch_size / batch_time_m.val
+            logging.info(
+                f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
+                f"Data (t): {data_time_m.avg:.3f} "
+                f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
+                f"LR: {optimizer.param_groups[0]['lr']:5f} "
+                f"Logit Scale: {logit_scale_scalar:.3f} " + loss_log
+            )
+
+            # Save train loss / etc. Using non avg meter values as loggers have their own smoothing
+            log_data = {
+                "data_time": data_time_m.val,
+                "batch_time": batch_time_m.val,
+                "samples_per_second": samples_per_second,
+                "samples_per_second_per_gpu": samples_per_second_per_gpu,
+                "scale": logit_scale_scalar,
+                "bias": logit_bias.item(),
+                "lr": optimizer.param_groups[0]["lr"],
+            }            
+            log_data.update({name:val.val for name, val in losses_m.items()})
+            log_data.update({f"{name}_avg":val.avg for name, val in losses_m.items()})
+
+            log_data = {"train/" + name: val for name, val in log_data.items()}
+
+            if tb_writer is not None:
+                for name, val in log_data.items():
+                    tb_writer.add_scalar(name, val, step)
+            
+            if args.wandb:
+                assert wandb is not None, 'Please install wandb.'
+                log_data['step'] = step  # for backwards compatibility
+                args.step = step
+                wandb.log(log_data, step=step)
+            
+            # resetting batch / data time meters per log window
+            batch_time_m.reset()
+            data_time_m.reset()
+    # end for
+
+
+def evaluate(model, device, dataloader, clip_loss, proto_loss, content_loss, epoch, tb_writer, step, args):
+    metrics = {}
+    autocast = get_autocast(args.precision, device_type=device.type)
+    input_dtype = get_input_dtype(args.precision)
+    model.eval()
+
+    if args.val_frequency and ((epoch % args.val_frequency) == 0 or epoch == args.epochs):
+        num_samples = 0
+        samples_per_val = dataloader.num_samples
+
+        # cumulative_loss = {}
+        losses_m = {}
+        all_image_features, all_classes, all_tag_features, all_tags = [], [], [], []
+        with torch.inference_mode():
+            for i, batch in enumerate(dataloader):
+                images, classes, tags= batch['image'], batch['label'], batch['tag']
+                images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+                classes = classes.to(device=device, dtype=torch.long, non_blocking=True)
+                tags = tags.to(device=device, dtype=torch.float32, non_blocking=True)
+
+                batch_size = images.size(0)
+
+                with autocast():
+                    model_out = model.evaluate(
+                        images,
+                    )
+                    cls_features = {
+                        'style_feat': model_out['style_feat'],
+                        'content_feat': model_out['content_feat'],
+                        'content_tag_feat': model_out['content_tag_feat'],
+                    }
+                    logit_scale = model_out["logit_scale"]
+                    logit_bias = model_out.get('logit_bias', None)
+                    
+                    all_image_features.append(cls_features['style_feat'].cpu())
+                    all_classes.append(classes.cpu())
+                    all_tag_features.append(cls_features['content_tag_feat'].cpu())
+                    all_tags.append(tags.cpu())
+
+                    losses = {}
+                    losses['style_loss'] = clip_loss(
+                        cls_features['style_feat'], 
+                        logit_scale, logit_bias, 
+                        classes=classes, same_class_weight=args.same_class_weight,
+                        output_dict=False
+                    )
+                    losses['proto_loss'] = proto_loss(
+                        cls_features['style_feat'], model.prototypes,
+                        logit_scale, logit_bias,
+                        classes, 
+                    )
+
+                    losses['content_loss'] = content_loss(cls_features['content_tag_feat'], tags)
+
+                    # contetn style sim loss
+                    losses['content_style_cosine_loss'] = content_style_sim_loss(
+                        cls_features['content_feat'], 
+                        cls_features['style_feat'],
+                    )
+
+                    # # similarity mse loss
+                    # losses['mse_loss'] = similarity_mse_loss(
+                    #     torch.cat((cls_features['style_feat1'], cls_features['style_feat2']), dim=0), 
+                    #     torch.cat((classes, classes), dim=0).long(), 
+                    #     model.prototypes, args.rel_real
+                    # )
+
+                    losses["loss"] = sum(losses.values())
+
+                for key, val in losses.items():
+                    if key not in losses_m:
+                        losses_m[key] = AverageMeter()
+                    losses_m[key].update(val.item(), batch_size)
+
+                loss_log = " ".join(
+                    [
+                        f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
+                        for loss_name, loss_m in losses_m.items()
+                    ]
+                )
+
+                # cumulative_loss += losses * batch_size
+                num_samples += batch_size
+
+                if is_master(args) and (i % 100) == 0:
+                    logging.info(
+                        f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t" + loss_log
+                        # f"Clip Loss: {losses_m['contrastive_loss'].avg:.6f}\t"
+                        # f"Recon Loss: {losses_m['mae_loss'].avg:.6f}\t"
+                    )
+            
+            if logit_bias:
+                logit_bias = logit_bias.cpu()
+
+            val_metrics = {}
+            val_metrics.update(
+                get_class_topk(   # include mae_error
+                    image_features=torch.cat(all_image_features),
+                    prototypes=model.prototypes.cpu(),
+                    classes=torch.cat(all_classes),
+                    rel_real=args.rel_real,
+                )
+            )
+
+            val_metrics.update(
+                get_tag_metrics(torch.cat(all_tag_features), torch.cat(all_tags), threshold=0.4)
+            )
+
+            metrics.update({
+                **val_metrics, 
+                "style_loss": losses_m['style_loss'].avg, 
+                "proto_loss": losses_m['proto_loss'].avg, 
+                "content_loss": losses_m['content_loss'].avg, 
+                # "mse_loss": losses_m['mse_loss'].avg,
+                # "mae_loss": losses_m['mae_loss'].avg, 
+                "content_style_cosine_loss": losses_m['content_style_cosine_loss'].avg, 
+                "epoch": epoch, "num_samples": num_samples
+            })
+
+    logging.info(
+        f"Eval Epoch: {epoch} "
+        + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
+    )
+
+    log_data = {"val/" + name: val for name, val in metrics.items()}
+
+    if tb_writer is not None:
+        for name, val in log_data.items():
+            tb_writer.add_scalar(name, val, epoch)
+
+        with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
+            f.write(json.dumps(metrics))
+            f.write("\n")
+
+    if args.wandb:
+        assert wandb is not None, 'Please install wandb.'
+        log_data['epoch'] = epoch
+        wandb.log(log_data, step=step)
+
+    return metrics
+       
+
+def main(args):
+    if torch.cuda.is_available():
+        # This enables tf32 on Ampere GPUs which is only 8% slower than
+        # float16 and almost as accurate as float32
+        # This was a default in pytorch until 1.12
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
+    device = init_distributed_device(args)
+
+    t_now = datetime.now().strftime('%y-%m-%d_%H-%M-%S')
+    args.logs = "./pretrain_log"
+    args.output_path = os.path.join(args.logs, f"{t_now}_{args.model_name[:50]}")
+    args.log_name = os.path.basename(args.output_path)
+    args.checkpoint_path = os.path.join(args.output_path, "checkpoint")
+    os.makedirs(args.checkpoint_path, exist_ok=True)
+    args.config_path = os.path.join(args.output_path, os.path.basename(args.config))
+    if args.config: shutil.copy(args.config, args.config_path)
+
+    if is_master(args, local=args.log_local):
+        log_filename = f'out-{args.rank}' if args.log_local else 'out.log'
+        args.log_path = os.path.join(args.output_path, log_filename)
+        if os.path.exists(args.log_path):
+            print(
+                "Error. Experiment already exists. Use --name {} to specify a new experiment."
+            )
+            return -1
+
+    args.log_level = logging.DEBUG if args.debug else logging.INFO
+    setup_logging(args.log_path, args.log_level)
+    
+    args.wandb = 'wandb' in args.report_to or 'all' in args.report_to
+    args.tensorboard = 'tensorboard' in args.report_to or 'all' in args.report_to
+    writer = None
+    if is_master(args):
+        args.tensorboard_path = os.path.join(args.output_path, "tensorboard") if args.tensorboard else ''
+        for dirname in [args.tensorboard_path, args.checkpoint_path]:
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+    else:
+        args.tensorboard_path = ''
+
+    random_seed(args.seed)
+    # autodtype = get_cast_dtype(args.precision)
+
+    scaler = None
+    if args.precision == "amp":
+        try:
+            scaler = torch.amp.GradScaler(device=device)
+        except (AttributeError, TypeError) as e:
+            scaler = torch.cuda.amp.GradScaler()
+
+    print("## Load Dataset")
+    train_loader, valid_loader = make_pretrain_tag_dataset(args)
+
+    print("## Model Create\n")
+    model = CustomVisual2(
+        model_name=args.model_name, 
+        model_kargs=args.model_kargs,
+        content_head={"num_classes": args.tag_num_classes},
+        init_logit_scale=math.log(10), 
+        init_logit_bias=-8, 
+        output_dict=True,
+        num_classes=args.num_classes,
+    ).to(device=device)
+    load_pretrain(model, args.pretrain)
+
+    # 대표벡터 불러오기
+    if args.prototype_path is not None:
+        prototypes = torch.load(args.prototype_path)
+        if prototypes.shape == model.prototypes.shape:
+            model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+            logging.info(f"Loaded prototypes from {args.prototype_path} with shape {prototypes.shape}")
+        else:
+            logging.warning(f"Loaded prototypes shape {prototypes.shape} does not match model prototypes shape {model.prototypes.shape}. Skipping prototype loading.")
+
+    if is_master(args):
+        logging.info("Model:")
+        logging.info(f"{str(model)}")
+        logging.info("Params:")
+        for name in sorted(vars(args)):
+            val = getattr(args, name)
+            logging.info(f"  {name}: {val}")
+
+    params_group = make_mae_param_groups(model, args.lr_decay, args.patch_embed_lr_mult)
+    if args.opt_name == "adamw8bit":
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16 학습을 위함
+
+    elif args.opt_name == "adamw":
+        from torch.optim import AdamW
+        optimizer = AdamW(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16으로 학습하지 말것! 모델이 nan을 출력함.
+
+    clip_loss = RelationSigLipLoss2(
+        rel_matrix=args.rel_real,
+        rel_real=args.rel_real,
+        rank=args.rank,
+        world_size=args.world_size,
+        dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
+        device=device,
+    )
+
+    # cosine_loss = CosineSimilarityLoss(dim=-1)
+
+    # proto_loss = PrototypeContrastiveLoss(
+    #     num_classes=args.num_classes,
+    #     feat_dim=768,
+    #     momentum=0.95,
+    #     rank=args.rank,
+    #     world_size=args.world_size,
+    #     dist_impl=args.loss_dist_impl,
+    #     device=device,
+    # )
+
+    proto_loss = RelationPrototypeContrastiveLoss(
+        num_classes=args.num_classes,
+        feat_dim=768,
+        momentum=0.99,
+        rel_matrix=args.rel_real, 
+        rel_real=args.rel_real,
+        topk_rate=args.topk_rate,
+        rank=args.rank,
+        world_size=args.world_size,
+        dist_impl=args.loss_dist_impl,
+        device=device,
+    )
+
+    content_loss = BCELoss(class_weights=args.tag_class_weights, pos_weights=args.tag_pos_weights, device=device)
+
+    sample_manager = SampleManager(len(train_loader.dataset), 0.7)
+
+    if is_master(args):
+            defaults = copy.deepcopy(optimizer.defaults)
+            defaults['weight_decay'] = args.wd
+            defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
+            logging.info(
+                f'Created {type(optimizer).__name__} ({args.opt_name}) optimizer: {defaults}'
+            )
+            
+    start_epoch = 0
+    if args.resume is not None:
+        logging.info(f"Resume training")
+        logging.info(f"Resume checkpoint: {args.resume}")
+        logging.info(f"wandb run_id: {args.run_id}")
+
+        checkpoint = pt_load(args.resume, map_location='cpu')
+        if 'epoch' in checkpoint:
+            # resuming a train checkpoint w/ epoch and optimizer state
+            start_epoch = checkpoint["epoch"]
+            load_random_state(checkpoint)
+            model.load_state_dict(checkpoint["state_dict"])
+            if optimizer is not None:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            if scaler is not None and 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+        else:
+            # loading a bare (model only) checkpoint for fine-tune or evaluation
+            model.load_state_dict(checkpoint)
+        
+        if 'proto_mean' in checkpoint:
+            proto_loss.statics.mean = checkpoint["proto_mean"].to(device=device)
+
+        if 'sample_manager' in checkpoint:
+            sample_manager.loss = checkpoint['sample_manager']['loss']
+            sample_manager.count = checkpoint['sample_manager']['count']
+            sample_manager.seen = checkpoint['sample_manager']['seen']
+            sample_manager.total_count = checkpoint['sample_manager']['total_count']
+        
+
+        logging.info(f"Resume checkpoint is loaded successfully")
+        logging.info(f"Training begins at epoch {start_epoch}.")
+
+
+    if args.tensorboard:
+        assert tensorboard is not None, "Please install tensorboard."
+        writer = tensorboard.SummaryWriter(args.tensorboard_path)
+
+    if args.wandb and is_master(args):
+        assert wandb is not None, 'Please install wandb.'
+        logging.debug('Starting wandb.')
+
+        wandb.init(
+            dir="logs",
+            project=args.wandb_project_name,
+            name=None,
+            id=args.run_id,
+            notes=None,
+            tags=[],
+            resume='must' if args.resume or args.run_id else None,
+            config=vars(args),
+        )
+        if args.debug:
+            wandb.watch(model, log='all')
+
+        wandb.save(args.config_path)
+        logging.info(f'Finished loading wandb. run_id: {wandb.run.id}')
+
+    
+    total_steps = (train_loader.num_batches // args.accum_freq) * args.epochs
+
+    warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
+    scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
+    clip_scheduler = CosineScheduler(*args.style_weight, total_steps // 2, 0)    # clip_loss weight scheduler
+    proto_scheduler = CosineScheduler(*args.proto_weight, total_steps // 2, 0)    # clip_loss weight scheduler
+    proto_momentum_scheduler = CosineScheduler(*args.proto_momentum, total_steps, 0)    # relation momentum
+    rel_momentum_scheduler = CosineScheduler(*args.relation_momentum, total_steps, 0)    # relation momentum
+    batch_sampler_scheduler = StepGenerator(total_steps, args.BS_update_freq, args.BS_update_shape, args.BS_update_start)
+    logging.info(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
+    logging.info(f"## batch_sampler_scheduler \nstep_list: {batch_sampler_scheduler.step_list[:10]} ... {batch_sampler_scheduler.step_list[-10:]}\n")
+
+    # args.step = 0
+    for epoch in range(start_epoch, args.epochs):
+        if args.loss_weight_start_epoch <= epoch:
+            if not clip_loss.loss_weight_on:
+                logging.info("The False Negative loss reduction feature for clip_loss and proto_loss has been enabled.")
+            clip_loss.loss_weight_on = True
+            proto_loss.loss_weight_on = True
+        
+        if args.proto_ema_threshold_start_epoch <= epoch:
+            if not proto_loss.ema_threshold_on:
+                logging.info("The proto_loss_ema_threshold feature is turned on.")
+            proto_loss.ema_threshold_on = True
+
+        train_one_epoch(
+            model, device, train_loader, clip_loss, proto_loss, content_loss,
+            epoch, optimizer, scaler, scheduler, clip_scheduler, 
+            proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, batch_sampler_scheduler,
+            writer, sample_manager, args
+        )
+
+        completed_epoch = epoch + 1
+        # args.step += 1
+        metrics = evaluate(model, device, valid_loader, clip_loss, proto_loss, content_loss, completed_epoch, writer, args.step, args)
+
+        checkpoint_dict = {
+            "epoch": completed_epoch,
+            "name": args.model_name,
+            "state_dict": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "proto_mean": proto_loss.statics.mean,
+            "sample_manager": {"loss": sample_manager.loss, "count": sample_manager.count, "seen": sample_manager.seen, "total_count": sample_manager.total_count},
+            'torch_rng_state': torch.random.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            'numpy_rng_state': np.random.get_state(),
+            'random_state': random.getstate()
+        }
+        if scaler is not None:
+            checkpoint_dict["scaler"] = scaler.state_dict()
+
+        if completed_epoch == args.epochs or (
+            args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+        ):
+            model_save_path = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt")
+            
+            torch.save(
+                checkpoint_dict,
+                model_save_path,
+            )
+
+            saved_models = [os.path.join(args.checkpoint_path, file) for file in os.listdir(args.checkpoint_path) if file.endswith(".pt")]
+            saved_models.sort(key=lambda x: int(re.search(r"epoch_(\d+).pt", os.path.basename(x)).group(1)))
+            if len(saved_models) > args.max_save_count:
+                remove_paths = saved_models[:-args.max_save_count]
+                for remove_path in remove_paths:
+                    if os.path.exists(remove_path):
+                        os.remove(remove_path)
+            
+    
+    if args.wandb and is_master(args):
+        wandb.finish()
+
+        logging.info('Finished.')
+
+
+
+if __name__ == "__main__":
+    parser = setup_parser()
+    args = parser.parse_args()
+    args = read_config(args, parser)
+    main(args)

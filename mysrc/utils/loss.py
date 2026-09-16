@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from torch.nn import functional as F
+from mysrc.utils import function
 
 try:
     import torch.distributed.nn
@@ -352,15 +353,6 @@ class SigLipLoss(nn.Module):
         return {"contrastive_loss": loss} if output_dict else loss
     
 class RelationSigLipLoss(nn.Module):
-    """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
-
-    @article{zhai2023sigmoid,
-      title={Sigmoid loss for language image pre-training},
-      author={Zhai, Xiaohua and Mustafa, Basil and Kolesnikov, Alexander and Beyer, Lucas},
-      journal={arXiv preprint arXiv:2303.15343},
-      year={2023}
-    }
-    """
     def __init__(
             self, rel_matrix, rel_real=None, loss_weight_on=False,
             cache_labels: bool = False,
@@ -398,8 +390,7 @@ class RelationSigLipLoss(nn.Module):
 
         return labels
 
-    def get_logits(self, image_features1, image_features2, logit_scale, logit_bias=None, classes=None):
-        output = {}
+    def get_logits(self, image_features1, image_features2, classes=None):
         logits = image_features1 @ image_features2.T
 
         # if classes is not None and self.loss_weight_on:
@@ -410,21 +401,45 @@ class RelationSigLipLoss(nn.Module):
 
         #     output["loss_weights"] = loss_weights
 
-        logits = logit_scale * logits
-        if logit_bias is not None:
-            logits += logit_bias
+        return logits
+    
+    def not_fars_masking(self, labels, logits, classes, not_fars, low, high):
+        weight_mask = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
 
-        output["logits"] = logits
-        return output
+        if not_fars is not None and not_fars.any():
+            same_class = classes[:, None] == classes[None, :]
+
+            pair_not_far = not_fars[:, None] | not_fars[None, :]    # 본인 클래스 외 not_fars와 연관되어 있는 데이터 학습 X
+            both_not_far = not_fars[:, None] & not_fars[None, :]    # 둘다 not_fars 데이터인 경우 학습 X
+
+            # 정확히 하나만 not_far + 같은 클래스
+            valid = same_class & pair_not_far & ~both_not_far
+
+
+            # not_far 관련 학습 제외 조건
+            invalid = (
+                both_not_far
+                | (pair_not_far & ~same_class)
+                | (valid & (logits >= low) & (logits <= high))
+            )
+
+            weight_mask[invalid] = 0
+
+            # label 변경
+            labels[valid & (logits < low)] = low
+            labels[valid & (logits > high)] = high
+
+        return labels, weight_mask
 
     def _loss(
             self, image_features1, image_features2, 
             logit_scale, logit_bias=None, 
             classes=None, same_class_weight=1.0, 
             times=None, time_range=10, time_weight=0.3, 
+            not_fars=None,
             negative_only=False
         ):
-        logits = self.get_logits(image_features1, image_features2, logit_scale, logit_bias, classes)
+        logits = self.get_logits(image_features1, image_features2, classes)
         labels = self.get_ground_truth(
             image_features1.device,
             image_features1.dtype,
@@ -434,18 +449,31 @@ class RelationSigLipLoss(nn.Module):
             times=times, time_range=time_range, time_weight=time_weight,
             negative_only=negative_only,
         )
+
+        # if not_fars is not None and not_fars.sum() > 1:
+        #     breakpoint()
+
+        labels, not_fars_weight_mask = self.not_fars_masking(labels, logits, classes, not_fars, 0.5, 0.7)
+
+        logits = logit_scale * logits
+        if logit_bias is not None:
+            logits += logit_bias
+
         # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
         if classes is not None:
-            loss  = F.binary_cross_entropy_with_logits(logits["logits"], labels, reduction='none')
+            loss  = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
 
             # if self.loss_weight_on:
             #     loss = loss * logits["loss_weights"]
 
             # 자기자신과의 semantic한 의미 학습 방지하기
-            mask = ~torch.eye(loss.size(0), dtype=torch.bool, device=loss.device)
-            loss = loss[mask].mean()
+            mask = 1 - torch.eye(loss.size(0), dtype=logits.dtype, device=loss.device)
+            mask = mask * not_fars_weight_mask
+
+            loss = (loss * mask).sum() / mask.sum()
+            # loss = loss[mask].mean()
         else:
-            loss = F.binary_cross_entropy_with_logits(logits["logits"], labels, reduction='mean')
+            loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
 
         return loss
 
@@ -454,13 +482,15 @@ class RelationSigLipLoss(nn.Module):
             logit_scale, logit_bias, 
             classes=None, same_class_weight=1.0, 
             times=None, time_range=10, time_weight=0.3,
+            not_fars=None,
             output_dict=False
         ):
         loss = self._loss(
             image_features1, image_features2, 
             logit_scale, logit_bias, 
             classes, same_class_weight, 
-            times, time_range, time_weight
+            times, time_range, time_weight,
+            not_fars,
         )
 
         if self.world_size > 1:
@@ -544,14 +574,233 @@ class RelationSigLipLoss(nn.Module):
                 assert False
 
         return {"contrastive_loss": loss} if output_dict else loss
+    
+class RelationSigLipLoss2(nn.Module):
+    def __init__(
+            self, rel_matrix, rel_real=None, loss_weight_on=False,
+            cache_labels: bool = False,
+            rank: int = 0,
+            world_size: int = 1,
+            dist_impl: Optional[str] = None,
+            device=None,
+    ):
+        super().__init__()
+        self.cache_labels = cache_labels
+        self.rank = rank
+        self.world_size = world_size
+        self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
+        assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
 
+        # cache state FIXME cache not currently used, worthwhile?
+        self.prev_num_logits = 0
+        self.labels = {}
+        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32)
+        self.rel_real = rel_real.to(device=device, dtype=torch.float32) if rel_real is not None else None
+        self.gt_mask = self.rel_real != 0 if rel_real is not None else None
+        self.loss_weight_on = loss_weight_on
+
+    def get_ground_truth(
+        self, device, dtype, num_logits, classes, same_class_weight=1.0, 
+        negative_only=False
+    ) -> torch.Tensor:
+        if classes is not None:
+            labels = self.rel_matrix[classes][:, classes]
+        else:
+            labels = torch.eye(num_logits, dtype=dtype, device=device)
+        
+        labels = labels.to(device=device, dtype=dtype)
+
+        return labels
+
+    def get_logits(self, image_features, classes=None):
+        logits = image_features @ image_features.T
+
+        # if classes is not None and self.loss_weight_on:
+        #     loss_weights = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
+        #     neg_mask = ~self.gt_mask[classes][:, classes]
+        #     loss_weights[neg_mask & (logits > 0.5)] = 0.5
+        #     loss_weights[neg_mask & (logits > 0.7)] = 0.1
+
+        #     output["loss_weights"] = loss_weights
+
+        return logits
+    
+    def not_fars_masking(self, labels, logits, classes, not_fars, low, high):
+        weight_mask = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
+
+        if not_fars is not None and not_fars.any():
+            same_class = classes[:, None] == classes[None, :]
+
+            pair_not_far = not_fars[:, None] | not_fars[None, :]    # 본인 클래스 외 not_fars와 연관되어 있는 데이터 학습 X
+            both_not_far = not_fars[:, None] & not_fars[None, :]    # 둘다 not_fars 데이터인 경우 학습 X
+
+            # 정확히 하나만 not_far + 같은 클래스
+            valid = same_class & pair_not_far & ~both_not_far
+
+
+            # not_far 관련 학습 제외 조건
+            invalid = (
+                both_not_far
+                | (pair_not_far & ~same_class)
+                | (valid & (logits >= low) & (logits <= high))
+            )
+
+            weight_mask[invalid] = 0
+
+            # label 변경
+            labels[valid & (logits < low)] = low
+            labels[valid & (logits > high)] = high
+
+        return labels, weight_mask
+
+    def _loss(
+            self, image_features, 
+            logit_scale, logit_bias=None, 
+            classes=None, same_class_weight=1.0, 
+            not_fars=None,
+            negative_only=False
+        ):
+        logits = self.get_logits(image_features, classes)
+        labels = self.get_ground_truth(
+            image_features.device,
+            image_features.dtype,
+            image_features.shape[0],
+            classes,
+            same_class_weight,
+            negative_only=negative_only,
+        )
+
+        # if not_fars is not None and not_fars.sum() > 1:
+        #     breakpoint()
+
+        labels, not_fars_weight_mask = self.not_fars_masking(labels, logits, classes, not_fars, 0.5, 0.7)
+
+        logits = logit_scale * logits
+        if logit_bias is not None:
+            logits += logit_bias
+
+        # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
+        if classes is not None:
+            loss  = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+
+            # if self.loss_weight_on:
+            #     loss = loss * logits["loss_weights"]
+
+            # 자기자신과의 semantic한 의미 학습 방지하기
+            mask = 1 - torch.eye(loss.size(0), dtype=logits.dtype, device=loss.device)
+            mask = mask * not_fars_weight_mask
+
+            loss = (loss * mask).sum() / mask.sum()
+            # loss = loss[mask].mean()
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
+
+        return loss
+
+    def forward(
+            self, image_features, 
+            logit_scale, logit_bias, 
+            classes=None, same_class_weight=1.0, 
+            times=None, time_range=10, time_weight=0.3,
+            not_fars=None,
+            output_dict=False
+        ):
+        loss = self._loss(
+            image_features, 
+            logit_scale, logit_bias, 
+            classes, same_class_weight, 
+            not_fars,
+        )
+
+        if self.world_size > 1:
+            if self.dist_impl == 'bidir':
+                right_rank = (self.rank + 1) % self.world_size
+                left_rank = (self.rank - 1 + self.world_size) % self.world_size
+                image_features2_to_right = image_features2_to_left = image_features2
+                num_bidir, remainder = divmod(self.world_size - 1, 2)
+                for i in range(num_bidir):
+                    image_features2_recv = neighbour_exchange_bidir_with_grad(
+                        left_rank,
+                        right_rank,
+                        image_features2_to_left,
+                        image_features2_to_right,
+                    )
+                    for f in image_features2_recv:
+                        loss += self._loss(
+                            image_features1,
+                            f,
+                            logit_scale,
+                            logit_bias,
+                            negative_only=True,
+                        )
+                    image_features2_to_left, image_features2_to_right = image_features2_recv
+
+                if remainder:
+                    image_features2_recv = neighbour_exchange_with_grad(
+                        left_rank,
+                        right_rank,
+                        image_features2_to_right
+                    )
+                    loss += self._loss(
+                        image_features1,
+                        image_features2_recv,
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+            elif self.dist_impl == "shift":
+                right_rank = (self.rank + 1) % self.world_size
+                left_rank = (self.rank - 1 + self.world_size) % self.world_size
+                image_features2_to_right = image_features2
+                for i in range(self.world_size - 1):
+                    image_features2_from_left = neighbour_exchange_with_grad(
+                        left_rank,
+                        right_rank,
+                        image_features2_to_right,
+                    )
+                    loss += self._loss(
+                        image_features1,
+                        image_features2_from_left,
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+                    image_features2_to_right = image_features2_from_left
+            elif self.dist_impl == "reduce":
+                for i in range(self.world_size):
+                    image2_from_other = torch.distributed.nn.all_reduce(
+                        image_features2 * (self.rank == i),
+                        torch.distributed.ReduceOp.SUM,
+                    )
+                    loss += float(i != self.rank) * self._loss(
+                        image_features1,
+                        image2_from_other,
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+            elif self.dist_impl == "gather":
+                all_images2 = torch.distributed.nn.all_gather(image_features2)
+                for i in range(self.world_size):
+                    loss += float(i != self.rank) * self._loss(
+                        image_features1,
+                        all_images2[i],
+                        logit_scale,
+                        logit_bias,
+                        negative_only=True,
+                    )
+            else:
+                assert False
+
+        return {"contrastive_loss": loss} if output_dict else loss
+    
 class RelationPrototypeContrastiveLoss(nn.Module):
     def __init__(
             self, num_classes, feat_dim, momentum, rel_matrix, rel_real=None, topk_rate=0.1,
             loss_weight_on=False, ema_threshold_on=False,
             rank = 0, 
             world_size = 1, 
-            dist_impl = None,
+            dist_impl=None,
             device=None, 
         ):
         super().__init__()
@@ -572,12 +821,12 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         self.ema_threshold_on = ema_threshold_on
         self.statics = SimilarityStatisticsEMA(0.99, num_classes, device)
 
-
     @torch.no_grad()
-    def update_prototypes(self, features, prototypes, classes):
-        proto_sims = (features * prototypes[classes]).sum(dim=-1)
+    def update_prototypes(self, features, prototypes, classes, logits):
+        # proto_sims = (features * prototypes[classes]).sum(dim=-1)
+        proto_sims = logits.gather(1, classes.unsqueeze(1)).squeeze(1)
         sim_means = self.statics.mean[classes]
-        threshold = sim_means * 0.85 if self.ema_threshold_on else -1
+        threshold = sim_means * 1.0 if self.ema_threshold_on else -1
         selected = proto_sims >= threshold
 
         if not selected.any():
@@ -603,7 +852,7 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         prototypes[mask] = (
             self.momentum * prototypes[mask] + (1 - self.momentum) * new_protos
         )
-        prototypes[mask] = torch.nn.functional.normalize(prototypes[mask], dim=-1)
+        prototypes[mask] = F.normalize(prototypes[mask], dim=-1)
 
 
     def get_ground_truth(
@@ -622,39 +871,37 @@ class RelationPrototypeContrastiveLoss(nn.Module):
 
         return labels
 
-    def get_logits(self, image_features, prototypes, logit_scale, classes=None, logit_bias=None):
-        output = {}
-        # protos = F.normalize(prototypes, dim=1)
-        logits = image_features @ prototypes.T
-
+    def get_label_adjust(self, logits, prototypes, classes,):
         self_indices = (torch.arange(logits.size(0), device=logits.device), classes)
         sims_self = logits[self_indices]
+        label_adjust = None
 
-        if self.loss_weight_on:
-            with torch.no_grad():
-                proto_sims = prototypes[classes] @ prototypes.T
-                rel_mask = self.gt_mask[classes]
+        # if self.loss_weight_on:
+        #     with torch.no_grad():
+        #         proto_sims = prototypes[classes] @ prototypes.T
+        #         rel_mask = self.gt_mask[classes]
 
-                sub_style_weight = torch.clamp(1 + (sims_self - self.statics.mean[classes]), min=0.8, max=1.0)[:, None] # 선택된 샘플이 본인 클래스의 평균 유사도보다 조금 작은 경우 보정
+        #         sub_style_weight = torch.clamp(1 + (sims_self - self.statics.mean[classes]), min=0.8, max=1.0)[:, None] # 선택된 샘플이 본인 클래스의 평균 유사도보다 조금 작은 경우 보정
 
-                label_adjust = (logits - (proto_sims * sub_style_weight))
-                label_adjust = torch.clamp(label_adjust, min=-0.1, max=0.1)
-                label_adjust = torch.where(rel_mask, label_adjust, torch.zeros_like(label_adjust))
-                label_adjust[self_indices] = 0
-
-                output["label_adjust"] = label_adjust
+        #         label_adjust = (logits - (proto_sims * sub_style_weight))
+        #         label_adjust = torch.clamp(label_adjust, min=-0.1, max=0.1)
+        #         label_adjust = torch.where(rel_mask, label_adjust, torch.zeros_like(label_adjust))
+        #         label_adjust[self_indices] = 0
 
         self.statics.update(sims_self, classes)
 
+        return label_adjust
+
+    def get_topk_mask(self, logits, prototypes, classes=None):
+        # protos = F.normalize(prototypes, dim=1)
+        # logits = image_features @ prototypes.T
+
         k = int(prototypes.size(0) * self.topk_rate)    # 상위 topk_rate sim
         topk_values, topk_indices = torch.topk(logits, k=k, dim=-1)
-        
+
         mask = torch.zeros_like(logits, dtype=torch.bool)
         mask.scatter_(1, topk_indices, True)
-
-        mask = mask | self.gt_mask[classes]
-        output["mask"] = mask
-
+        
         # if self.loss_weight_on:
         #     diff = torch.clamp(1 + self.statics.mean[classes] - sims_self, min=1.0).to(dtype=sims_self.dtype)
         #     loss_weights = torch.ones_like(logits)
@@ -684,36 +931,172 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         #     loss_weights[top_wk_mask & neg_mask & (logits > 0.7)] = 0.1
         #     output["loss_weights"] = loss_weights
 
-        logits = logit_scale * logits
-        if logit_bias is not None:
-            logits += logit_bias
-
-        output["logits"] = logits
-        return output
+        return mask
     
+    def get_weight_mask(self, logits, hards, centers, labels, classes):
+        if self.loss_weight_on and hards is not None:
+            # Hard, Center 샘플 가중치
+            weight_mask = torch.ones_like(logits)
+            hc_mask = torch.zeros_like(logits, dtype=torch.bool)
+
+            batch_idx = torch.arange(classes.size(0), device=classes.device)
+
+            rel_mask = self.gt_mask[classes]
+            weight_mask[rel_mask] = function.gaussian_peak(
+                logits[rel_mask], 
+                center=labels[rel_mask], 
+                sigma=0.2,
+                p=2.5,
+                plateau=0.03,
+                min_weight=0.1,
+                max_weight=1.0,
+            ).to(dtype=logits.dtype)
+
+            hard_batch_idx = batch_idx[hards]
+            if hard_batch_idx.numel() > 0:
+                hard_rel_rows, hard_rel_cols = torch.where(self.gt_mask[classes[hards]])
+                hard_rows = hard_batch_idx[hard_rel_rows]
+                weight_mask[hard_rows, hard_rel_cols] = function.gaussian_valley(
+                    logits[hard_rows, hard_rel_cols], 
+                    center=labels[hard_rows, hard_rel_cols],
+                    sigma=0.2,
+                    p=2.5,
+                    plateau=0.05,
+                    min_weight=1.0,
+                    max_weight=10.0,
+                ).to(dtype=logits.dtype)
+
+                # hc_mask[hard_rows, hard_rel_cols] = True
+                # hc_mask[hard_batch_idx, classes[hards]] = True
+
+            center_batch_idx = batch_idx[centers]
+            if center_batch_idx.numel() > 0:
+                center_rel_rows, center_rel_cols = torch.where(self.gt_mask[classes[centers]])
+                center_rows = center_batch_idx[center_rel_rows]
+                weight_mask[center_rows, center_rel_cols] = function.gaussian_valley(
+                    logits[center_rows, center_rel_cols], 
+                    center=labels[center_rows, center_rel_cols],
+                    sigma=0.1,
+                    p=2.5,
+                    plateau=0.0,
+                    min_weight=1.0,
+                    max_weight=10.0,
+                ).to(dtype=logits.dtype)
+
+                # hc_mask[center_rows, center_rel_cols] = True
+                # hc_mask[center_batch_idx, classes[centers]] = True
+
+            return weight_mask
+        else:
+            return None
+        
+    def not_far_sample(self, not_fars, logits, labels, classes):
+        not_far_mask = torch.ones_like(logits)
+
+        if not_fars is not None and not_fars.any():
+            device = logits.device
+            batch_size = logits.size(0)
+
+            batch_idx = torch.arange(batch_size, device=device)
+
+            own_logits = logits[batch_idx, classes] # 본인 클래스 로짓값
+            not_far_mask[not_fars] = 0
+
+            # 본인 클래스 weight 활성화
+            not_far_indices = torch.where(not_fars)[0]
+            not_far_mask[not_far_indices, classes[not_far_indices]] = 1
+
+            # logit < 0.5
+            low_mask = not_fars & (own_logits < 0.5)
+            labels[batch_idx[low_mask], classes[low_mask]] = 0.5
+
+
+            # logit > 0.7
+            high_mask = not_fars & (own_logits > 0.7)
+            labels[batch_idx[high_mask], classes[high_mask]] = 0.7
+
+            # 0.5 <= logit <= 0.7
+            middle_mask = (not_fars & (own_logits >= 0.5) & (own_logits <= 0.7))
+            not_far_mask[batch_idx[middle_mask], classes[middle_mask]] = 0
+
+        # if not_fars is not None and not_fars.sum() > 0:
+        #     if not_fars.sum() > 1:
+        #         breakpoint()
+        #     not_fars_rows = torch.where(not_fars)[0]
+        #     not_fars_cols = classes[not_fars]
+
+        #     self_logits = logits[not_fars_rows, not_fars_cols]
+
+        #     labels[not_fars_rows, not_fars_cols] = self_logits.clamp(0.5, 0.7).to(dtype=labels.dtype)
+
+        #     not_far_rel_rows, not_far_rel_cols = torch.where(self.gt_mask[not_fars_cols])
+        #     not_self_rel = not_far_rel_cols != not_fars_cols[not_far_rel_rows]
+        #     not_far_mask[
+        #         not_fars_rows[not_far_rel_rows[not_self_rel]],
+        #         not_far_rel_cols[not_self_rel],
+        #     ] = 0
+        #     not_far_mask = not_far_mask.to(dtype=self.gt_mask.dtype)
+
+        return not_far_mask, labels
+
+    def tracking_loss(self, index, loss, labels, classes, sample_manager, not_fars):
+        # self_logits = logits[torch.arange(0, logits.size(0)), classes]
+        self_loss = loss[torch.arange(0, loss.size(0)), classes]
+        self_labels = labels[torch.arange(0, loss.size(0)), classes]
+        eps = 1e-8
+        entropy = -(
+            self_labels * torch.log(self_labels + eps)
+            + (1 - self_labels) * torch.log(1 - self_labels + eps)
+        )
+        self_loss = (self_loss - entropy) * ~not_fars
+        sample_manager.update(index, self_loss)
+
+
     def _loss(
-            self, image_features, ema_prototypes, memory_prototypes,
-            logit_scale, logit_bias=None, 
+            self, image_features, logits, ema_prototypes, memory_prototypes,
+            logit_scale, logit_bias=None, train=False,
             classes=None, same_class_weight=1.0, 
-            ):
-        logits = self.get_logits(image_features, ema_prototypes, logit_scale, classes, logit_bias)
+            hards=None, centers=None, not_fars=None,
+            index=None, sample_manager=None, sample_manager_update=True,
+        ):
+        topk_mask = self.get_topk_mask(logits, ema_prototypes, classes)
+        # label_adjust = self.get_label_adjust(logits, ema_prototypes, classes)
         labels = self.get_ground_truth(
             image_features.device,
             image_features.dtype,
             image_features.shape[0],
             classes,
             same_class_weight,
-            label_adjust=logits.get('label_adjust')
+            # label_adjust=label_adjust
         )
+
+        not_far_mask, labels = self.not_far_sample(not_fars, logits, labels, classes)
+
+        mask = (self.gt_mask[classes] | topk_mask) * not_far_mask
+        # mask = (self.gt_mask[classes] | topk_mask)
+
+        logits = logit_scale * logits
+        if logit_bias is not None:
+            logits += logit_bias
+
+        # weight_mask = self.get_weight_mask(logits, hards, centers, labels, classes)
+
         # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
-        loss = F.binary_cross_entropy_with_logits(logits['logits'], labels, reduction='none')
+        loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+
+        if train and sample_manager_update:
+            self.tracking_loss(index, loss, labels, classes, sample_manager, not_fars)
+
+        # if self.loss_weight_on and not_fars is not None:
+        #     loss = loss * weight_mask
 
         # if self.loss_weight_on:
         #     loss = loss * logits['loss_weights']
 
         # loss = loss.mean()
 
-        loss = (loss * logits['mask']).sum() / logits['mask'].sum() # 마스킹된 부분만 평균내기
+
+        loss = (loss * mask).sum() / mask.sum() # 마스킹된 부분만 평균내기
         
         # # negative 데이터 영향력 낮추기
         # weights = torch.where(labels == 0, 0.01, 1.0)
@@ -722,11 +1105,16 @@ class RelationPrototypeContrastiveLoss(nn.Module):
 
     def forward(
             self, features, prototypes,
-            logit_scale, logit_bias, 
+            logit_scale, logit_bias,
             classes, same_class_weight=1.0, 
+            hards=None, centers=None, not_fars=None,
+            index=None, sample_manager=None, sample_manager_update=True,
             output_dict=False,
-            train=False,
+            train=False, 
         ):
+        logits = features @ prototypes.T
+        # proto_sims = (features * prototypes).sum(dim=-1)
+
         if train:
             with torch.no_grad():
                 # self_sims = (features * prototypes).sum(dim=-1)
@@ -736,12 +1124,14 @@ class RelationPrototypeContrastiveLoss(nn.Module):
                 # mask = z_score < -3
 
                 
-                self.update_prototypes(features, prototypes, classes)
+                self.update_prototypes(features, prototypes, classes, logits)
 
         loss = self._loss(
-            features, prototypes, None,
-            logit_scale, logit_bias, 
-            classes, same_class_weight, 
+            features, logits, prototypes, None,
+            logit_scale, logit_bias, train,
+            classes, same_class_weight,
+            hards, centers, not_fars,
+            index, sample_manager, sample_manager_update,
         )
 
         return {"contrastive_loss": loss} if output_dict else loss
@@ -1167,6 +1557,7 @@ def mse_loss(pred, label, mask):
     return loss
 
 def similarity_mse_loss(features, classes, prototypes, rel_real):
+
     proto_targets = prototypes[classes]
     pred = features @ proto_targets.T
 
@@ -1176,6 +1567,27 @@ def similarity_mse_loss(features, classes, prototypes, rel_real):
     mask = rel[classes][:, classes] != 0
 
     return mse_loss(pred, label, mask)
+
+def content_style_sim_loss(content_features, style_features):
+
+    cosine_sim = F.cosine_similarity(content_features, style_features, dim=-1)
+
+    return (cosine_sim**2).mean()
+    # return ((1 + cosine_sim)**2).mean()
+
+class BCELoss(nn.Module):
+    def __init__(self, class_weights=None, pos_weights=None, device='cpu'):
+        super().__init__()
+        self.class_weight = class_weights.to(device=device) if pos_weights is not None else None
+        self.pos_weights = pos_weights.to(device=device) if pos_weights is not None else None
+
+    def forward(self, features, labels):
+        loss = F.binary_cross_entropy_with_logits(features, labels, reduction='none', pos_weight=self.pos_weights)
+        if self.class_weight is not None:
+            loss = loss * self.class_weight.to(dtype=loss.dtype)
+
+        return loss.mean()
+
 
 def gather_features(
         image_features,
@@ -1345,6 +1757,3 @@ def align_loss(x, y, alpha=2):
 
 def uniform_loss(x, t=2):
     return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
-
-
-

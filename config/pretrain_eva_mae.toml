@@ -1,7 +1,8 @@
 [model]
-model_name = 'eva02_base_patch14_224.mim_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+model_name = 'eva02_base_patch14_448.mim_in22k_ft_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 precision = 'amp'  # amp, float16
 # resume = 'pretrain_log/26-07-25_22-13-28_eva02_base_patch14_224.mim_in22k/checkpoint/epoch_25.pt'
+# pretrain = 'pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/checkpoint/epoch_29.pt' # pretrain/my_eva_decoder_512.pt
 pretrain = 'pretrain/my_eva_decoder_512.pt' # pretrain/my_eva_decoder_512.pt
 save_frequency = 1
 max_save_count = 10
@@ -9,6 +10,7 @@ max_save_count = 10
 [model_kargs]
 num_classes = 0
 global_pool = ''    # avg, map, token(cls_token)
+# img_size = 448
 
 [decoder]
 decoder_name = "eva_decoder"
@@ -19,8 +21,8 @@ horovod = false
 [train]
 seed = 42
 epochs = 30 
-batch_size = 16
-accum_freq = 1
+batch_size = 6
+accum_freq = 4
 # drop_path = 0.1
 grad_clip_norm = 3.0
 time_range = 10 # n years
@@ -34,7 +36,7 @@ mae_weight = 0.5
 norm_pix_loss = false
 
 [validation]
-valid_batch_size = 32
+valid_batch_size = 16
 val_frequency = 1
 
 [optimizer]
@@ -49,7 +51,7 @@ patch_embed_lr_mult = 1.0
 
 [schaduler]
 sch_name = 'cos'  # cos, cos_restart
-min_lr = 1e-7
+min_lr = 1e-8
 warmup = 0
 cycles = 5
 cycle_multiplier = 1.0
@@ -62,35 +64,35 @@ proto_momentum = [0.9, 0.999]
 relation_momentum = [0.9, 0.99]
 BS_update_freq = 1000
 BS_update_shape = 1.0
-BS_update_start = 0.33
-loss_weight_start_epoch = 15
-proto_ema_threshold_start_epoch = 15
+BS_update_start = 0.1
+loss_weight_start_epoch = 10
+proto_ema_threshold_start_epoch = 10
 
 [relation_EMA]
 th_mean_weight = 0.8
 th_std_weight = 1.5
 alpha_center = 0.5
 alpha_sharpness = 4
-topk_rate = 0.2
+topk_rate = 0.5
 
 [data]
-train = 'datasets/pretrain01_640/csv_like/train08.parquet'
-valid = 'datasets/pretrain01_640/csv_like/valid08.parquet'
+train = 'datasets/pretrain01_640/csv_like/train09.parquet'
+valid = 'datasets/pretrain01_640/csv_like/valid09.parquet'
 relation = 'datasets/pretrain01_640/class_similarity_weight_list.yaml'
 image_key = 'image'
 workers = 8
 
 [dataset]
-image_size = [224, 224]
+image_size = [448, 448]
 patch_size = 14
-train_aug = "pretrain_global_loacl"
+train_aug = "bbox_crop_pretrain"    # "pretrain_global_loacl"
 valid_aug = "simple_center_crop"
-# prototype_path = "pretrain_log/26-07-11_15-22-15_eva02_base_patch14_224.mim_in22k_y1a9b4un/26-07-25_15-00-42_prototypes_add04_HardGauss more_similar_sample_by_class topk mse accum_04.pt" # datasets/pretrain01_640/proto_vectors/proto_484_01.pt
+prototype_path = "pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/26-08-10_18-26-19_prototypes_add04_HardGauss more_similar_sample_by_class topk mse accum_05.pt" # datasets/pretrain01_640/proto_vectors/proto_484_01.pt
 
 [sampler]
 # num_postive = [2, 3]
-hard_num = [2, 4]
-same_num = [2, 4]
+hard_num = [1, 1]
+same_num = [1, 1]
 
 [logger]
 report_to = 'wandb'    # tensorboard, wandb

@@ -1,0 +1,17 @@
+[path]
+video_dir = 'video_test2'
+
+# CD_th50_min15
+# CD_Mode1_th40_min23
+# output = 'video_output_CD_th30_min23'
+# output = 'video_output_CD_th50_min15'
+output = 'video_output_AD_th2.2_min30_ww10_cmin20'
+
+[model]
+clip_model = "vit_l_14"
+batch_size = 32
+
+[detector]
+threshold = 30
+min_scene_len = 23
+filter_mode = 'merge'   # merge, suppress

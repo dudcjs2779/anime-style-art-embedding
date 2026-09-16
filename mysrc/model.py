@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 import numpy as np
 
 import timm
-from timm.models.eva import Eva, EvaBlock, checkpoint_filter_fn
+from timm.models.eva import Eva, EvaBlock, AttentionPoolLatent, checkpoint_filter_fn
 from timm.models.vision_transformer import Block
 from timm.models._manipulate import checkpoint
 from timm.models._builder import load_pretrained, resolve_pretrained_cfg
@@ -608,15 +608,15 @@ class CustomMaeVisual(nn.Module):
         else:
             self.logit_bias = None
 
-        decoder_kargs['patch_size'] = visual_args['patch_size']
-        decoder_kargs['in_chans'] = self.visual.patch_embed.proj.in_channels
-        decoder_kargs['encoder_dim'] = visual_args['embed_dim']
-        decoder_kargs['num_patches'] = self.visual.patch_embed.num_patches
-        decoder_kargs['grid_size'] = self.visual.patch_embed.grid_size
-        decoder_kargs['num_prefix_tokens'] = self.visual.num_prefix_tokens
-        if 'dynamic_img_size' in model_kargs:
-            decoder_kargs['dynamic_img_size'] = model_kargs['dynamic_img_size']
-        self.decoder = eva_decoder(**decoder_kargs)
+        # decoder_kargs['patch_size'] = visual_args['patch_size']
+        # decoder_kargs['in_chans'] = self.visual.patch_embed.proj.in_channels
+        # decoder_kargs['encoder_dim'] = visual_args['embed_dim']
+        # decoder_kargs['num_patches'] = self.visual.patch_embed.num_patches
+        # decoder_kargs['grid_size'] = self.visual.patch_embed.grid_size
+        # decoder_kargs['num_prefix_tokens'] = self.visual.num_prefix_tokens
+        # if 'dynamic_img_size' in model_kargs:
+        #     decoder_kargs['dynamic_img_size'] = model_kargs['dynamic_img_size']
+        # self.decoder = eva_decoder(**decoder_kargs)
 
         # self.style_head = eva_head(rope=self.visual.rope, **style_head)
         # self.content_head = eva_head(rope=self.visual.rope, **content_head)
@@ -627,8 +627,25 @@ class CustomMaeVisual(nn.Module):
         # embed_head_kargs['scale_mlp'] = visual_args['scale_mlp']
         # self.embed_head = EmbeddingHead(**embed_head_kargs)
 
+        # self.style_attn_pool = AttentionPoolLatent(
+        #     visual_args['embed_dim'],
+        #     num_heads=visual_args['num_heads'],
+        #     mlp_ratio=visual_args['mlp_ratio'],
+        #     norm_layer=LayerNorm,
+        #     act_layer=nn.GELU,
+        # )
+
+        # self.content_attn_pool = AttentionPoolLatent(
+        #     visual_args['embed_dim'],
+        #     num_heads=visual_args['num_heads'],
+        #     mlp_ratio=visual_args['mlp_ratio'],
+        #     norm_layer=LayerNorm,
+        #     act_layer=nn.GELU,
+        # )
+
         self.style_head = nn.Linear(visual_args['embed_dim'], 512)
         self.content_head = nn.Linear(visual_args['embed_dim'], 512)
+
 
         # trunc_normal_(self.style_head.weight, std=.02)
         # self.style_head.weight.data.mul_(0.001)
@@ -651,9 +668,10 @@ class CustomMaeVisual(nn.Module):
     ):
         im_feats = self.encode_image(images, normalize=False) if images is not None else None
 
-        if mask is not None:
-            pred = self.decoder(im_feats)
+        # if mask is not None:
+        #     pred = self.decoder(im_feats)
 
+        # style_feat = self.style_attn_pool(im_feats).unsqueeze(1)
         style_feat = F.normalize(self.style_head(im_feats), dim=-1)
 
         if self.output_dict:
@@ -664,9 +682,9 @@ class CustomMaeVisual(nn.Module):
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
 
-            if mask is not None:
-                out_dict['pred'] = pred
-                out_dict['mask'] = mask
+            # if mask is not None:
+            #     out_dict['pred'] = pred
+            #     out_dict['mask'] = mask
             return out_dict
 
         if self.logit_bias is not None:
@@ -687,8 +705,12 @@ class CustomMaeVisual(nn.Module):
         im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
         im_eval_feats = self.encode_image(image_eval, normalize=False) if image_eval is not None else None
 
-        if mask_samples is not None:
-            im_pred = self.decoder(im_feats[mask_samples])
+        # if mask_samples is not None:
+        #     im_pred = self.decoder(im_feats[mask_samples])
+
+        # style_feat = self.style_attn_pool(im_feats).unsqueeze(1)
+        # content_feat = self.content_attn_pool(im_feats).unsqueeze(1)
+        # eval_style_feat = self.style_attn_pool(im_eval_feats).unsqueeze(1)
 
         style_feat = F.normalize(self.style_head(im_feats), dim=-1)
         content_feat = F.normalize(self.content_head(im_feats), dim=-1)
@@ -712,9 +734,9 @@ class CustomMaeVisual(nn.Module):
                 out_dict['logit_bias'] = self.logit_bias
 
 
-            if mask_samples is not None:
-                out_dict['im_pred'] = im_pred
-                out_dict['masks'] = masks[mask_samples]
+            # if mask_samples is not None:
+            #     out_dict['im_pred'] = im_pred
+            #     out_dict['masks'] = masks[mask_samples]
 
             return out_dict
 
@@ -763,8 +785,11 @@ class CustomMaeVisual(nn.Module):
         #     masked_patches @ label_patches.T
         #     _masked_patches @ _label_patches.T
 
-        if mask_samples is not None:
-            im_pred = self.decoder(im_feats[mask_samples])
+        # if mask_samples is not None:
+        #     im_pred = self.decoder(im_feats[mask_samples])
+
+        # style_feat = self.style_attn_pool(im_feats).unsqueeze(1)
+        # content_feat = self.content_attn_pool(im_feats).unsqueeze(1)
 
         style_feat = F.normalize(self.style_head(im_feats), dim=-1)
         content_feat = F.normalize(self.content_head(im_feats), dim=-1)
@@ -782,9 +807,179 @@ class CustomMaeVisual(nn.Module):
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
 
-            if mask_samples is not None:
-                out_dict['im_pred'] = im_pred
-                out_dict['masks'] = masks[mask_samples]
+            # if mask_samples is not None:
+            #     out_dict['im_pred'] = im_pred
+            #     out_dict['masks'] = masks[mask_samples]
+
+            return out_dict
+
+        if self.logit_bias is not None:
+            return im_feats, self.logit_scale.exp(), self.logit_bias
+        return im_feats, self.logit_scale.exp()
+
+
+class CustomVisual2(nn.Module):
+    def __init__(
+            self,
+            model_name: str,
+            model_kargs: dict = {},
+            content_head: dict = {},
+            init_logit_scale: float = np.log(1 / 0.07),
+            init_logit_bias: Optional[float] = None,
+            nonscalar_logit_scale: bool = False,
+            num_classes=None,
+            output_dict: bool = False,
+    ):
+        super().__init__()
+        self.output_dict = output_dict
+        self.visual, visual_args = create_eva(model_name, pretrained=True, **model_kargs)
+
+        lshape = [1] if nonscalar_logit_scale else []
+        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
+        if init_logit_bias is not None:
+            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
+        else:
+            self.logit_bias = None
+
+        # embed_head_kargs['dim'] = visual_args['embed_dim']
+        # embed_head_kargs['mlp_ratio'] = visual_args['mlp_ratio']
+        # embed_head_kargs['swiglu_mlp'] = visual_args['swiglu_mlp']
+        # embed_head_kargs['scale_mlp'] = visual_args['scale_mlp']
+        # self.embed_head = EmbeddingHead(**embed_head_kargs)
+
+        # self.style_attn_pool = AttentionPoolLatent(
+        #     visual_args['embed_dim'],
+        #     num_heads=visual_args['num_heads'],
+        #     mlp_ratio=visual_args['mlp_ratio'],
+        #     norm_layer=LayerNorm,
+        #     act_layer=nn.GELU,
+        # )
+
+        # self.content_attn_pool = AttentionPoolLatent(
+        #     visual_args['embed_dim'],
+        #     num_heads=visual_args['num_heads'],
+        #     mlp_ratio=visual_args['mlp_ratio'],
+        #     norm_layer=LayerNorm,
+        #     act_layer=nn.GELU,
+        # )
+
+        self.style_head = nn.Linear(visual_args['embed_dim'], 512)
+        self.content_proj = nn.Linear(visual_args['embed_dim'], 512)
+        self.content_head = nn.Linear(512, content_head['num_classes'])
+        # self.head_drop = nn.Dropout(0.1)
+
+
+        # trunc_normal_(self.style_head.weight, std=.02)
+        # self.style_head.weight.data.mul_(0.001)
+        # self.style_head.bias.data.mul_(0.001)
+
+        # trunc_normal_(self.content_head.weight, std=.02)
+        # self.content_head.weight.data.mul_(0.001)
+        # self.content_head.bias.data.mul_(0.001)
+        self.register_buffer('prototypes', torch.zeros(num_classes, 512))
+        
+
+    def encode_image(self, image, mask=None, normalize: bool = False):
+        features = self.visual(image, mask)
+        return F.normalize(features, dim=-1) if normalize else features
+    
+    def inference(
+            self,
+            images,
+    ):
+        im_feats = self.encode_image(images, normalize=False)[:, 0]
+
+        # if mask is not None:
+        #     pred = self.decoder(im_feats)
+
+        # style_feat = self.style_attn_pool(im_feats).unsqueeze(1)
+        style_feat = F.normalize(self.style_head(im_feats), dim=-1)
+
+        content_feat = self.content_proj(im_feats)
+        content_tag_feat = self.content_head(content_feat)
+        # content_feat = F.normalize(content_feat, dim=-1)
+
+        if self.output_dict:
+            out_dict = {
+                "style_feat": style_feat,
+                "content_tag_feat": content_tag_feat,
+                "logit_scale": self.logit_scale.exp(),
+            }
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+
+            return out_dict
+
+        if self.logit_bias is not None:
+            return style_feat, self.logit_scale.exp(), self.logit_bias
+        
+        return style_feat, self.logit_scale.exp()
+   
+    
+    def evaluate(
+            self,
+            images: torch.Tensor,
+    ):
+        im_feats = self.encode_image(images, normalize=False)[:, 0]
+
+        # style_feat = self.style_attn_pool(im_feats).unsqueeze(1)
+        # content_feat = self.content_attn_pool(im_feats).unsqueeze(1)
+        # eval_style_feat = self.style_attn_pool(im_eval_feats).unsqueeze(1)
+
+        style_feat = F.normalize(self.style_head(im_feats), dim=-1)
+
+        content_feat = self.content_proj(im_feats)
+        content_tag_feat = self.content_head(content_feat)
+        content_feat = F.normalize(content_feat, dim=-1)
+
+        # im_feats = self.embed_head(im_feats, normalize=True)
+        # im_eval_feats = self.embed_head(im_eval_feats, normalize=True)
+
+        if self.output_dict:
+            out_dict = {
+                "style_feat": style_feat,
+                "content_feat": content_feat,
+                "content_tag_feat": content_tag_feat,
+                "logit_scale": self.logit_scale.exp(),
+            }
+
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+
+            return out_dict
+
+        if self.logit_bias is not None:
+            return im_feats, self.logit_scale.exp(), self.logit_bias
+        return im_feats, self.logit_scale.exp()
+
+    def forward(
+            self,
+            images: torch.Tensor,
+    ):
+        im_feats = self.encode_image(images, normalize=False)[:, 0]
+        # im_feats = self.head_drop(im_feats)
+        
+        # style_feat = self.style_attn_pool(im_feats).unsqueeze(1)
+        # content_feat = self.content_attn_pool(im_feats).unsqueeze(1)
+
+        style_feat = F.normalize(self.style_head(im_feats), dim=-1)
+        content_feat = self.content_proj(im_feats)
+        content_tag_feat = self.content_head(content_feat)
+
+        content_feat = F.normalize(content_feat, dim=-1)
+        
+        # im_feats = self.embed_head(im_feats, normalize=True)
+
+        if self.output_dict:
+            out_dict = {
+                "style_feat": style_feat,
+                "content_feat": content_feat,
+                "content_tag_feat": content_tag_feat,
+                "logit_scale": self.logit_scale.exp(),
+            }
+
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
 
             return out_dict
 
@@ -798,6 +993,10 @@ def create_eva(name, pretrained: bool = False, **kwargs):
     kwargs['pretrained_cfg'] = pretrained_cfg
     if name == "eva02_base_patch14_224":
         model, model_args = eva02_base_patch14_224(pretrained, **kwargs)
+
+    elif name == "eva02_base_patch14_448":
+            model, model_args = eva02_base_patch14_448(pretrained, **kwargs)
+    
 
     return model, model_args
     
@@ -829,6 +1028,44 @@ def eva02_base_patch14_224(pretrained: bool = False, **kwargs) -> CustomEva:
     )
     pretrained_cfg = pretrained_cfg.to_dict()
     
+    load_pretrained(
+        model,
+        pretrained_cfg=pretrained_cfg,
+        num_classes=kwargs['num_classes'],
+        in_chans=kwargs.get('in_chans', 3),
+        filter_fn=checkpoint_filter_fn,
+        strict=False,
+        # cache_dir=cache_dir,
+    )
+    return model, model_args
+
+def eva02_base_patch14_448(pretrained: bool = False, **kwargs) -> CustomEva:
+    """EVA02 Base https://arxiv.org/abs/2303.11331"""
+    model_args = dict(
+        img_size=448,
+        patch_size=14,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        qkv_fused=False,
+        mlp_ratio=4 * 2 / 3,
+        swiglu_mlp=True,
+        scale_mlp=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(16, 16),  # 224/14
+    )
+    pretrained_cfg = kwargs.pop("pretrained_cfg")
+    model_args.update(kwargs)
+    model = CustomEva(**model_args)
+    variant = "eva02_base_patch14_448"
+
+    pretrained_cfg = resolve_pretrained_cfg(
+        variant,
+        pretrained_cfg=pretrained_cfg,
+        # pretrained_cfg_overlay=pretrained_cfg_overlay
+    )
+    pretrained_cfg = pretrained_cfg.to_dict()
+
     load_pretrained(
         model,
         pretrained_cfg=pretrained_cfg,

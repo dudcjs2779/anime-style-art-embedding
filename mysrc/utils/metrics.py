@@ -391,3 +391,41 @@ def get_style_clip_metrics(image_style, text_style, logit_scale, classes):
 
     return metrics
 
+import torch
+from sklearn.metrics import accuracy_score, f1_score
+
+
+def get_tag_metrics(logits, labels, threshold=0.5):
+
+    # logit -> probability
+    probs = torch.sigmoid(logits)
+
+    # probability -> binary prediction
+    preds = (probs >= threshold).int()
+
+    # Tensor -> numpy
+    preds = preds.cpu().numpy()
+    labels = labels.cpu().numpy()
+
+    # Multilabel Accuracy
+    # 모든 label이 동시에 맞아야 1로 판단
+    # F1
+    f1_micro = f1_score(
+        labels,
+        preds,
+        average="micro",
+        zero_division=0
+    )
+
+    f1_macro = f1_score(
+        labels,
+        preds,
+        average="macro",
+        zero_division=0
+    )
+
+    return {
+        "content_f1_micro": f1_micro,
+        "content_f1_macro": f1_macro,
+    }
+
