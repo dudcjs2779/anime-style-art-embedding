@@ -1572,8 +1572,8 @@ def content_style_sim_loss(content_features, style_features):
 
     cosine_sim = F.cosine_similarity(content_features, style_features, dim=-1)
 
-    return (cosine_sim**2).mean()
-    # return ((1 + cosine_sim)**2).mean()
+    # return (cosine_sim**2).mean()
+    return ((1 + cosine_sim)**2).mean()
 
 class BCELoss(nn.Module):
     def __init__(self, class_weights=None, pos_weights=None, device='cpu'):
