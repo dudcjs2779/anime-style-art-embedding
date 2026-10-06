@@ -155,7 +155,7 @@ def get_proto_metrics(image_features, prototypes, classes):
 
     return metrics
 
-def get_class_topk(image_features, prototypes, classes, rel_real):
+def get_class_topk(image_features, prototypes, classes, rel_real=None):
     metrics = {}
 
     ## TopK
@@ -200,13 +200,13 @@ def get_class_topk(image_features, prototypes, classes, rel_real):
     
     metrics[f"topk_mean_sim"] = topk_values.mean().item()
 
-    # args.rel_real
-    proto_matrix = (prototypes @ prototypes.t()).detach().cpu()
-    labeled = rel_real != 0
-    labeled.fill_diagonal_(False)
+    if rel_real is not None:
+        proto_matrix = (prototypes @ prototypes.t()).detach().cpu()
+        labeled = rel_real != 0
+        labeled.fill_diagonal_(False)
 
-    mae_error = np.abs(proto_matrix[labeled] - rel_real[labeled]).mean()
-    metrics[f"mae_error"] = mae_error.item()
+        mae_error = np.abs(proto_matrix[labeled] - rel_real[labeled]).mean()
+        metrics[f"mae_error"] = mae_error.item()
 
     ## silhouette_score
     metrics[f"silhouette_score_real_class"] = silhouette_score(image_features, classes, metric='cosine')
@@ -395,7 +395,7 @@ import torch
 from sklearn.metrics import accuracy_score, f1_score
 
 
-def get_tag_metrics(logits, labels, threshold=0.5):
+def get_sfg_metrics(logits, labels, threshold=0.5):
 
     # logit -> probability
     probs = torch.sigmoid(logits)
@@ -425,7 +425,7 @@ def get_tag_metrics(logits, labels, threshold=0.5):
     )
 
     return {
-        "content_f1_micro": f1_micro,
-        "content_f1_macro": f1_macro,
+        "sfg_f1_micro": f1_micro,
+        "sfg_f1_macro": f1_macro,
     }
 

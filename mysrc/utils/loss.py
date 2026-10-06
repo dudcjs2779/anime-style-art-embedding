@@ -354,7 +354,7 @@ class SigLipLoss(nn.Module):
     
 class RelationSigLipLoss(nn.Module):
     def __init__(
-            self, rel_matrix, rel_real=None, loss_weight_on=False,
+            self, rel_matrix=None, rel_real=None, loss_weight_on=False,
             cache_labels: bool = False,
             rank: int = 0,
             world_size: int = 1,
@@ -371,7 +371,7 @@ class RelationSigLipLoss(nn.Module):
         # cache state FIXME cache not currently used, worthwhile?
         self.prev_num_logits = 0
         self.labels = {}
-        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32)
+        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32) if rel_matrix is not None else None
         self.rel_real = rel_real.to(device=device, dtype=torch.float32) if rel_real is not None else None
         self.gt_mask = self.rel_real != 0 if rel_real is not None else None
         self.loss_weight_on = loss_weight_on
@@ -381,8 +381,12 @@ class RelationSigLipLoss(nn.Module):
         times=None, time_range=10, time_weight=0.3, 
         negative_only=False
     ) -> torch.Tensor:
-        if classes is not None:
+        if self.rel_matrix is not None and classes is not None:
             labels = self.rel_matrix[classes][:, classes]
+
+        elif classes is not None:
+            labels = classes[:, None] == classes[None, :]
+
         else:
             labels = torch.eye(num_logits, dtype=dtype, device=device)
         
@@ -673,7 +677,8 @@ class RelationSigLipLoss2(nn.Module):
         # if not_fars is not None and not_fars.sum() > 1:
         #     breakpoint()
 
-        labels, not_fars_weight_mask = self.not_fars_masking(labels, logits, classes, not_fars, 0.5, 0.7)
+        if classes is not None:
+            labels, not_fars_weight_mask = self.not_fars_masking(labels, logits, classes, not_fars, 0.5, 0.7)
 
         logits = logit_scale * logits
         if logit_bias is not None:
@@ -796,7 +801,7 @@ class RelationSigLipLoss2(nn.Module):
     
 class RelationPrototypeContrastiveLoss(nn.Module):
     def __init__(
-            self, num_classes, feat_dim, momentum, rel_matrix, rel_real=None, topk_rate=0.1,
+            self, num_classes, momentum, rel_matrix=None, rel_real=None, topk_rate=0.1,
             loss_weight_on=False, ema_threshold_on=False,
             rank = 0, 
             world_size = 1, 
@@ -811,12 +816,11 @@ class RelationPrototypeContrastiveLoss(nn.Module):
 
         self.num_classes = num_classes
         self.all_classes = torch.arange(num_classes, device=device, dtype=torch.float32)
-        self.feat_dim = feat_dim
         self.momentum = momentum
         self.topk_rate = topk_rate
-        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32)
-        self.rel_real = rel_real.to(device=device, dtype=torch.float32)
-        self.gt_mask = self.rel_real != 0
+        self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32) if rel_matrix is not None else None
+        self.rel_real = rel_real.to(device=device, dtype=torch.float32) if rel_real is not None else None
+        self.gt_mask = self.rel_real != 0 if rel_real is not None else torch.eye(num_classes, device=device, dtype=torch.bool)
         self.loss_weight_on = loss_weight_on
         self.ema_threshold_on = ema_threshold_on
         self.statics = SimilarityStatisticsEMA(0.99, num_classes, device)
@@ -858,9 +862,12 @@ class RelationPrototypeContrastiveLoss(nn.Module):
     def get_ground_truth(
         self, device, dtype, num_logits, classes, same_class_weight=1.0, label_adjust=None,
     ) -> torch.Tensor:
-        if classes is not None:
+        if self.rel_matrix is not None and classes is not None:
             labels = self.rel_matrix[classes]
-            # labels = (classes[:, None] == self.all_classes[None, :]).float()
+
+        elif classes is not None:
+            labels = (classes[:, None] == self.all_classes[None, :]).float()
+
         else:
             labels = torch.eye(num_logits, dtype=dtype, device=device)
 
@@ -1115,14 +1122,13 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         logits = features @ prototypes.T
         # proto_sims = (features * prototypes).sum(dim=-1)
 
-        if train:
+        if train and sample_manager_update:
             with torch.no_grad():
                 # self_sims = (features * prototypes).sum(dim=-1)
 
                 # self.statics.update(self_sims, classes)
                 # z_score = self.statics.z_score(self_sims, classes)
                 # mask = z_score < -3
-
                 
                 self.update_prototypes(features, prototypes, classes, logits)
 

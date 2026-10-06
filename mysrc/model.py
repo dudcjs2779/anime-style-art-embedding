@@ -646,7 +646,6 @@ class CustomMaeVisual(nn.Module):
         self.style_head = nn.Linear(visual_args['embed_dim'], 512)
         self.content_head = nn.Linear(visual_args['embed_dim'], 512)
 
-
         # trunc_normal_(self.style_head.weight, std=.02)
         # self.style_head.weight.data.mul_(0.001)
         # self.style_head.bias.data.mul_(0.001)
@@ -810,6 +809,180 @@ class CustomMaeVisual(nn.Module):
             # if mask_samples is not None:
             #     out_dict['im_pred'] = im_pred
             #     out_dict['masks'] = masks[mask_samples]
+
+            return out_dict
+
+        if self.logit_bias is not None:
+            return im_feats, self.logit_scale.exp(), self.logit_bias
+        return im_feats, self.logit_scale.exp()
+
+class CustomVisual3(nn.Module):
+    def __init__(
+            self,
+            model_name: str,
+            decoder_name: str,
+            model_kargs: dict = {},
+            decoder_kargs: dict = {},
+            content_head: dict = {},
+            feat_head: dict = {},
+            init_logit_scale: float = np.log(1 / 0.07),
+            init_logit_bias: Optional[float] = None,
+            nonscalar_logit_scale: bool = False,
+            num_classes=None,
+            output_dict: bool = False,
+    ):
+        super().__init__()
+        self.output_dict = output_dict
+        self.visual, visual_args = create_eva(model_name, pretrained=True, **model_kargs)
+
+        lshape = [1] if nonscalar_logit_scale else []
+        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
+        if init_logit_bias is not None:
+            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
+        else:
+            self.logit_bias = None
+
+        self.self_style_head = nn.Linear(visual_args['embed_dim'], 512)
+        self.feat_head = nn.Linear(visual_args['embed_dim'], feat_head['num_classes'])
+        self.style_head = nn.Linear(512 + feat_head['num_classes'], 512)
+        self.content_head = nn.Linear(visual_args['embed_dim'], 512)
+
+        self.register_buffer('prototypes', torch.zeros(num_classes, 512))
+        self.register_buffer('self_prototypes', torch.zeros(num_classes, 512))
+        
+
+    def encode_image(self, image, mask=None, normalize: bool = False):
+        features = self.visual(image, mask)
+        return F.normalize(features, dim=-1) if normalize else features
+    
+    def inference(
+            self,
+            images: Optional[torch.Tensor] = None,
+            mask=None,
+    ):
+        im_feats = self.encode_image(images, normalize=False) if images is not None else None
+
+        self_style_feat = F.normalize(self.self_style_head(im_feats), dim=-1)
+        sfg_feat = self.feat_head(im_feats)
+
+        style_feat = torch.cat((self_style_feat, sfg_feat), dim=-1)
+        style_feat = F.normalize(self.style_head(style_feat), dim=-1)
+
+        # if mask is not None:
+        #     pred = self.decoder(im_feats)
+
+        if self.output_dict:
+            out_dict = {
+                "style_cls": style_feat[:, 0],
+                "sfg_cls": sfg_feat[:, 0],
+                "self_style_cls": self_style_feat[:, 0],
+                "logit_scale": self.logit_scale.exp(),
+            }
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+
+            # if mask is not None:
+            #     out_dict['pred'] = pred
+            #     out_dict['mask'] = mask
+            return out_dict
+
+        if self.logit_bias is not None:
+            return style_feat, self.logit_scale.exp(), self.logit_bias
+        
+        return style_feat, self.logit_scale.exp()
+   
+    
+    def evaluate(
+            self,
+            images: torch.Tensor,
+            image_eval: torch.Tensor,
+            masks: Optional[torch.Tensor] = None,
+            mask_indices = None,
+            none_mask_indices = None,
+            mask_samples = None,
+    ):
+        im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
+
+        self_style_feat = F.normalize(self.self_style_head(im_feats), dim=-1)
+        sfg_feat = self.feat_head(im_feats)
+
+        style_feat = torch.cat((self_style_feat, sfg_feat), dim=-1)
+        style_feat = F.normalize(self.style_head(style_feat), dim=-1)
+
+
+        eval_im_feats = self.encode_image(image_eval, normalize=False) if image_eval is not None else None
+
+        eval_self_style_feat = F.normalize(self.self_style_head(eval_im_feats), dim=-1)
+        eval_sfg_feat = self.feat_head(eval_im_feats)
+
+        eval_style_feat = torch.cat((eval_self_style_feat, eval_sfg_feat), dim=-1)
+        eval_style_feat = F.normalize(self.style_head(eval_style_feat), dim=-1)
+
+        content_feat = F.normalize(self.content_head(im_feats), dim=-1)
+
+        if self.output_dict:
+            out_dict = {
+                "style_cls": style_feat[:, 0],
+                "self_style_cls": self_style_feat[:, 0],
+                "content_cls": content_feat[:, 0],
+                "eval_style_cls": eval_style_feat[:, 0],
+                "eval_self_style_cls": eval_self_style_feat[:, 0],
+                "eval_sfg_cls": eval_sfg_feat[:, 0],
+                # "im_feats_cls": im_feats[:, 0],
+                # "im_feats_patches": im_feats[:, self.visual.num_prefix_tokens:],
+                # "im_eval_feats_cls": im_eval_feats[:, 0],
+                "logit_scale": self.logit_scale.exp(),
+            }
+
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+
+
+            # if mask_samples is not None:
+            #     out_dict['im_pred'] = im_pred
+            #     out_dict['masks'] = masks[mask_samples]
+
+            return out_dict
+
+        if self.logit_bias is not None:
+            return im_feats, eval_im_feats, self.logit_scale.exp(), self.logit_bias
+        return im_feats, eval_im_feats, self.logit_scale.exp()
+
+    def forward(
+            self,
+            images: torch.Tensor,
+            masks: Optional[torch.Tensor] = None,
+            mask_indices = None,
+            none_mask_indices = None,
+            mask_samples = None,
+
+    ):
+        # if mask_samples is not None:
+        #     breakpoint()
+
+        im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
+        
+        self_style_feat = F.normalize(self.self_style_head(im_feats), dim=-1)
+        sfg_feat = self.feat_head(im_feats)
+
+        style_feat = torch.cat((self_style_feat, sfg_feat), dim=-1)
+        style_feat = F.normalize(self.style_head(style_feat), dim=-1)
+
+        content_feat = F.normalize(self.content_head(im_feats), dim=-1)
+
+        if self.output_dict:
+            out_dict = {
+                "style_cls": style_feat[:, 0],
+                "sfg_cls": sfg_feat[:, 0],
+                "self_style_cls": self_style_feat[:, 0],
+                "content_cls": content_feat[:, 0],
+                # "im_feats_cls": im_feats[:, 0],
+                # "im_feats_patches": im_feats[:, self.visual.num_prefix_tokens:],
+                "logit_scale": self.logit_scale.exp(),
+            }
+
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
 
             return out_dict
 

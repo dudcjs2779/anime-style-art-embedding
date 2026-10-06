@@ -1,7 +1,7 @@
 [model]
 model_name = 'eva02_base_patch14_448.mim_in22k_ft_in22k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 precision = 'amp'  # amp, float16
-resume = 'pretrain_log/26-09-15_21-58-45_eva02_base_patch14_448.mim_in22k_ft_in22k/checkpoint/epoch_10.pt'
+resume = 'pretrain_log/26-09-16_02-40-39_eva02_base_patch14_448.mim_in22k_ft_in22k/checkpoint/epoch_22.pt'
 # pretrain = 'pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/checkpoint/epoch_29.pt' # pretrain/my_eva_decoder_512.pt
 # pretrain = 'pretrain/my_eva_decoder_512.pt' # pretrain/my_eva_decoder_512.pt
 save_frequency = 1

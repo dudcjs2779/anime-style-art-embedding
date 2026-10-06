@@ -190,6 +190,10 @@ def pretrain_collate03(batch, mask_ratio_tuple, mask_probability, n_tokens=None,
     output['image'] = torch.concat((image1, image2), dim=0)
 
     output['label'] = torch.stack([data['label'] for data in batch])
+
+    if 'feat_label' in batch[0]:
+        output['feat_label'] = torch.stack([data['feat_label'] for data in batch])
+
     if 'hard' in batch[0]:
         output['hard'] = torch.stack([data['hard'] for data in batch])
 
@@ -378,7 +382,19 @@ def make_relation_label(path, df, dtype):
 
     # rel_matrix = remap(rel_matrix, 0, 1.0, 0.3, 1.0)
     # rel_matrix[rel_matrix == 0.3] = 0
-    rel_matrix = torch.clamp(rel_matrix, min=0.0, max=0.9)
+    # rel_matrix = torch.clamp(rel_matrix, min=0.0, max=0.9)
+
+
+
+    self_mask = torch.eye(num_classes, dtype=torch.bool)
+    strong_sim_mask = (rel_matrix < 1.0) & (rel_matrix >= 0.7)
+    week_sim_mask = (rel_matrix < 0.7) & (rel_matrix >= 0.4)
+    except_mask = ~(self_mask | strong_sim_mask | week_sim_mask)
+
+    rel_matrix[self_mask] = 1.0
+    rel_matrix[strong_sim_mask] = 0.9
+    rel_matrix[week_sim_mask] = 0.0
+    rel_matrix[except_mask] = 0.0
 
     return rel_matrix
 
@@ -464,14 +480,15 @@ def make_pretrain_dataset02(args):
 def make_pretrain_dataset03(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
-
-    train_df = train_df[train_df['target'].isin([i for i in range(100)])]
-    valid_df = valid_df[valid_df['target'].isin([i for i in range(100)])]
+    
+    # train_df = train_df[train_df['target'].isin([i for i in range(100)])]
+    # valid_df = valid_df[valid_df['target'].isin([i for i in range(100)])]
 
     print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
     args.num_classes = train_df['target'].nunique()
     args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
     args.rel_pseudo = args.rel_real.clone()
+
 
     # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
     # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
@@ -531,6 +548,88 @@ def make_pretrain_dataset03(args):
 
     return train_loader, valid_loader
 
+def make_pretrain_dataset04(args):
+    train_df = pd.read_parquet(args.train)
+    valid_df = pd.read_parquet(args.valid)
+    
+    # train_df = train_df[train_df['target'].isin([i for i in range(20)])]
+    # valid_df = valid_df[valid_df['target'].isin([i for i in range(20)])]
+
+    print(f"Total Data: {len(train_df) + len(valid_df)}, Train: {len(train_df)}, Valid: {len(valid_df)}")
+    args.num_classes = train_df['target'].nunique()
+    args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
+    args.rel_pseudo = args.rel_real.clone()
+
+    with open(args.feat_label, 'r', encoding='utf-8') as file:
+        sty_feat_group = yaml.safe_load(file)
+    args.feat_len = len(sty_feat_group)
+
+    args.feat_class_weight = torch.tensor(np.load(args.feat_class_weight_path))
+    args.feat_pos_weight = torch.tensor(np.load(args.feat_pos_weight_path))
+    # args.tag_pos_weights = None
+
+    # transforms = get_preset(args.train_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    # valid_trans = get_preset(args.valid_aug, image_size=args.image_size, mean=[0.70843786, 0.65038896, 0.6473464], std=[0.25763473, 0.26254627, 0.25369588])
+    transforms = get_preset(args.train_aug, image_size=args.image_size)
+    valid_trans = get_preset(args.valid_aug, image_size=args.image_size)
+
+    logging.info(f"Train Image Processor:")
+    logging.info(f"{transforms}")
+    logging.info(f"Valid Image Processor: ")
+    logging.info(f"{valid_trans}")
+
+    img_size = args.image_size[0]
+    patch_size = args.patch_size
+    n_tokens = (img_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
+    )
+
+    collate_fn = partial(
+        pretrain_collate03,
+        mask_ratio_tuple=(0.2, 0.5),
+        mask_probability=0.7,
+        n_tokens=n_tokens,
+        mask_generator=mask_generator,
+    )
+    
+    train_labels = torch.tensor(train_df.target.tolist(), dtype=torch.float32, device='cpu')
+    train_sty_feats = [torch.tensor(feats, dtype=torch.long, device='cpu') for feats in train_df.style_feats_encoded.values]
+    train_bboxes = [np.stack(bbox) if len(bbox) > 0 else [] for bbox in train_df.bbox.tolist()]
+    train_bb_masks = train_df.bb_bi_mask.tolist()
+    train_bg_masks = train_df.bg_mask.tolist()
+    train_hards = torch.tensor(train_df.hard_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_centers = torch.tensor(train_df.center_sample.tolist(), dtype=torch.bool, device='cpu')
+    train_not_fars = torch.tensor(train_df.not_far_sample.tolist(), dtype=torch.bool, device='cpu')
+
+
+    train_dataset = PretrainBboxStyFeatDataset(
+        train_df.image.tolist(), train_labels,
+        train_sty_feats, args.feat_len,
+        train_bboxes, train_bb_masks, train_bg_masks,
+        transforms, hards=train_hards, centers=train_centers, not_fars=train_not_fars)
+    
+    sampler = HardLossSampler(
+        train_dataset, batch_size=args.batch_size, 
+        rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+        hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, collate_fn=collate_fn, pin_memory=True, num_workers=args.workers)
+    train_loader.num_samples = len(train_dataset)
+    train_loader.num_batches = len(train_loader)
+
+    valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
+    valid_sty_feats = [torch.tensor(feats, dtype=torch.long, device='cpu') for feats in valid_df.style_feats_encoded.values]
+    valid_dataset = PretrainValidBboxStyFeatDataset(valid_df.image.tolist(), valid_labels, valid_sty_feats, args.feat_len, transforms, valid_trans)
+    valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    valid_loader.num_samples = len(valid_dataset)
+    valid_loader.num_batches = len(valid_loader)
+
+    return train_loader, valid_loader
+
 def make_pretrain_tag_dataset(args):
     train_df = pd.read_parquet(args.train)
     valid_df = pd.read_parquet(args.valid)
@@ -540,8 +639,8 @@ def make_pretrain_tag_dataset(args):
     # args.tag_pos_weights = None
     args.tag_num_classes = args.tag_class_weights.size(0)
 
-    train_df = train_df[:2000]
-    valid_df = valid_df[:500]
+    # train_df = train_df[:2000]
+    # valid_df = valid_df[:500]
     # train_df = train_df[train_df['target'].isin([i for i in range(100)])]
     # valid_df = valid_df[valid_df['target'].isin([i for i in range(100)])]
 
@@ -1172,6 +1271,157 @@ class PretrainValidBboxDataset(Dataset):
 
         output= {'index': self.indices[idx], 'image1': image1, 'image2': image2, 'image_eval': image_eval, 'label': label}
         return output
+
+class PretrainBboxStyFeatDataset(Dataset):
+    def __init__(self, images, labels, feat_labels, feat_labels_len, bboxes, bb_masks, bg_masks, transforms, hards=None, centers=None, not_fars=None, df=None):
+        self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
+        self.images = images
+        self.labels = labels
+        self.feat_labels = feat_labels
+        self.feat_labels_len = feat_labels_len
+        self.bboxes = bboxes
+        self.bb_masks = bb_masks
+        self.bg_masks = bg_masks
+        self.hards = hards
+        self.centers = centers
+        self.not_fars = not_fars
+        self.transforms = transforms
+        self.test_trans1 = remove_normalize_and_totensor(self.transforms)
+
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        bb_mask = self.bb_masks[idx]
+        if bb_mask is not None:
+            bb_mask = cv2.imread(self.bb_masks[idx], cv2.IMREAD_GRAYSCALE)
+
+        bg_mask = self.bg_masks[idx]
+        if bg_mask is not None:
+            bg_mask = cv2.imread(self.bg_masks[idx], cv2.IMREAD_GRAYSCALE)
+
+        label = self.labels[idx]
+        bbox = self.bboxes[idx]
+        hard = self.hards[idx]
+        center = self.centers[idx]
+        not_far = self.not_fars[idx]
+
+        feat_label_indices = self.feat_labels[idx]
+        feat_label = torch.zeros(self.feat_labels_len, dtype=torch.float32)
+        feat_label[feat_label_indices] = 1.0
+
+        transformed1 = self.transforms(
+            image=image,
+            mask=bb_mask,
+            bg_mask=bg_mask,
+            bboxes=bbox,
+        )
+
+        transformed2 = self.transforms(
+            image=image,
+            mask=bb_mask,
+            bg_mask=bg_mask,
+            bboxes=bbox,
+        )
+        output = {'index': self.indices[idx], 'image1': transformed1['image'], 'image2': transformed2['image'], 'label': label, 'feat_label': feat_label, 'hard': hard, 'center': center, 'not_far': not_far}
+
+        return output
+    
+    def get_pil(self, idx, pixels=None):
+        image =Image.open(self.images[idx])
+        if pixels:
+            width, height = image.size
+
+            aspect_ratio = width / height
+            resize_h  = math.ceil(math.sqrt(pixels**2 / aspect_ratio))
+            resize_w = math.ceil(resize_h * aspect_ratio)
+
+            image = image.resize((resize_w, resize_h), Image.Resampling.BICUBIC)
+
+        return image
+    
+    def get_transform(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        bb_mask = cv2.imread(self.bboxes[idx], cv2.IMREAD_GRAYSCALE)
+        bg_mask = cv2.imread(self.bg_masks[idx], cv2.IMREAD_GRAYSCALE)
+        bbox = self.bboxes[idx]
+        
+        transformed = self.transforms(
+            image=image,
+            mask=bb_mask,
+            bg_mask=bg_mask,
+            bboxes=bbox,
+        )
+
+        return Image.fromarray(transformed['image'])
+
+class PretrainValidBboxStyFeatDataset(Dataset):
+    def __init__(self, images, labels, feat_labels, feat_labels_len, transforms, valid_transforms, df=None):
+        self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
+        self.images = images
+        self.labels = labels
+        self.feat_labels = feat_labels
+        self.feat_labels_len = feat_labels_len
+        self.transforms = transforms
+        self.valid_transforms = valid_transforms
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image1 = self.transforms(image=image)['image']
+        image2 = self.transforms(image=image)['image']
+        image_eval = self.valid_transforms(image=image)['image']
+        label = self.labels[idx]
+
+        feat_label_indices = self.feat_labels[idx]
+        feat_label = torch.zeros(self.feat_labels_len, dtype=torch.float32)
+        feat_label[feat_label_indices] = 1.0
+
+        output= {'index': self.indices[idx], 'image1': image1, 'image2': image2, 'image_eval': image_eval, 'label': label, 'feat_label': feat_label}
+        return output
+
+class PretrainInferBboxStyFeatDataset(Dataset):
+    def __init__(self, images, transforms, labels=None, feat_labels=None, feat_labels_len=None, df=None):
+        self.df = df
+        self.indices = torch.arange(0, len(images), dtype=torch.long, device='cpu')
+        self.images = images
+        self.labels = labels
+        self.feat_labels = feat_labels
+        self.feat_labels_len = feat_labels_len
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        output = {'index': self.indices[idx]}
+
+        image = cv2.imread(self.images[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        output['image'] = self.transforms(image=image)['image']
+
+        if self.labels is not None:
+            output['label'] = self.labels[idx]
+
+        if self.feat_labels is not None:
+            feat_label_indices = self.feat_labels[idx]
+            feat_label = torch.zeros(self.feat_labels_len, dtype=torch.float32)
+            feat_label[feat_label_indices] = 1.0
+            output['feat_label'] = feat_label
+
+        return output
+
 
 class PretrainTagDataset(Dataset):
     def __init__(self, images, labels, tags, greytags, tag_num, transforms, raw_tags=None, raw_greytags=None, hards=None, centers=None, not_fars=None, df=None):

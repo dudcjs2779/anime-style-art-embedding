@@ -144,6 +144,10 @@ def load_pretrain(model, path):
                 logging.info(f"The model of the prototpye shape not matches pretrain prototype shape. {model.prototypes.shape}(model) != {checkpoint['state_dict']['prototypes'].shape}(pretrained). Therefore, the prototype vector is excluded.")
                 del checkpoint['state_dict']['prototypes']
 
+            if checkpoint['state_dict']['content_head.weight'].shape != model.content_head.weight.shape:
+                del checkpoint['state_dict']['content_head.weight']
+                del checkpoint['state_dict']['content_head.bias']
+
             missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
         else:
             if checkpoint.get('prototypes') and checkpoint['prototypes'].shape != model.prototypes.shape:
@@ -228,7 +232,6 @@ def train_one_epoch(
         accum_features = {}
 
     losses_m = {}
-    losses_log = {}
     # total_m = AverageMeter()
     # clip_loss_m = AverageMeter()
     batch_time_m = AverageMeter()
@@ -317,25 +320,24 @@ def train_one_epoch(
                     cls_features['style_feat'],
                 )
 
-                # similarity mse loss
-                losses['mse_loss'] = similarity_mse_loss(
-                    torch.cat((cls_features['style_feat1'][~not_fars], cls_features['style_feat2'][~not_fars]), dim=0), 
-                    torch.cat((classes[~not_fars], classes[~not_fars]), dim=0).long(), 
-                    model.prototypes, args.rel_real,
-                )
+                # # similarity mse loss
+                # losses['mse_loss'] = similarity_mse_loss(
+                #     cls_features['style_feat1'][~not_fars], 
+                #     classes[~not_fars].long(), 
+                #     model.prototypes, args.rel_real,
+                # )
                 
                 losses["raw_loss"] = sum(losses.values())
                 losses["loss"] = (
                     losses['style_loss'] * clip_scheduler[step] 
                     + losses['proto_loss'] * proto_scheduler[step] 
-                    + losses['content_loss'] 
+                    + losses['content_loss']
                     + losses['content_style_cosine_loss'] 
                     # + losses['mse_loss'] * 1.0 
                     # + losses['mae_loss'] * 0.5
                 )
 
             backward(losses["loss"], scaler)
-            losses_log.update(losses)
 
         else:
             # First, cache the features without any gradient tracking.
@@ -345,7 +347,6 @@ def train_one_epoch(
                     cls_features = {
                         'style_feat': model_out['style_feat'],
                         'content_feat': model_out['content_feat'],
-                        'content_tag_feat': model_out['content_tag_feat'],
                     }
 
                     for key, val in cls_features.items():
@@ -372,7 +373,10 @@ def train_one_epoch(
             accum_classes = torch.concat(accum_classes, dim=-1)
             accum_not_fars = torch.concat(accum_not_fars, dim=-1)
             accum_index = torch.concat(accum_index, dim=-1)
-            accum_tags = torch.concat(accum_tags, dim=0)
+
+            losses = {}
+            losses['content_loss_log'] = 0
+            losses['content_style_cosine_loss_log'] = 0
             for j in range(args.accum_freq):
                 images = accum_images[j]
                 tags = accum_tags[j]
@@ -389,7 +393,7 @@ def train_one_epoch(
                         'style_feat': model_out['style_feat'],
                         'content_feat': model_out['content_feat'],
                     }
-                    content_tag_feat = model_out['content_tag_feat'],
+                    content_tag_feat = model_out['content_tag_feat']
                     
                     logit_scale = model_out["logit_scale"]
                     logit_bias = model_out.get("logit_bias", None)
@@ -399,7 +403,6 @@ def train_one_epoch(
                         accumulated = accum_features[key]
                         inputs[key] = torch.cat(accumulated[:j] + [cls_features[key]] + accumulated[j + 1:])
                     
-                    losses = {}
                     losses['style_loss'] = clip_loss(
                         inputs['style_feat'], 
                         logit_scale, logit_bias, 
@@ -418,30 +421,22 @@ def train_one_epoch(
                         sample_manager_update=(j==0),
                         train=True,
                     )
+                    
+                    # no need concat
+                    losses['content_loss'] = content_loss(
+                        content_tag_feat,
+                        tags
+                    ) / args.accum_freq
 
-                    # no need stack
-                    if j == 0:
-                        losses['content_loss'] = content_loss(
-                            content_tag_feat,
-                            tags
-                        ) / args.accum_freq
+                    losses['content_loss_log'] += losses['content_loss'].detach()
 
-                        # content style sim loss
-                        losses['content_style_cosine_loss'] = content_style_sim_loss(
-                            cls_features['content_feat'],
-                            cls_features['style_feat'],
-                        ) / args.accum_freq
-                    else:
-                        losses['content_loss'] += content_loss(
-                            content_tag_feat,
-                            tags
-                        ) / args.accum_freq
+                    # content style sim loss
+                    losses['content_style_cosine_loss'] = content_style_sim_loss(
+                        cls_features['content_feat'],
+                        cls_features['style_feat'],
+                    ) / args.accum_freq
 
-                        # content style sim loss
-                        losses['content_style_cosine_loss'] += content_style_sim_loss(
-                            cls_features['content_feat'],
-                            cls_features['style_feat'],
-                        ) / args.accum_freq
+                    losses['content_style_cosine_loss_log'] += losses['content_style_cosine_loss'].detach()
 
                     # # similarity mse loss
                     # losses['mse_loss'] = similarity_mse_loss(
@@ -453,7 +448,7 @@ def train_one_epoch(
                     del inputs
 
                     # total_loss = sum(losses.values())
-                    losses["raw_loss"] = sum(losses.values())
+                    
                     losses["loss"] = (
                         losses['style_loss'] * clip_scheduler[step] + 
                         losses['proto_loss'] * proto_scheduler[step] +
@@ -465,8 +460,22 @@ def train_one_epoch(
 
                 backward(losses["loss"], scaler)
                 
-                # accum_freq 때문에 mae_lossr의 기록이 왜곡되는 것 방지
-                losses_log.update(losses)
+            # accum_freq 때문에 mae_loss의 기록이 왜곡되는 것 방지
+            losses['content_loss'] = losses['content_loss_log']
+            losses['content_style_cosine_loss'] = losses['content_style_cosine_loss_log']
+            del losses['content_loss_log']
+            del losses['content_style_cosine_loss_log']
+            del losses['loss']
+
+            losses['raw_loss'] = sum(losses.values())
+            losses["loss"] = (
+                losses['style_loss'] * clip_scheduler[step] + 
+                losses['proto_loss'] * proto_scheduler[step] +
+                losses['content_loss'] + 
+                losses['content_style_cosine_loss']
+                # losses['mse_loss'] * 1.0 + 
+                # (losses['mae_loss'] * 0.5 / args.accum_freq)
+            )
 
         if scaler is not None:
             if args.horovod:
@@ -510,7 +519,7 @@ def train_one_epoch(
             percent_complete = 100.0 * batch_count / num_batches_per_epoch
 
             # NOTE loss is coarsely sampled, just master node and per log update
-            for key, val in losses_log.items():
+            for key, val in losses.items():
                 if key not in losses_m:
                     losses_m[key] = AverageMeter()
                 losses_m[key].update(val.item(), batch_size)
@@ -808,21 +817,8 @@ def main(args):
         device=device,
     )
 
-    # cosine_loss = CosineSimilarityLoss(dim=-1)
-
-    # proto_loss = PrototypeContrastiveLoss(
-    #     num_classes=args.num_classes,
-    #     feat_dim=768,
-    #     momentum=0.95,
-    #     rank=args.rank,
-    #     world_size=args.world_size,
-    #     dist_impl=args.loss_dist_impl,
-    #     device=device,
-    # )
-
     proto_loss = RelationPrototypeContrastiveLoss(
         num_classes=args.num_classes,
-        feat_dim=768,
         momentum=0.99,
         rel_matrix=args.rel_real, 
         rel_real=args.rel_real,
@@ -906,7 +902,7 @@ def main(args):
     
     total_steps = (train_loader.num_batches // args.accum_freq) * args.epochs
 
-    warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
+    warmup_steps = int(total_steps * args.warmup_ratio) if args.warmup_ratio is not None else args.warmup
     scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
     clip_scheduler = CosineScheduler(*args.style_weight, total_steps // 2, 0)    # clip_loss weight scheduler
     proto_scheduler = CosineScheduler(*args.proto_weight, total_steps // 2, 0)    # clip_loss weight scheduler
