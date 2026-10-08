@@ -1961,7 +1961,7 @@ class HardLossSampler(Sampler[int]):
         self.sample_available_mask = np.ones(len(self.indices), dtype=bool)
 
         if self.sample_score.sum() > 0:
-            self.score_sampling_limit = len(self) * 0.1
+            self.score_sampling_limit = len(self) * 0.1 // self.accum
 
         # self.all_batches = []
         # self.all_classes = []
@@ -2042,7 +2042,13 @@ class HardLossSampler(Sampler[int]):
             same_k = random.randint(*self.same_num)
 
             if self.score_sampling_limit > 0:
-                score_sample = random.choices(self.indices, weights=self.sample_score * self.sample_available_mask, k=1)[0]
+                weights = self.sample_score * self.sample_available_mask
+
+                if not np.any(weights):
+                    self.score_sampling_limit = 0
+                    weights = self.sample_available_mask
+
+                score_sample = random.choices(self.indices, weights=weights, k=1)[0]
                 cls = self.data_to_class[score_sample]
                 self.score_sampling_limit -= 1
 
