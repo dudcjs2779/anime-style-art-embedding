@@ -122,153 +122,6 @@ class CustomEva(Eva):
         
         return x
 
-
-class CustomVisual(nn.Module):
-    def __init__(
-            self,
-            model_name: str,
-            model_kargs: dict = {},
-            init_logit_scale: float = np.log(1 / 0.07),
-            init_logit_bias: Optional[float] = None,
-            nonscalar_logit_scale: bool = False,
-            output_dict: bool = False,
-    ):
-        super().__init__()
-        self.output_dict = output_dict
-        self.visual, visual_args = create_eva(model_name, pretrained=True, **model_kargs)
-        # self.visual = timm.create_model(model_name, pretrained=True, **model_kargs)
-
-        lshape = [1] if nonscalar_logit_scale else []
-        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
-        if init_logit_bias is not None:
-            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
-        else:
-            self.logit_bias = None
-
-    def encode_image(self, image, mask=None, normalize: bool = False):
-        features = self.visual(image, mask)
-        return F.normalize(features, dim=-1) if normalize else features
-    
-    def inference(
-            self,
-            image: Optional[torch.Tensor] = None,
-            normalize: bool = True,
-    ):
-        image_features = self.encode_image(image, normalize=normalize) if image is not None else None
-
-        if self.output_dict:
-            out_dict = {
-                "image_features": image_features,
-                "logit_scale": self.logit_scale.exp()
-            }
-            if self.logit_bias is not None:
-                out_dict['logit_bias'] = self.logit_bias
-            return out_dict
-
-        if self.logit_bias is not None:
-            return image_features, self.logit_scale.exp(), self.logit_bias
-        return image_features, self.logit_scale.exp()
-    
-    def evaluate(
-            self,
-            image1: Optional[torch.Tensor] = None,
-            image2: Optional[torch.Tensor] = None,
-            image3: Optional[torch.Tensor] = None,
-            gl_masks: Optional[torch.Tensor] = None,
-            loc_masks: Optional[torch.Tensor] = None,
-    ):
-        im_feat1 = self.encode_image(image1, gl_masks, normalize=True) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, loc_masks,  normalize=True) if image2 is not None else None
-        im_feat3 = self.encode_image(image3, normalize=True) if image3 is not None else None
-
-        if self.output_dict:
-            out_dict = {
-                "im_feat1_cls": im_feat1[:, 0],
-                "im_feat1_patches": im_feat1[:, self.visual.num_prefix_tokens:],
-                "im_feat2_cls": im_feat2[:, 0],
-                "im_feat2_patches": im_feat2[:, self.visual.num_prefix_tokens:],
-                "im_feat3_cls": im_feat3[:, 0],
-                "logit_scale": self.logit_scale.exp(),
-            }
-            if self.logit_bias is not None:
-                out_dict['logit_bias'] = self.logit_bias
-            return out_dict
-
-        if self.logit_bias is not None:
-            return im_feat1, im_feat2, im_feat3, self.logit_scale.exp(), self.logit_bias
-        return im_feat1, im_feat2, im_feat3, self.logit_scale.exp()
-    
-        # im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
-        # im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
-        # im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
-        # im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
-        # im_feat3 = self.encode_image(image3, normalize=True) if image3 is not None else None
-
-        # if self.output_dict:
-        #     out_dict = {
-        #         "im_feat1": im_feat1,
-        #         "im_feat1_masked": im_feat1_masked,
-        #         "im_feat2": im_feat2,
-        #         "im_feat2_masked": im_feat2_masked,
-        #         "im_feat3": im_feat3,
-        #         "logit_scale": self.logit_scale.exp()
-        #     }
-        #     if self.logit_bias is not None:
-        #         out_dict['logit_bias'] = self.logit_bias
-        #     return out_dict
-
-        # if self.logit_bias is not None:
-        #     return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp(), self.logit_bias
-        # return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, im_feat3, self.logit_scale.exp()
-
-    def forward(
-            self,
-            image1: torch.Tensor,
-            image2: torch.Tensor,
-            gl_masks: Optional[torch.Tensor] = None,
-            loc_masks: Optional[torch.Tensor] = None,
-    ):
-        im_feat1 = self.encode_image(image1, gl_masks, normalize=True) if image1 is not None else None
-        im_feat2 = self.encode_image(image2, loc_masks, normalize=True) if image2 is not None else None
-     
-        if self.output_dict:
-            out_dict = {
-                "im_feat1_cls": im_feat1[:, 0],
-                "im_feat1_patches": im_feat1[:, self.visual.num_prefix_tokens:],
-                "im_feat2_cls": im_feat2[:, 0],
-                "im_feat2_patches": im_feat2[:, self.visual.num_prefix_tokens:],
-                "logit_scale": self.logit_scale.exp(),
-            }
-            if self.logit_bias is not None:
-                out_dict['logit_bias'] = self.logit_bias
-            return out_dict
-
-        if self.logit_bias is not None:
-            return im_feat1, im_feat2, self.logit_scale.exp(), self.logit_bias
-        return im_feat1, im_feat2, self.logit_scale.exp()
-
-
-        # im_feat1 = self.encode_image(image1, normalize=True) if image1 is not None else None
-        # im_feat1_masked = self.encode_image(image1, mask1, normalize=True) if image1 is not None else None
-        # im_feat2 = self.encode_image(image2, normalize=True) if image2 is not None else None
-        # im_feat2_masked = self.encode_image(image2, mask2, normalize=True) if image2 is not None else None
-     
-        # if self.output_dict:
-        #     out_dict = {
-        #         "im_feat1": im_feat1,
-        #         "im_feat1_masked": im_feat1_masked,
-        #         "im_feat2": im_feat2,
-        #         "im_feat2_masked": im_feat2_masked,
-        #         "logit_scale": self.logit_scale.exp()
-        #     }
-        #     if self.logit_bias is not None:
-        #         out_dict['logit_bias'] = self.logit_bias
-        #     return out_dict
-
-        # if self.logit_bias is not None:
-        #     return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp(), self.logit_bias
-        # return im_feat1, im_feat1_masked, im_feat2, im_feat2_masked, self.logit_scale.exp()
-
 class EvaDecoder(nn.Module):
     def __init__(
             self, 
@@ -447,71 +300,6 @@ class EvaDecoder(nn.Module):
 
         return x
 
-class EmbeddingHead(nn.Module):
-    def __init__(
-            self, 
-            dim,
-            mlp_ratio,
-            depth=1,
-            swiglu_mlp=False,
-            scale_mlp=False,
-            proj_drop: float = 0,
-            norm_layer: Callable = LayerNorm,
-            act_layer: Callable = nn.GELU,
-            **kwargs,
-        ):
-        super().__init__()
-        hidden_features = int(dim * mlp_ratio)
-
-        if swiglu_mlp:
-            if scale_mlp:
-                # when norm in SwiGLU used, an impl with separate fc for gate & x is used
-                self.mlps = nn.ModuleList([
-                    SwiGLU(
-                        in_features=dim,
-                        hidden_features=hidden_features,
-                        norm_layer=norm_layer if scale_mlp else None,
-                        drop=proj_drop,
-                    )
-                    for i in range(depth)])
-                
-            else:
-                # w/o any extra norm, an impl with packed weights is used, matches existing GluMLP
-
-                self.mlps = nn.ModuleList([
-                    GluMlp(
-                        in_features=dim,
-                        hidden_features=hidden_features * 2,
-                        norm_layer=norm_layer if scale_mlp else None,
-                        act_layer=nn.SiLU,
-                        gate_last=False,
-                        drop=proj_drop,
-                    )
-                    for i in range(depth)])
-        else:
-            self.mlps = nn.ModuleList([
-                Mlp(
-                    in_features=dim,
-                    hidden_features=hidden_features,
-                    act_layer=act_layer,
-                    norm_layer=norm_layer if scale_mlp else None,
-                    drop=proj_drop,
-                )
-                for i in range(depth)])
-            
-        self.norm = norm_layer(dim)
-
-        if isinstance(self.norm, nn.LayerNorm):
-            nn.init.constant_(self.norm.bias, 0)
-            nn.init.constant_(self.norm.weight, 1.0)
-            
-    def forward(self, x, normalize=True):
-        for mlp in self.mlps:
-            x = mlp(x)
-        x = self.norm(x)
-
-        return F.normalize(x, dim=-1) if normalize else x
-
 class EvaHead(nn.Module):
     def __init__(
             self,
@@ -583,7 +371,7 @@ class EvaHead(nn.Module):
         return x
 
 
-class CustomMaeVisual(nn.Module):
+class StyleMaeVisual(nn.Module):
     def __init__(
             self,
             model_name: str,
@@ -816,13 +604,11 @@ class CustomMaeVisual(nn.Module):
             return im_feats, self.logit_scale.exp(), self.logit_bias
         return im_feats, self.logit_scale.exp()
 
-class CustomVisual3(nn.Module):
+class StyleFeatVisual(nn.Module):
     def __init__(
             self,
             model_name: str,
-            decoder_name: str,
             model_kargs: dict = {},
-            decoder_kargs: dict = {},
             content_head: dict = {},
             feat_head: dict = {},
             init_logit_scale: float = np.log(1 / 0.07),
@@ -833,6 +619,7 @@ class CustomVisual3(nn.Module):
     ):
         super().__init__()
         self.output_dict = output_dict
+        model_kargs.update({"num_classes": 0, "global_pool": ""}) # head와 pooling 방식은 직접 정의
         self.visual, visual_args = create_eva(model_name, pretrained=True, **model_kargs)
 
         lshape = [1] if nonscalar_logit_scale else []
@@ -991,7 +778,7 @@ class CustomVisual3(nn.Module):
         return im_feats, self.logit_scale.exp()
 
 
-class CustomVisual2(nn.Module):
+class StyleTagVisual(nn.Module):
     def __init__(
             self,
             model_name: str,

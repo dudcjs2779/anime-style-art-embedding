@@ -19,14 +19,15 @@ from open_clip_train.logger import setup_logging
 
 from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
-from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02, make_pretrain_dataset04
+from mysrc.utils.dataset import make_pretrain_dataset04
 from mysrc.utils.optim_utils import make_mae_param_groups
-from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, RelationPrototypeContrastiveLoss, RelationSigLipLoss, similarity_mse_loss, content_style_sim_loss, BCELoss
+from mysrc.utils.loss import RelationPrototypeContrastiveLoss, RelationSigLipLoss, similarity_mse_loss, content_style_sim_loss, BCELoss
 from mysrc.utils.scheduler import CosineScheduler, StepGenerator
 from mysrc.utils.precision import get_autocast, get_input_dtype
-from mysrc.model import CustomVisual3
+from mysrc.model import StyleFeatVisual
 from mysrc.utils.file_utils import pt_load
 from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics, get_class_topk, get_sfg_metrics
+from mysrc.utils.pos_embed import interpolate_pos_embed
 
 
 class AverageMeter(object):
@@ -146,11 +147,14 @@ def load_pretrain(model, path):
                 checkpoint['state_dict']['content_head.weight'] = checkpoint['state_dict']['content_proj.weight']
                 checkpoint['state_dict']['content_head.bias'] = checkpoint['state_dict']['content_proj.bias']
 
-
             checkpoint['state_dict']['self_style_head.weight'] = checkpoint['state_dict']['style_head.weight']
             checkpoint['state_dict']['self_style_head.bias'] = checkpoint['state_dict']['style_head.bias']
             del checkpoint['state_dict']['style_head.weight']
             del checkpoint['state_dict']['style_head.bias']
+
+            if model.visual.pos_embed.shape != checkpoint['state_dict']['visual.pos_embed'].shape:
+                model.visual.pos_embed, checkpoint['state_dict']['visual.pos_embed']
+                interpolate_pos_embed(model, checkpoint['state_dict'])
 
             missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
         else:
@@ -164,57 +168,11 @@ def load_pretrain(model, path):
         logging.info(f"missing_key: {len(missing)}: {missing[:10]}")
         logging.info(f"unexpected_key: {len(unexpected)}: {unexpected[:10]}")
 
-def update_relation(clip_loss, proto_loss, prototypes, momentum, batch_sampler, args, step=None, save=False):
-    rel_pseudo = args.rel_pseudo.to(device=prototypes.device, dtype=prototypes.dtype)
-    rel_real = args.rel_real.to(device=prototypes.device, dtype=prototypes.dtype)
-
-    # cosine similarity
-    new_rel_pseudo = torch.clamp(prototypes @ prototypes.T, 0, 1.0)
-
-    k = int(prototypes.size(0) * args.topk_rate)    # 상위 10% sim
-    topk_values, topk_indices = torch.topk(new_rel_pseudo, k=k, dim=-1)
-
-    # adaptive threshold
-    mean = topk_values.mean(dim=-1, keepdim=True)    # mean이 높다 => 비슷한 그림체가 많다(또는 흔하다) => 컷을 높여 진짜 비슷한 그림만 선별한다
-    std = topk_values.std(dim=-1, keepdim=True)  # std가 높다 => 특별히 비슷한 그림체가 있다(또는 개성있다) => 컷을 높여 진짜 비슷한 그림만 선별한다
-    threshold = mean * args.th_mean_weight + std * args.th_std_weight
-
-    # threshold 보다 큰 sim 값만 남김 => 너무 작은 sim은 크게 의미 없는 값일 가능성이 높음
-    new_rel_pseudo = torch.where(new_rel_pseudo > threshold, new_rel_pseudo, torch.zeros_like(new_rel_pseudo))
-    new_rel_pseudo = torch.maximum(new_rel_pseudo, new_rel_pseudo.T)    # A => B, B => A 연관성 동일 보장
-
-    rel_pseudo = momentum * rel_pseudo + (1 - momentum) * new_rel_pseudo    # EMA
-
-    center = args.alpha_center
-    sharpness = args.alpha_sharpness
-    alpha = torch.sigmoid(sharpness * (rel_real - center)) # 연관성이 높을 수록 rel_real의 값을 많이 유지한다.
-
-    real_mask = rel_real != 0
-    rel_mixed = torch.where(
-        real_mask,
-        alpha * rel_real + (1 - alpha) * rel_pseudo,
-        rel_pseudo
-    )
-
-    args.rel_pseudo = rel_pseudo
-    clip_loss.rel_matrix = rel_mixed
-    proto_loss.rel_matrix = rel_mixed
-    batch_sampler.rel_real = rel_mixed.detach().cpu().numpy()
-    batch_sampler.rel_pseudo = rel_mixed.detach().cpu().numpy()
-
-    if save:
-        relation_dir = os.path.join(args.output_path, "relation")
-        os.makedirs(relation_dir, exist_ok=True)
-        relation_path = os.path.join(relation_dir, f"{step}_relation.pt")
-
-        rel_dict = {"step": step, "rel_pseudo": rel_mixed}
-        torch.save(rel_dict, relation_path)
-
 def train_one_epoch(
         model, device, dataloader, 
         clip_loss, proto_loss, feat_loss, self_clip_loss, self_proto_loss, 
         epoch, optimizer, scaler, 
-        scheduler, clip_scheduler, proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, batch_sampler_scheduler, 
+        scheduler, clip_scheduler, proto_scheduler, proto_momentum_scheduler, batch_sampler_scheduler, 
         tb_writer, sample_manager, args
     ):
     autocast = get_autocast(args.precision, device_type=device.type)
@@ -247,9 +205,6 @@ def train_one_epoch(
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
-
-        # if rel_update_scheduler.is_update_step(step):
-        #     update_relation(clip_loss, proto_loss, model.prototypes, rel_momentum_scheduler[step], dataloader.batch_sampler, args, step=step, save=True)
 
         if batch_sampler_scheduler.is_update_step(step):
             sim_matrix = model.prototypes @ model.prototypes.T
@@ -299,6 +254,8 @@ def train_one_epoch(
                     'style_feat2': model_out['style_cls'][bsz:],
                     'content_feat1': model_out['content_cls'][:bsz],
                     'content_feat2': model_out['content_cls'][bsz:],
+                    'self_style_feat1': model_out['self_style_cls'][bsz:],
+                    'self_style_feat2': model_out['self_style_cls'][:bsz],
                     'sfg_feat': model_out['sfg_cls'],
                 }
                 logit_scale = model_out["logit_scale"]
@@ -308,7 +265,7 @@ def train_one_epoch(
                 losses['self_style_loss'] = self_clip_loss(
                     cls_features['self_style_feat1'], cls_features['self_style_feat2'], 
                     logit_scale, logit_bias, 
-                    classes, same_class_weight=args.same_class_weight, 
+                    classes, 
                     not_fars=not_fars,
                     output_dict=False
                 )
@@ -338,7 +295,7 @@ def train_one_epoch(
                 losses['style_loss'] = clip_loss(
                     cls_features['style_feat1'], cls_features['style_feat2'], 
                     logit_scale, logit_bias, 
-                    classes, same_class_weight=args.same_class_weight, 
+                    classes, 
                     not_fars=not_fars,
                     output_dict=False
                 )
@@ -487,7 +444,7 @@ def train_one_epoch(
                     losses['self_style_loss'] = self_clip_loss(
                         inputs['self_style_feat1'], inputs['self_style_feat2'], 
                         logit_scale, logit_bias, 
-                        accum_classes, same_class_weight=args.same_class_weight, 
+                        accum_classes, 
                         not_fars=accum_not_fars,
                         output_dict=False
                     )
@@ -517,7 +474,7 @@ def train_one_epoch(
                     losses['style_loss'] = clip_loss(
                         inputs['style_feat1'], inputs['style_feat2'], 
                         logit_scale, logit_bias, 
-                        accum_classes, same_class_weight=args.same_class_weight, 
+                        accum_classes, 
                         not_fars=accum_not_fars,
                         output_dict=False
                     )
@@ -771,7 +728,7 @@ def evaluate(
                     losses['self_style_loss'] = self_clip_loss(
                         cls_features['self_style_feat1'], cls_features['self_style_feat2'], 
                         logit_scale, logit_bias, 
-                        classes=classes, same_class_weight=args.same_class_weight, 
+                        classes=classes, 
                         output_dict=False
                     )
 
@@ -791,14 +748,14 @@ def evaluate(
                     losses['style_loss'] = clip_loss(
                         cls_features['style_feat1'], cls_features['style_feat2'], 
                         logit_scale, logit_bias, 
-                        classes=classes, same_class_weight=args.same_class_weight,
+                        classes=classes,
                         output_dict=False
                     )
                     losses['proto_loss'] = proto_loss(
                         cls_features['style_feat1'], model.prototypes,
                         logit_scale, logit_bias,
                         classes, 
-                    )
+                    ) * 0.5
 
                     losses['proto_loss'] +=  proto_loss(
                         cls_features['style_feat2'], model.prototypes,
@@ -810,7 +767,7 @@ def evaluate(
                         cls_features['content_feat1'], cls_features['content_feat2'], 
                         logit_scale, logit_bias,
                         output_dict=False
-                    ) * 0.5
+                    )
 
                     # contetn style sim loss
                     losses['content_style_cosine_loss'] = content_style_sim_loss(
@@ -819,22 +776,6 @@ def evaluate(
                     )
 
                     losses['sfg_loss'] = feat_loss(eval_sfg_feat, sfg_label)
-
-                    # # similarity mse loss
-                    # losses['mse_loss'] = similarity_mse_loss(
-                    #     torch.cat((cls_features['style_feat1'], cls_features['style_feat2']), dim=0), 
-                    #     torch.cat((classes, classes), dim=0).long(), 
-                    #     model.prototypes, args.rel_real
-                    # )
-
-                    # ## Reconstruction loss
-                    # pred = model_out['im_pred']
-                    # masks = model_out['masks']
-                    # label = model.decoder.patchify(images[mask_samples])
-
-                    # loss = mae_loss(pred, label, masks, norm_pix_loss=args.norm_pix_loss)
-                    # # loss = loss * args.mae_weight
-                    # losses['mae_loss'] = loss
 
                     losses["loss"] = sum(losses.values())
 
@@ -919,6 +860,193 @@ def evaluate(
         wandb.log(log_data, step=step)
 
     return metrics
+
+def test_evaluate(
+        model, device, dataloader, 
+        clip_loss, proto_loss, self_clip_loss, self_proto_loss,
+        epoch, tb_writer, step, args):
+    metrics = {}
+    autocast = get_autocast(args.precision, device_type=device.type)
+    input_dtype = get_input_dtype(args.precision)
+    model.eval()
+
+    if args.val_frequency and ((epoch % args.val_frequency) == 0 or epoch == args.epochs):
+        num_samples = 0
+        samples_per_val = dataloader.num_samples
+
+        # cumulative_loss = {}
+        losses_m = {}
+        all_image_features, all_classes = [], []
+        with torch.inference_mode():
+            for i, batch in enumerate(dataloader):
+                images, image_eval, classes = batch['image'], batch['image_eval'], batch['label']
+                images = images.to(device=device, dtype=input_dtype, non_blocking=True)   # aug1
+                image_eval = image_eval.to(device=device, dtype=input_dtype, non_blocking=True)   # non aug
+                classes = classes.to(device=device, dtype=torch.long, non_blocking=True)
+
+                crop_masks, mask_indices, none_mask_indices, mask_samples = batch['crop_masks'], batch['mask_indices'], batch['none_mask_indices'], batch['mask_samples']
+                crop_masks = crop_masks.to(device=device, non_blocking=True)
+                mask_indices = mask_indices.to(device=device, non_blocking=True)
+                none_mask_indices = none_mask_indices.to(device=device, non_blocking=True)
+                mask_samples = mask_samples.to(device=device, non_blocking=True)
+
+                batch_size = images.shape[0] // 2
+                with autocast():
+                    model_out = model.evaluate(
+                        images, image_eval,
+                        crop_masks, mask_indices, none_mask_indices, mask_samples,
+                    )
+                    cls_features = {
+                        'style_feat1': model_out['style_cls'][:batch_size],
+                        'style_feat2': model_out['style_cls'][batch_size:],
+                        'content_feat1': model_out['content_cls'][:batch_size],
+                        'content_feat2': model_out['content_cls'][batch_size:],
+                        'self_style_feat1': model_out['self_style_cls'][batch_size:],
+                        'self_style_feat2': model_out['self_style_cls'][:batch_size],
+
+                    }
+                    eval_features = model_out["eval_style_cls"]
+                    # eval_self_features = model_out["eval_self_style_cls"]
+                    logit_scale = model_out["logit_scale"]
+                    logit_bias = model_out.get('logit_bias', None)
+                    
+                    all_image_features.append(eval_features.cpu())
+                    all_classes.append(classes.cpu())
+
+                    losses = {}
+                    losses['self_style_loss'] = self_clip_loss(
+                        cls_features['self_style_feat1'], cls_features['self_style_feat2'], 
+                        logit_scale, logit_bias, 
+                        classes=classes, 
+                        output_dict=False
+                    )
+
+                    # losses['self_proto_loss'] = self_proto_loss(
+                    #     cls_features['self_style_feat1'], model.self_prototypes,
+                    #     logit_scale, logit_bias,
+                    #     classes,
+                    # ) * 0.5
+
+                    # losses['self_proto_loss'] +=  self_proto_loss(
+                    #     cls_features['self_style_feat2'], model.self_prototypes,
+                    #     logit_scale, logit_bias,
+                    #     classes,
+                    # ) * 0.5
+
+
+                    losses['style_loss'] = clip_loss(
+                        cls_features['style_feat1'], cls_features['style_feat2'], 
+                        logit_scale, logit_bias, 
+                        classes=classes,
+                        output_dict=False
+                    )
+                    # losses['proto_loss'] = proto_loss(
+                    #     cls_features['style_feat1'], model.prototypes,
+                    #     logit_scale, logit_bias,
+                    #     classes, 
+                    # ) * 0.5
+
+                    # losses['proto_loss'] +=  proto_loss(
+                    #     cls_features['style_feat2'], model.prototypes,
+                    #     logit_scale, logit_bias,
+                    #     classes,
+                    # ) * 0.5
+
+                    losses['content_loss'] = clip_loss(
+                        cls_features['content_feat1'], cls_features['content_feat2'], 
+                        logit_scale, logit_bias,
+                        output_dict=False
+                    )
+
+                    # contetn style sim loss
+                    losses['content_style_cosine_loss'] = content_style_sim_loss(
+                        torch.concat((cls_features['content_feat1'], cls_features['content_feat2']), dim=0),
+                        torch.concat((cls_features['style_feat1'], cls_features['style_feat2']), dim=0),
+                    )
+
+                    losses["loss"] = sum(losses.values())
+
+                for key, val in losses.items():
+                    if key not in losses_m:
+                        losses_m[key] = AverageMeter()
+                    losses_m[key].update(val.item(), batch_size)
+
+                loss_log = " ".join(
+                    [
+                        f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
+                        for loss_name, loss_m in losses_m.items()
+                    ]
+                )
+
+                # cumulative_loss += losses * batch_size
+                num_samples += batch_size
+
+                if is_master(args) and (i % 100) == 0:
+                    logging.info(
+                        f"Test Epoch: {epoch} [{num_samples} / {samples_per_val}]\t" + loss_log
+                        # f"Clip Loss: {losses_m['contrastive_loss'].avg:.6f}\t"
+                        # f"Recon Loss: {losses_m['mae_loss'].avg:.6f}\t"
+                    )
+            
+            if logit_bias:
+                logit_bias = logit_bias.cpu()
+
+
+            all_image_features = torch.cat(all_image_features)
+            all_classes = torch.cat(all_classes)
+
+            centers = []
+            for i in range(args.text_num_classes):
+                indices = torch.where(all_classes == i)
+                class_features = all_image_features[indices]
+                center = class_features.median(dim=0)[0]
+
+                centers.append(center)
+
+            centers = torch.stack(centers)
+            centers = torch.nn.functional.normalize(centers, dim=-1)
+
+            val_metrics = get_class_topk(
+                image_features=all_image_features,
+                prototypes=centers,
+                classes=all_classes,
+            )
+
+            metrics.update({
+                **val_metrics, 
+                "style_loss": losses_m['style_loss'].avg, 
+                # "proto_loss": losses_m['proto_loss'].avg, 
+                "content_loss": losses_m['content_loss'].avg, 
+                "self_style_loss": losses_m['self_style_loss'].avg, 
+                # "self_proto_loss": losses_m['self_proto_loss'].avg, 
+                # "mse_loss": losses_m['mse_loss'].avg,
+                # "mae_loss": losses_m['mae_loss'].avg, 
+                "content_style_cosine_loss": losses_m['content_style_cosine_loss'].avg, 
+                "epoch": epoch, "num_samples": num_samples
+            })
+
+    logging.info(
+        f"Test Epoch: {epoch} "
+        + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
+    )
+
+    log_data = {"test/" + name: val for name, val in metrics.items()}
+
+    if tb_writer is not None:
+        for name, val in log_data.items():
+            tb_writer.add_scalar(name, val, epoch)
+
+        with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
+            f.write(json.dumps(metrics))
+            f.write("\n")
+
+    if args.wandb:
+        assert wandb is not None, 'Please install wandb.'
+        log_data['epoch'] = epoch
+        wandb.log(log_data, step=step)
+
+    return metrics
+
        
 
 def main(args):
@@ -977,12 +1105,11 @@ def main(args):
     print("## Load Dataset")
     # train_loader, valid_loader = make_pretrain_dataset(args)
     # train_loader, valid_loader = make_pretrain_dataset02(args)
-    train_loader, valid_loader = make_pretrain_dataset04(args)
+    dataset = make_pretrain_dataset04(args)
 
     print("## Model Create\n")
-    model = CustomVisual3(
+    model = StyleFeatVisual(
         model_name=args.model_name, 
-        decoder_name=args.decoder_name, 
         model_kargs=args.model_kargs,
         feat_head = {"num_classes": args.feat_len},
         init_logit_scale=math.log(10), 
@@ -1125,46 +1252,48 @@ def main(args):
         logging.info(f'Finished loading wandb. run_id: {wandb.run.id}')
 
     
-    total_steps = (train_loader.num_batches // args.accum_freq) * args.epochs
+    total_steps = (dataset['train'].num_batches // args.accum_freq) * args.epochs
 
     warmup_steps = total_steps * args.warmup_ratio if args.warmup_ratio is not None else args.warmup
     scheduler = CosineScheduler(args.lr, args.min_lr, total_steps, warmup_steps)
     clip_scheduler = CosineScheduler(*args.style_weight, total_steps // 2, 0)    # clip_loss weight scheduler
     proto_scheduler = CosineScheduler(*args.proto_weight, total_steps // 2, 0)    # clip_loss weight scheduler
     proto_momentum_scheduler = CosineScheduler(*args.proto_momentum, total_steps, 0)    # relation momentum
-    rel_momentum_scheduler = CosineScheduler(*args.relation_momentum, total_steps, 0)    # relation momentum
     batch_sampler_scheduler = StepGenerator(total_steps, args.BS_update_freq, args.BS_update_shape, args.BS_update_start)
-    sample_manager = SampleManager(len(train_loader.dataset), 0.7)
+    sample_manager = SampleManager(len(dataset['train'].dataset), 0.7)
     logging.info(f"## Using CosineScheduler \nwarmup steps: {warmup_steps} \ntotal steps: {total_steps}\n")
     logging.info(f"## batch_sampler_scheduler \nstep_list: {batch_sampler_scheduler.step_list[:10]} ... {batch_sampler_scheduler.step_list[-10:]}\n")
 
     # args.step = 0
     for epoch in range(start_epoch, args.epochs):
-        if args.loss_weight_start_epoch <= epoch:
-            if not clip_loss.loss_weight_on:
-                logging.info("The False Negative loss reduction feature for clip_loss and proto_loss has been enabled.")
-            clip_loss.loss_weight_on = True
-            proto_loss.loss_weight_on = True
-        
         if args.proto_ema_threshold_start_epoch <= epoch:
             if not proto_loss.ema_threshold_on:
                 logging.info("The proto_loss_ema_threshold feature is turned on.")
             proto_loss.ema_threshold_on = True
 
         train_one_epoch(
-            model, device, train_loader, 
+            model, device, dataset['train'], 
             clip_loss, proto_loss, feat_loss, self_clip_loss, self_proto_loss,
             epoch, optimizer, scaler, scheduler, clip_scheduler, 
-            proto_scheduler, proto_momentum_scheduler, rel_momentum_scheduler, batch_sampler_scheduler,
+            proto_scheduler, proto_momentum_scheduler, batch_sampler_scheduler,
             writer, sample_manager, args
         )
 
         completed_epoch = epoch + 1
         # args.step += 1
-        metrics = evaluate(
-            model, device, valid_loader, 
-            clip_loss, proto_loss, feat_loss, self_clip_loss, self_proto_loss,
-            completed_epoch, writer, args.step, args
+
+        if args.valid:
+            metrics = evaluate(
+                model, device, dataset['valid'], 
+                clip_loss, proto_loss, feat_loss, self_clip_loss, self_proto_loss,
+                completed_epoch, writer, args.step, args
+            )
+
+        if args.test:
+            metrics = test_evaluate(
+                model, device, dataset['test'], 
+                clip_loss, proto_loss, self_clip_loss, self_proto_loss,
+                completed_epoch, writer, args.step, args
             )
 
         checkpoint_dict = {

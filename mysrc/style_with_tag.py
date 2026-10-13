@@ -24,7 +24,7 @@ from mysrc.utils.optim_utils import make_mae_param_groups
 from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, RelationPrototypeContrastiveLoss, RelationSigLipLoss2, BCELoss, similarity_mse_loss, content_style_sim_loss
 from mysrc.utils.scheduler import CosineScheduler, StepGenerator
 from mysrc.utils.precision import get_autocast, get_input_dtype
-from mysrc.model import CustomVisual2
+from mysrc.model import StyleTagVisual
 from mysrc.utils.file_utils import pt_load
 from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics, get_class_topk, get_tag_metrics
 
@@ -771,7 +771,7 @@ def main(args):
     train_loader, valid_loader = make_pretrain_tag_dataset(args)
 
     print("## Model Create\n")
-    model = CustomVisual2(
+    model = StyleTagVisual(
         model_name=args.model_name, 
         model_kargs=args.model_kargs,
         content_head={"num_classes": args.tag_num_classes},

@@ -21,10 +21,10 @@ from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset, make_pretrain_dataset02, make_pretrain_dataset03
 from mysrc.utils.optim_utils import make_mae_param_groups
-from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, mae_loss, PrototypeContrastiveLoss, RelationPrototypeContrastiveLoss, RelationSigLipLoss, uniform_loss, similarity_mse_loss, content_style_sim_loss
+from mysrc.utils.loss import SigLipLoss, CosineSimilarityLoss, RelationPrototypeContrastiveLoss, RelationSigLipLoss, uniform_loss, similarity_mse_loss, content_style_sim_loss
 from mysrc.utils.scheduler import CosineScheduler, StepGenerator
 from mysrc.utils.precision import get_autocast, get_input_dtype
-from mysrc.model import CustomMaeVisual
+from mysrc.model import StyleMaeVisual
 from mysrc.utils.file_utils import pt_load
 from mysrc.utils.metrics import get_embed_metrics, get_proto_metrics, get_class_topk
 
@@ -845,7 +845,7 @@ def main(args):
     train_loader, valid_loader = make_pretrain_dataset03(args)
 
     print("## Model Create\n")
-    model = CustomMaeVisual(
+    model = StyleMaeVisual(
         model_name=args.model_name, 
         decoder_name=args.decoder_name, 
         model_kargs=args.model_kargs,
