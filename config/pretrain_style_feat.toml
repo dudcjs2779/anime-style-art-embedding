@@ -1,9 +1,9 @@
 [model]
-model_name = 'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k' # eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_224.mim_in22k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+model_name = 'eva02_tiny_patch14_224.mim_in22k' # eva02_tiny_patch14_224.mim_in22k, eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_224.mim_in22k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
 precision = 'amp'  # amp, float16
 # resume = 'pretrain_log/26-10-12_12-22-04_eva02_base_patch14_448.mim_in22k_ft_in22k/checkpoint/epoch_5.pt'
 # pretrain = 'pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/checkpoint/epoch_29.pt' # pretrain/my_eva_decoder_512.pt
-pretrain = 'pretrain/tag_pretrain.pt' # pretrain/my_eva_decoder_512.pt
+# pretrain = 'pretrain/tag_pretrain.pt' # pretrain/my_eva_decoder_512.pt
 save_frequency = 1
 max_save_count = 10
 
@@ -14,12 +14,13 @@ drop_path_rate = 0.1
 horovod = false
 
 [train]
+device = 'cpu'
 seed = 42
 epochs = 15
-batch_size = 6
+batch_size = 3
 accum_freq = 1
 grad_clip_norm = 1.0
-topk_rate = 0.3
+topk_rate = 1.0
 
 [validation]
 valid_batch_size = 16
@@ -57,10 +58,10 @@ relation = 'datasets/pretrain01_640/class_similarity_weight_list.yaml'
 feat_label = 'datasets/pretrain01_640/style_featrue_group2.yaml'
 feat_class_weight_path = 'datasets/pretrain01_640/weight/feat_class_weights02.npy'
 feat_pos_weight_path = 'datasets/pretrain01_640/weight/feat_pos_weights02.npy'
-workers = 8
+workers = 4
 
 [dataset]
-image_size = [448, 448]
+image_size = [224, 224]
 patch_size = 14
 train_aug = "bbox_crop_pretrain"    # pretrain_global_loacl, bbox_crop_pretrain
 valid_aug = "simple_center_crop"
@@ -68,7 +69,7 @@ prototype_path = "pretrain_log/26-09-19_02-33-02_eva02_base_patch14_448.mim_in22
 
 [sampler]
 # num_postive = [2, 3]
-hard_num = [1, 2]
+hard_num = [1, 1]
 same_num = [1, 1]
 
 [logger]

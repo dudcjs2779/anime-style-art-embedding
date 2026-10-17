@@ -13,10 +13,14 @@ import copy
 import wandb
 
 import torch.utils.tensorboard as tensorboard
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-from open_clip_train.distributed import is_master, init_distributed_device
-from open_clip_train.logger import setup_logging
+# from open_clip_train.distributed import is_master, init_distributed_device
+# from open_clip_train.logger import setup_logging
 
+from mysrc.utils.distributed import is_master
+from mysrc.utils.logger import setup_logging
 from mysrc.utils.pretrain_params import setup_parser
 from mysrc.utils.config import read_config
 from mysrc.utils.dataset import make_pretrain_dataset04
@@ -52,52 +56,63 @@ class SampleManager:
     def __init__(self, n_samples, momentum=0.9):
         self.loss = torch.zeros(n_samples)
         self.count = torch.zeros(n_samples)
-
-        self.seen = torch.zeros(
-            n_samples,
-            dtype=torch.bool
-        )
-
+        self.seen = torch.zeros(n_samples, dtype=torch.bool)
+        self.pending_sum = torch.zeros(n_samples)
+        self.pending_count = torch.zeros(n_samples)
         self.momentum = momentum
         self.total_count = 0
 
     @torch.no_grad()
     def update(self, indices, loss):
-        indices = indices.cpu()
-        new = loss.detach().cpu()
+        indices = indices.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+        values = loss.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+        if indices.numel() != values.numel():
+            raise ValueError("sample indices and losses must have the same length")
+        self.pending_sum.index_add_(0, indices, values)
+        self.pending_count.index_add_(0, indices, torch.ones_like(values))
 
-        old = self.loss[indices]
-        first = ~self.seen[indices]
+    @torch.no_grad()
+    def _synchronize_pending(self):
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            device = torch.device("cpu")
+            if dist.get_backend() == "nccl":
+                device = torch.device("cuda", torch.cuda.current_device())
+            pending_sum = self.pending_sum.to(device=device)
+            pending_count = self.pending_count.to(device=device)
+            dist.all_reduce(pending_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(pending_count, op=dist.ReduceOp.SUM)
+            self.pending_sum.copy_(pending_sum.cpu())
+            self.pending_count.copy_(pending_count.cpu())
 
-        self.loss[indices] = torch.where(
-            first,
-            new,
-            self.momentum * old
-            + (1 - self.momentum) * new
-        )
+        observed = self.pending_count > 0
+        if observed.any():
+            new = self.pending_sum[observed] / self.pending_count[observed]
+            first = ~self.seen[observed]
+            old = self.loss[observed]
+            self.loss[observed] = torch.where(
+                first,
+                new,
+                self.momentum * old + (1 - self.momentum) * new,
+            )
+            self.count[observed] += self.pending_count[observed]
+            self.seen[observed] = True
+            self.total_count += int(self.pending_count.sum().item())
 
-        self.count[indices] += 1
-        self.seen[indices] = True
-
-        self.total_count += len(indices)
+        self.pending_sum.zero_()
+        self.pending_count.zero_()
 
     @torch.no_grad()
     def get_score(self, alpha=0.9):
+        # All ranks call this at the epoch boundary; synchronize observations
+        # before computing the score vector used by the global batch sampler.
+        self._synchronize_pending()
         mean_count = self.total_count / len(self.loss)
-
         hardness = self.loss
-
         exploration = (
             np.sqrt(mean_count + 1)
             / (self.count + 1).sqrt()
         )
-
-        score = (
-            alpha * hardness
-            + (1 - alpha) * exploration
-        )
-
-        return score
+        return alpha * hardness + (1 - alpha) * exploration
 
 
 def random_seed(seed=42, rank=0):
@@ -201,7 +216,10 @@ def train_one_epoch(
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
-        
+
+    # if args.local_rank == 0:
+    #     breakpoint()
+
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
@@ -237,6 +255,9 @@ def train_one_epoch(
         # dataloader.batch_sampler.all_classes[-1]
         # dataloader.batch_sampler.sample_diff_weights
 
+        self_prototypes = model.module.self_prototypes if args.distributed else model.self_prototypes
+        prototypes = model.module.prototypes if args.distributed else model.prototypes
+
         bsz = len(images) // 2
 
         data_time_m.update(time.time() - end)
@@ -262,6 +283,7 @@ def train_one_epoch(
                 logit_bias = model_out.get("logit_bias", None)
 
                 losses = {}
+
                 losses['self_style_loss'] = self_clip_loss(
                     cls_features['self_style_feat1'], cls_features['self_style_feat2'], 
                     logit_scale, logit_bias, 
@@ -271,7 +293,7 @@ def train_one_epoch(
                 )
 
                 losses['self_proto_loss'] = self_proto_loss(
-                    cls_features['self_style_feat1'], model.self_prototypes,
+                    cls_features['self_style_feat1'], self_prototypes,
                     logit_scale, logit_bias,
                     classes,
                     not_fars=not_fars,
@@ -282,15 +304,15 @@ def train_one_epoch(
                 ) * 0.5
 
                 losses['self_proto_loss'] +=  self_proto_loss(
-                    cls_features['self_style_feat2'], model.self_prototypes,
+                    cls_features['self_style_feat2'], self_prototypes,
                     logit_scale, logit_bias,
                     classes,
                     not_fars=not_fars,
                     index=index,
                     sample_manager=sample_manager,
+                    sample_manager_update=False,
                     train=True,
                 ) * 0.5
-
 
                 losses['style_loss'] = clip_loss(
                     cls_features['style_feat1'], cls_features['style_feat2'], 
@@ -302,7 +324,7 @@ def train_one_epoch(
 
                 # proto_loss를 따로 계산하는 이유는 accum 사용시 꼬일 수 있기 때문에 일관성을 유지하기 위함
                 losses['proto_loss'] = proto_loss(
-                    cls_features['style_feat1'], model.prototypes,
+                    cls_features['style_feat1'], prototypes,
                     logit_scale, logit_bias,
                     classes,
                     hards=hards, centers=centers, not_fars=not_fars,
@@ -311,7 +333,7 @@ def train_one_epoch(
                 ) * 0.5
 
                 losses['proto_loss'] +=  proto_loss(
-                    cls_features['style_feat2'], model.prototypes,
+                    cls_features['style_feat2'], prototypes,
                     logit_scale, logit_bias, 
                     classes,
                     hards=hards, centers=centers, not_fars=not_fars,
@@ -359,9 +381,15 @@ def train_one_epoch(
                     + losses['self_proto_loss'] * proto_scheduler[step] 
                     # + losses['mse_loss'] * 1.0 
                     # + losses['mae_loss'] * 0.5
+
                 )
 
             backward(losses["loss"], scaler)
+
+            if args.world_size > 1:
+                for key in losses.keys():
+                    dist.all_reduce(losses[key], op=dist.ReduceOp.SUM)
+                    losses[key] /= args.world_size
 
         else:
             # First, cache the features without any gradient tracking.
@@ -450,7 +478,7 @@ def train_one_epoch(
                     )
 
                     losses['self_proto_loss'] = self_proto_loss(
-                        inputs['self_style_feat1'], model.self_prototypes,
+                        inputs['self_style_feat1'], self_prototypes,
                         logit_scale, logit_bias,
                         accum_classes,
                         not_fars=accum_not_fars,
@@ -461,7 +489,7 @@ def train_one_epoch(
                     ) * 0.5
 
                     losses['self_proto_loss'] +=  self_proto_loss(
-                        inputs['self_style_feat2'], model.self_prototypes,
+                        inputs['self_style_feat2'], self_prototypes,
                         logit_scale, logit_bias,
                         accum_classes,
                         not_fars=accum_not_fars,
@@ -480,7 +508,7 @@ def train_one_epoch(
                     )
 
                     losses['proto_loss'] = proto_loss(
-                        inputs['style_feat1'], model.prototypes,
+                        inputs['style_feat1'], prototypes,
                         logit_scale, logit_bias,
                         accum_classes,
                         not_fars=accum_not_fars,
@@ -491,7 +519,7 @@ def train_one_epoch(
                     ) * 0.5
 
                     losses['proto_loss'] +=  proto_loss(
-                        inputs['style_feat2'], model.prototypes,
+                        inputs['style_feat2'], prototypes,
                         logit_scale, logit_bias,
                         accum_classes,
                         not_fars=accum_not_fars,
@@ -522,7 +550,7 @@ def train_one_epoch(
                     # losses['mse_loss'] = similarity_mse_loss(
                     #     torch.cat((cls_features['style_feat1'], cls_features['style_feat2']), dim=0),
                     #     torch.cat((classes, classes), dim=0).long(),
-                    #     model.prototypes, args.rel_real
+                    #     prototypes, args.rel_real
                     # ) / args.accum_freq
 
                     del inputs
@@ -698,6 +726,9 @@ def evaluate(
                 none_mask_indices = none_mask_indices.to(device=device, non_blocking=True)
                 mask_samples = mask_samples.to(device=device, non_blocking=True)
 
+                self_prototypes = model.module.self_prototypes if args.distributed else model.self_prototypes
+                prototypes = model.module.prototypes if args.distributed else model.prototypes
+
                 batch_size = images.shape[0] // 2
                 with autocast():
                     model_out = model.evaluate(
@@ -733,13 +764,13 @@ def evaluate(
                     )
 
                     losses['self_proto_loss'] = self_proto_loss(
-                        cls_features['self_style_feat1'], model.self_prototypes,
+                        cls_features['self_style_feat1'], self_prototypes,
                         logit_scale, logit_bias,
                         classes,
                     ) * 0.5
 
                     losses['self_proto_loss'] +=  self_proto_loss(
-                        cls_features['self_style_feat2'], model.self_prototypes,
+                        cls_features['self_style_feat2'], self_prototypes,
                         logit_scale, logit_bias,
                         classes,
                     ) * 0.5
@@ -752,13 +783,13 @@ def evaluate(
                         output_dict=False
                     )
                     losses['proto_loss'] = proto_loss(
-                        cls_features['style_feat1'], model.prototypes,
+                        cls_features['style_feat1'], prototypes,
                         logit_scale, logit_bias,
                         classes, 
                     ) * 0.5
 
                     losses['proto_loss'] +=  proto_loss(
-                        cls_features['style_feat2'], model.prototypes,
+                        cls_features['style_feat2'], prototypes,
                         logit_scale, logit_bias,
                         classes,
                     ) * 0.5
@@ -779,20 +810,24 @@ def evaluate(
 
                     losses["loss"] = sum(losses.values())
 
-                for key, val in losses.items():
-                    if key not in losses_m:
-                        losses_m[key] = AverageMeter()
-                    losses_m[key].update(val.item(), batch_size)
+                if args.world_size > 1:
+                    for key in losses.keys():
+                        dist.all_reduce(losses[key], op=dist.ReduceOp.SUM)
+                        losses[key] /= args.world_size
 
-                loss_log = " ".join(
-                    [
-                        f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
-                        for loss_name, loss_m in losses_m.items()
-                    ]
-                )
+                if is_master(args):
+                    for key, val in losses.items():
+                        if key not in losses_m:
+                            losses_m[key] = AverageMeter()
+                        losses_m[key].update(val.item(), batch_size)
 
-                # cumulative_loss += losses * batch_size
-                num_samples += batch_size
+                    loss_log = " ".join(
+                        [
+                            f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
+                            for loss_name, loss_m in losses_m.items()
+                        ]
+                    )
+                    num_samples += batch_size * args.world_size
 
                 if is_master(args) and (i % 100) == 0:
                     logging.info(
@@ -800,64 +835,62 @@ def evaluate(
                         # f"Clip Loss: {losses_m['contrastive_loss'].avg:.6f}\t"
                         # f"Recon Loss: {losses_m['mae_loss'].avg:.6f}\t"
                     )
-            
-            if logit_bias:
-                logit_bias = logit_bias.cpu()
 
-            # val_metrics = get_embed_metrics(
-            #     image_features=torch.cat(all_image_features),
-            #     classes=torch.cat(all_classes),
-            # )
+            all_image_features = torch.cat(all_image_features)
+            all_classes = torch.cat(all_classes)
+                    
+            if is_master(args):
+                if args.world_size > 1:
+                    gathered = [torch.empty_like(all_image_features) for _ in range(args.world_size)]
+                    dist.all_gather(gathered, all_image_features)
+                    all_image_features = torch.cat(gathered, dim=0)
 
-            # val_metrics = get_proto_metrics(
-            #     image_features=torch.cat(all_image_features),
-            #     prototypes=model.prototypes.cpu(),
-            #     classes=torch.cat(all_classes),
-            # )
+                    gathered = [torch.empty_like(all_classes) for _ in range(args.world_size)]
+                    dist.all_gather(gathered, all_classes)
+                    all_classes = torch.cat(gathered, dim=0)
 
-            val_metrics = get_class_topk(
-                image_features=torch.cat(all_image_features),
-                prototypes=model.prototypes.cpu(),
-                classes=torch.cat(all_classes),
-                rel_real=args.rel_real,
-            )
+                val_metrics = get_class_topk(
+                    image_features=all_image_features,
+                    prototypes=prototypes.cpu(),
+                    classes=all_classes,
+                    rel_real=args.rel_real,
+                )
 
-            val_metrics.update(
-                get_sfg_metrics(torch.cat(all_sfg_features), torch.cat(all_sfg_labels), threshold=0.4)
-            )
+                val_metrics.update(
+                    get_sfg_metrics(torch.cat(all_sfg_features), torch.cat(all_sfg_labels), threshold=0.4)
+                )
 
-            metrics.update({
-                **val_metrics, 
-                "style_loss": losses_m['style_loss'].avg, 
-                "proto_loss": losses_m['proto_loss'].avg, 
-                "content_loss": losses_m['content_loss'].avg, 
-                "self_style_loss": losses_m['self_style_loss'].avg, 
-                "self_proto_loss": losses_m['self_proto_loss'].avg, 
-                # "mse_loss": losses_m['mse_loss'].avg,
-                # "mae_loss": losses_m['mae_loss'].avg, 
-                "content_style_cosine_loss": losses_m['content_style_cosine_loss'].avg, 
-                "epoch": epoch, "num_samples": num_samples
-            })
+                metrics.update({
+                    **val_metrics, 
+                    "style_loss": losses_m['style_loss'].avg, 
+                    "proto_loss": losses_m['proto_loss'].avg, 
+                    "content_loss": losses_m['content_loss'].avg, 
+                    "self_style_loss": losses_m['self_style_loss'].avg, 
+                    "self_proto_loss": losses_m['self_proto_loss'].avg, 
+                    "content_style_cosine_loss": losses_m['content_style_cosine_loss'].avg, 
+                    "epoch": epoch, "num_samples": num_samples
+                })
 
-    logging.info(
-        f"Eval Epoch: {epoch} "
-        + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
-    )
+    if is_master(args):
+        logging.info(
+            f"Eval Epoch: {epoch} "
+            + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
+        )
 
-    log_data = {"val/" + name: val for name, val in metrics.items()}
+        log_data = {"val/" + name: val for name, val in metrics.items()}
 
-    if tb_writer is not None:
-        for name, val in log_data.items():
-            tb_writer.add_scalar(name, val, epoch)
+        if tb_writer is not None:
+            for name, val in log_data.items():
+                tb_writer.add_scalar(name, val, epoch)
 
-        with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
-            f.write(json.dumps(metrics))
-            f.write("\n")
+            with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
+                f.write(json.dumps(metrics))
+                f.write("\n")
 
-    if args.wandb:
-        assert wandb is not None, 'Please install wandb.'
-        log_data['epoch'] = epoch
-        wandb.log(log_data, step=step)
+        if args.wandb:
+            assert wandb is not None, 'Please install wandb.'
+            log_data['epoch'] = epoch
+            wandb.log(log_data, step=step)
 
     return metrics
 
@@ -922,13 +955,13 @@ def test_evaluate(
                     )
 
                     # losses['self_proto_loss'] = self_proto_loss(
-                    #     cls_features['self_style_feat1'], model.self_prototypes,
+                    #     cls_features['self_style_feat1'], self_prototypes,
                     #     logit_scale, logit_bias,
                     #     classes,
                     # ) * 0.5
 
                     # losses['self_proto_loss'] +=  self_proto_loss(
-                    #     cls_features['self_style_feat2'], model.self_prototypes,
+                    #     cls_features['self_style_feat2'], self_prototypes,
                     #     logit_scale, logit_bias,
                     #     classes,
                     # ) * 0.5
@@ -941,13 +974,13 @@ def test_evaluate(
                         output_dict=False
                     )
                     # losses['proto_loss'] = proto_loss(
-                    #     cls_features['style_feat1'], model.prototypes,
+                    #     cls_features['style_feat1'], prototypes,
                     #     logit_scale, logit_bias,
                     #     classes, 
                     # ) * 0.5
 
                     # losses['proto_loss'] +=  proto_loss(
-                    #     cls_features['style_feat2'], model.prototypes,
+                    #     cls_features['style_feat2'], prototypes,
                     #     logit_scale, logit_bias,
                     #     classes,
                     # ) * 0.5
@@ -966,20 +999,27 @@ def test_evaluate(
 
                     losses["loss"] = sum(losses.values())
 
-                for key, val in losses.items():
-                    if key not in losses_m:
-                        losses_m[key] = AverageMeter()
-                    losses_m[key].update(val.item(), batch_size)
+                if args.world_size > 1:
+                    for key in losses.keys():
+                        dist.all_reduce(losses[key], op=dist.ReduceOp.SUM)
+                        losses[key] /= args.world_size
+                        
+                if is_master(args):
 
-                loss_log = " ".join(
-                    [
-                        f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
-                        for loss_name, loss_m in losses_m.items()
-                    ]
-                )
+                    for key, val in losses.items():
+                        if key not in losses_m:
+                            losses_m[key] = AverageMeter()
+                        losses_m[key].update(val.item(), batch_size)
+
+                    loss_log = " ".join(
+                        [
+                            f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})" 
+                            for loss_name, loss_m in losses_m.items()
+                        ]
+                    )
 
                 # cumulative_loss += losses * batch_size
-                num_samples += batch_size
+                num_samples += batch_size * args.world_size
 
                 if is_master(args) and (i % 100) == 0:
                     logging.info(
@@ -988,68 +1028,95 @@ def test_evaluate(
                         # f"Recon Loss: {losses_m['mae_loss'].avg:.6f}\t"
                     )
             
-            if logit_bias:
-                logit_bias = logit_bias.cpu()
-
-
             all_image_features = torch.cat(all_image_features)
             all_classes = torch.cat(all_classes)
 
-            centers = []
-            for i in range(args.text_num_classes):
-                indices = torch.where(all_classes == i)
-                class_features = all_image_features[indices]
-                center = class_features.median(dim=0)[0]
+            if is_master(args) and args.world_size > 1:
+                gathered = [torch.empty_like(all_image_features) for _ in range(args.world_size)]
+                dist.all_gather(gathered, all_image_features)
+                all_image_features = torch.cat(gathered, dim=0)
 
-                centers.append(center)
+                gathered = [torch.empty_like(all_classes) for _ in range(args.world_size)]
+                dist.all_gather(gathered, all_classes)
+                all_classes = torch.cat(gathered, dim=0)
 
-            centers = torch.stack(centers)
-            centers = torch.nn.functional.normalize(centers, dim=-1)
+            if is_master(args):
+                centers = []
+                for i in range(args.text_num_classes):
+                    indices = torch.where(all_classes == i)
+                    class_features = all_image_features[indices]
+                    center = class_features.median(dim=0)[0]
 
-            val_metrics = get_class_topk(
-                image_features=all_image_features,
-                prototypes=centers,
-                classes=all_classes,
-            )
+                    centers.append(center)
 
-            metrics.update({
-                **val_metrics, 
-                "style_loss": losses_m['style_loss'].avg, 
-                # "proto_loss": losses_m['proto_loss'].avg, 
-                "content_loss": losses_m['content_loss'].avg, 
-                "self_style_loss": losses_m['self_style_loss'].avg, 
-                # "self_proto_loss": losses_m['self_proto_loss'].avg, 
-                # "mse_loss": losses_m['mse_loss'].avg,
-                # "mae_loss": losses_m['mae_loss'].avg, 
-                "content_style_cosine_loss": losses_m['content_style_cosine_loss'].avg, 
-                "epoch": epoch, "num_samples": num_samples
-            })
+                centers = torch.stack(centers)
+                centers = torch.nn.functional.normalize(centers, dim=-1)
 
-    logging.info(
-        f"Test Epoch: {epoch} "
-        + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
-    )
+                val_metrics = get_class_topk(
+                    image_features=all_image_features,
+                    prototypes=centers,
+                    classes=all_classes,
+                )
 
-    log_data = {"test/" + name: val for name, val in metrics.items()}
+                metrics.update({
+                    **val_metrics, 
+                    "style_loss": losses_m['style_loss'].avg, 
+                    # "proto_loss": losses_m['proto_loss'].avg, 
+                    "content_loss": losses_m['content_loss'].avg, 
+                    "self_style_loss": losses_m['self_style_loss'].avg, 
+                    # "self_proto_loss": losses_m['self_proto_loss'].avg, 
+                    "content_style_cosine_loss": losses_m['content_style_cosine_loss'].avg, 
+                    "epoch": epoch, "num_samples": num_samples
+                })
 
-    if tb_writer is not None:
-        for name, val in log_data.items():
-            tb_writer.add_scalar(name, val, epoch)
+    if is_master(args):
+        logging.info(
+            f"Test Epoch: {epoch} "
+            + "\t".join([f"{k}: {round(v, 4):.6f}" for k, v in metrics.items()])
+        )
 
-        with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
-            f.write(json.dumps(metrics))
-            f.write("\n")
+        log_data = {"test/" + name: val for name, val in metrics.items()}
 
-    if args.wandb:
-        assert wandb is not None, 'Please install wandb.'
-        log_data['epoch'] = epoch
-        wandb.log(log_data, step=step)
+        if tb_writer is not None:
+            for name, val in log_data.items():
+                tb_writer.add_scalar(name, val, epoch)
+
+            with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
+                f.write(json.dumps(metrics))
+                f.write("\n")
+
+        if args.wandb:
+            assert wandb is not None, 'Please install wandb.'
+            log_data['epoch'] = epoch
+            wandb.log(log_data, step=step)
 
     return metrics
 
        
 
 def main(args):
+    if "RANK" in os.environ:
+        args.distributed = True
+        args.rank = int(os.environ["RANK"])
+        args.local_rank = int(os.environ["LOCAL_RANK"])
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        assert args.world_size > 1 and args.accum_freq == 1, ("Not implemented accum with distributed training!")
+    else:
+        args.distributed = False
+
+        # print("rank_test: ", args.rank, args.local_rank, args.world_size)
+
+    if args.device == "cpu":
+        backend = "gloo"
+        device = torch.device("cpu")
+    else:
+        backend = "nccl"
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+
+    if args.distributed:
+        dist.init_process_group(backend=backend)
+
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
         # float16 and almost as accurate as float32
@@ -1058,7 +1125,7 @@ def main(args):
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
 
-    device = init_distributed_device(args)
+    # device = init_distributed_device(args)
 
     t_now = datetime.now().strftime('%y-%m-%d_%H-%M-%S')
     args.logs = "./pretrain_log"
@@ -1069,8 +1136,9 @@ def main(args):
     args.config_path = os.path.join(args.output_path, os.path.basename(args.config))
     if args.config: shutil.copy(args.config, args.config_path)
 
+    args.log_path = None
     if is_master(args, local=args.log_local):
-        log_filename = f'out-{args.rank}' if args.log_local else 'out.log'
+        log_filename = f'out-{args.local_rank}' if args.log_local else 'out.log'
         args.log_path = os.path.join(args.output_path, log_filename)
         if os.path.exists(args.log_path):
             print(
@@ -1140,7 +1208,7 @@ def main(args):
     if args.opt_name == "adamw8bit":
         from bitsandbytes.optim import AdamW8bit
         optimizer = AdamW8bit(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16 학습을 위함
-
+        
     elif args.opt_name == "adamw":
         from torch.optim import AdamW
         optimizer = AdamW(params_group, lr=args.lr, weight_decay=args.wd, betas=(args.beta1, args.beta2), eps=1e-08)    # float16으로 학습하지 말것! 모델이 nan을 출력함.
@@ -1151,7 +1219,6 @@ def main(args):
         rel_real=args.rel_real,
         rank=args.rank,
         world_size=args.world_size,
-        dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
         device=device,
     )
 
@@ -1163,7 +1230,6 @@ def main(args):
         topk_rate=args.topk_rate,
         rank=args.rank,
         world_size=args.world_size,
-        dist_impl=args.loss_dist_impl,
         device=device,
     )
 
@@ -1176,7 +1242,6 @@ def main(args):
     self_clip_loss = RelationSigLipLoss(
         rank=args.rank,
         world_size=args.world_size,
-        dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
         device=device,
     )
 
@@ -1186,7 +1251,6 @@ def main(args):
         topk_rate=args.topk_rate,
         rank=args.rank,
         world_size=args.world_size,
-        dist_impl=args.loss_dist_impl,
         device=device,
     )
 
@@ -1226,6 +1290,15 @@ def main(args):
         logging.info(f"Resume checkpoint is loaded successfully")
         logging.info(f"Training begins at epoch {start_epoch}.")
 
+    if args.distributed:
+        if device.type == "cuda":
+            model = DDP(
+                model,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+            )
+        else:
+            model = DDP(model)
 
     if args.tensorboard:
         assert tensorboard is not None, "Please install tensorboard."
@@ -1340,4 +1413,5 @@ if __name__ == "__main__":
     parser = setup_parser()
     args = parser.parse_args()
     args = read_config(args, parser)
+
     main(args)

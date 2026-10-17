@@ -1,9 +1,11 @@
 from typing import Optional
 import torch
 import torch.nn as nn
-
+import torch.distributed as dist
+from torch.autograd import Function
 from torch.nn import functional as F
 from mysrc.utils import function
+import debugpy
 
 try:
     import torch.distributed.nn
@@ -101,6 +103,76 @@ def neighbour_exchange_bidir_with_grad(left_rank, right_rank, tensor_to_left, te
     return NeighbourExchangeBidir.apply(left_rank, right_rank, group, tensor_to_left, tensor_to_right)
 
 
+class RingSwap(Function):
+    @staticmethod
+    def forward(ctx, x):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        ctx.rank = rank
+        ctx.world_size = world_size
+
+        # x를 다음 rank로 보내고,
+        # 이전 rank의 임베딩을 받습니다.
+        send_to = (rank + 1) % world_size
+        recv_from = (rank - 1 + world_size) % world_size
+
+        x = x.contiguous()
+        received = torch.empty_like(x)
+
+        ops = [
+            dist.P2POp(dist.irecv, received, recv_from),
+            dist.P2POp(dist.isend, x, send_to),
+        ]
+
+        for req in dist.batch_isend_irecv(ops):
+            req.wait()
+
+        return received
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rank = ctx.rank
+        world_size = ctx.world_size
+
+        # forward에서 x를 받은 rank가 보낸 gradient를
+        # 원래 x를 소유한 rank로 돌려보냅니다.
+        send_to = (rank - 1 + world_size) % world_size
+        recv_from = (rank + 1) % world_size
+
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(grad_output)
+
+        ops = [
+            dist.P2POp(
+                dist.irecv, grad_input, recv_from
+            ),
+            dist.P2POp(
+                dist.isend, grad_output, send_to
+            ),
+        ]
+
+        for req in dist.batch_isend_irecv(ops):
+            req.wait()
+
+        return grad_input
+
+
+def ring_swap_text(text_embeds):
+    return RingSwap.apply(text_embeds)
+
+
+def ddp_global_mean_from_local_sum(local_sum, local_count, world_size):
+    """Scale a local sum so DDP's gradient average equals the global mean."""
+    if world_size > 1:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("world_size > 1 requires an initialized process group")
+        global_count = local_count.detach().clone()
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+        return local_sum * (world_size / global_count.clamp_min(1))
+    return local_sum / local_count.clamp_min(1)
+
+
 class SimilarityStatisticsEMA:
     def __init__(self, momentum, num_classes, device):
         self.momentum = momentum
@@ -132,59 +204,56 @@ class SimilarityStatisticsEMA:
 class RelationSigLipLoss(nn.Module):
     def __init__(
             self, rel_matrix=None, rel_real=None,
-            cache_labels: bool = False,
             rank: int = 0,
             world_size: int = 1,
-            dist_impl: Optional[str] = None,
             device=None,
     ):
         super().__init__()
-        self.cache_labels = cache_labels
         self.rank = rank
         self.world_size = world_size
-        self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
-        assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
 
-        # cache state FIXME cache not currently used, worthwhile?
         self.prev_num_logits = 0
         self.labels = {}
         self.rel_matrix = rel_matrix.to(device=device, dtype=torch.float32) if rel_matrix is not None else None
         self.rel_real = rel_real.to(device=device, dtype=torch.float32) if rel_real is not None else None
         self.gt_mask = self.rel_real != 0 if rel_real is not None else None
+        self.swap_step = 0
 
     def get_ground_truth(
-        self, device, dtype, num_logits, classes,
+        self, device, dtype, num_logits, classes1, classes2
     ) -> torch.Tensor:
-        if self.rel_matrix is not None and classes is not None:
-            labels = self.rel_matrix[classes][:, classes]
+        if self.rel_matrix is not None and classes1 is not None:
+            labels = self.rel_matrix[classes1][:, classes2]
 
-        elif classes is not None:
-            labels = classes[:, None] == classes[None, :]
+        elif classes1 is not None:
+            labels = classes1[:, None] == classes2[None, :]
 
         else:
-            labels = torch.eye(num_logits, dtype=dtype, device=device)
-        
+            if self.swap_step == 0:
+                labels = torch.eye(num_logits, dtype=dtype, device=device)
+            else:
+                labels = torch.zeros((num_logits, num_logits), dtype=dtype, device=device)
+    
         labels = labels.to(device=device, dtype=dtype)
 
         return labels
 
-    def get_logits(self, image_features1, image_features2, classes=None):
+    def get_logits(self, image_features1, image_features2):
         logits = image_features1 @ image_features2.T
 
         return logits
     
-    def not_fars_masking(self, labels, logits, classes, not_fars, low, high):
+    def not_fars_masking(self, labels, logits, classes1, classes2, not_fars1, not_fars2, low, high):
         weight_mask = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
 
-        if not_fars is not None and not_fars.any():
-            same_class = classes[:, None] == classes[None, :]
+        if not_fars1 is not None and (not_fars1.any() or not_fars2.any()):
+            same_class = classes1[:, None] == classes2[None, :]
 
-            pair_not_far = not_fars[:, None] | not_fars[None, :]    # 본인 클래스 외 not_fars와 연관되어 있는 데이터 학습 X
-            both_not_far = not_fars[:, None] & not_fars[None, :]    # 둘다 not_fars 데이터인 경우 학습 X
+            pair_not_far = not_fars1[:, None] | not_fars2[None, :]    # 본인 클래스 외 not_fars와 연관되어 있는 데이터 학습 X
+            both_not_far = not_fars1[:, None] & not_fars2[None, :]    # 둘다 not_fars 데이터인 경우 학습 X
 
             # 정확히 하나만 not_far + 같은 클래스
             valid = same_class & pair_not_far & ~both_not_far
-
 
             # not_far 관련 학습 제외 조건
             invalid = (
@@ -204,135 +273,80 @@ class RelationSigLipLoss(nn.Module):
     def _loss(
             self, image_features1, image_features2, 
             logit_scale, logit_bias=None, 
-            classes=None,
-            not_fars=None,
+            classes1=None, classes2=None,
+            not_fars1=None, not_fars2=None,
         ):
-        logits = self.get_logits(image_features1, image_features2, classes)
+        logits = self.get_logits(image_features1, image_features2)
         labels = self.get_ground_truth(
             image_features1.device,
-            image_features1.dtype,
+            torch.float32,
             image_features1.shape[0],
-            classes,
+            classes1, classes2,
         )
 
         # if not_fars is not None and not_fars.sum() > 1:
         #     breakpoint()
 
-        labels, not_fars_weight_mask = self.not_fars_masking(labels, logits, classes, not_fars, 0.5, 0.7)
+        labels, not_fars_weight_mask = self.not_fars_masking(labels, logits, classes1, classes2, not_fars1, not_fars2, 0.5, 0.7)
 
         logits = logit_scale * logits
         if logit_bias is not None:
             logits += logit_bias
 
-        # loss = -F.logsigmoid(labels * logits).sum() / image_features1.shape[0]
-        if classes is not None:
-            loss  = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
-
-            # 자기자신과의 semantic한 의미 학습 방지하기
-            mask = 1 - torch.eye(loss.size(0), dtype=logits.dtype, device=loss.device)
-            mask = mask * not_fars_weight_mask
-
-            loss = (loss * mask).sum() / mask.sum()
-            # loss = loss[mask].mean()
+        # Return sums and counts so all ring blocks share one global denominator.
+        if classes1 is not None:
+            loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            if self.swap_step == 0:
+                mask = 1 - torch.eye(loss.size(0), dtype=logits.dtype, device=loss.device)
+                mask = mask * not_fars_weight_mask
+            else:
+                mask = not_fars_weight_mask
+            loss_sum = (loss * mask).sum()
+            loss_count = mask.sum().to(dtype=torch.float32)
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='mean')
-
-        return loss
+            loss_sum = F.binary_cross_entropy_with_logits(logits, labels, reduction='sum')
+            loss_count = logits.new_tensor(logits.numel())
+        return loss_sum, loss_count
 
     def forward(
             self, image_features1, image_features2, 
             logit_scale, logit_bias, 
-            classes=None, same_class_weight=1.0, 
-            times=None, time_range=10, time_weight=0.3,
+            classes=None, 
             not_fars=None,
             output_dict=False
         ):
-        loss = self._loss(
-            image_features1, image_features2, 
-            logit_scale, logit_bias, 
-            classes, 
-            not_fars,
-        )
 
-        if self.world_size > 1:
-            if self.dist_impl == 'bidir':
-                right_rank = (self.rank + 1) % self.world_size
-                left_rank = (self.rank - 1 + self.world_size) % self.world_size
-                image_features2_to_right = image_features2_to_left = image_features2
-                num_bidir, remainder = divmod(self.world_size - 1, 2)
-                for i in range(num_bidir):
-                    image_features2_recv = neighbour_exchange_bidir_with_grad(
-                        left_rank,
-                        right_rank,
-                        image_features2_to_left,
-                        image_features2_to_right,
-                    )
-                    for f in image_features2_recv:
-                        loss += self._loss(
-                            image_features1,
-                            f,
-                            logit_scale,
-                            logit_bias,
-                            negative_only=True,
-                        )
-                    image_features2_to_left, image_features2_to_right = image_features2_recv
+        if self.world_size == 1:
+            loss_sum, loss_count = self._loss(
+                image_features1, image_features2,
+                logit_scale, logit_bias,
+                classes, classes,
+                not_fars, not_fars,
+            )
+        else:
+            cur_image_feature2 = image_features2
+            cur_classes2 = classes
+            cur_not_fars2 = not_fars
+            loss_sum = image_features1.new_zeros(())
+            loss_count = image_features1.new_zeros(())
 
-                if remainder:
-                    image_features2_recv = neighbour_exchange_with_grad(
-                        left_rank,
-                        right_rank,
-                        image_features2_to_right
-                    )
-                    loss += self._loss(
-                        image_features1,
-                        image_features2_recv,
-                        logit_scale,
-                        logit_bias,
-                        negative_only=True,
-                    )
-            elif self.dist_impl == "shift":
-                right_rank = (self.rank + 1) % self.world_size
-                left_rank = (self.rank - 1 + self.world_size) % self.world_size
-                image_features2_to_right = image_features2
-                for i in range(self.world_size - 1):
-                    image_features2_from_left = neighbour_exchange_with_grad(
-                        left_rank,
-                        right_rank,
-                        image_features2_to_right,
-                    )
-                    loss += self._loss(
-                        image_features1,
-                        image_features2_from_left,
-                        logit_scale,
-                        logit_bias,
-                        negative_only=True,
-                    )
-                    image_features2_to_right = image_features2_from_left
-            elif self.dist_impl == "reduce":
-                for i in range(self.world_size):
-                    image2_from_other = torch.distributed.nn.all_reduce(
-                        image_features2 * (self.rank == i),
-                        torch.distributed.ReduceOp.SUM,
-                    )
-                    loss += float(i != self.rank) * self._loss(
-                        image_features1,
-                        image2_from_other,
-                        logit_scale,
-                        logit_bias,
-                        negative_only=True,
-                    )
-            elif self.dist_impl == "gather":
-                all_images2 = torch.distributed.nn.all_gather(image_features2)
-                for i in range(self.world_size):
-                    loss += float(i != self.rank) * self._loss(
-                        image_features1,
-                        all_images2[i],
-                        logit_scale,
-                        logit_bias,
-                        negative_only=True,
-                    )
-            else:
-                assert False
+            for swap_step in range(self.world_size):
+                self.swap_step = swap_step
+                block_sum, block_count = self._loss(
+                    image_features1, cur_image_feature2,
+                    logit_scale, logit_bias,
+                    classes, cur_classes2,
+                    not_fars, cur_not_fars2,
+                )
+                loss_sum = loss_sum + block_sum
+                loss_count = loss_count + block_count
+
+                if swap_step + 1 < self.world_size:
+                    cur_image_feature2 = ring_swap_text(cur_image_feature2)
+                    cur_classes2 = ring_swap_text(cur_classes2) if classes is not None else None
+                    cur_not_fars2 = ring_swap_text(cur_not_fars2) if not_fars is not None else None
+
+        loss = ddp_global_mean_from_local_sum(loss_sum, loss_count, self.world_size)
 
         return {"contrastive_loss": loss} if output_dict else loss
     
@@ -343,14 +357,11 @@ class RelationPrototypeContrastiveLoss(nn.Module):
             ema_threshold_on=False,
             rank = 0, 
             world_size = 1, 
-            dist_impl=None,
             device=None, 
         ):
         super().__init__()
         self.rank = rank
         self.world_size = world_size
-        self.dist_impl = dist_impl or 'bidir'  # default to bidir exchange for now, this will likely change
-        assert self.dist_impl in ('bidir', 'shift', 'reduce', 'gather')
 
         self.num_classes = num_classes
         self.all_classes = torch.arange(num_classes, device=device, dtype=torch.float32)
@@ -370,23 +381,26 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         threshold = sim_means * 0.9 if self.ema_threshold_on else -1
         selected = proto_sims >= threshold
 
-        if not selected.any():
-            return
-
         selected_classes = classes[selected]
-        selected_features = features[selected]
+        selected_features = features[selected].to(dtype=prototypes.dtype)
 
         sums = torch.zeros_like(prototypes)
-        counts = torch.zeros(self.num_classes, device=features.device, dtype=features.dtype)
+        counts = torch.zeros(self.num_classes, device=features.device, dtype=torch.float32)
+        if selected_classes.numel() > 0:
+            sums.index_add_(0, selected_classes, selected_features)
+            counts.index_add_(
+                0, selected_classes,
+                torch.ones_like(selected_classes, dtype=torch.float32),
+            )
 
-        sums.index_add_(0, selected_classes, selected_features)
-        counts.index_add_(
-            0,
-            selected_classes,
-            torch.ones_like(selected_classes, dtype=features.dtype),
-        )
+        # Prototype buffers do not get DDP gradient reductions.
+        if self.world_size > 1:
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
 
         mask = counts > 0
+        if not mask.any():
+            return
         new_protos = sums[mask] / counts[mask, None]
 
         # momentum update
@@ -475,10 +489,13 @@ class RelationPrototypeContrastiveLoss(nn.Module):
             hards=None, centers=None, not_fars=None,
             index=None, sample_manager=None, sample_manager_update=True,
         ):
+        # if self.rel_real is not None:
+        #     breakpoint()
+            
         topk_mask = self.get_topk_mask(logits, ema_prototypes, classes)
         labels = self.get_ground_truth(
             image_features.device,
-            image_features.dtype,
+            torch.float32,
             image_features.shape[0],
             classes,
         )
@@ -495,11 +512,13 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
 
         if train and sample_manager_update:
+            if self.rank == 0:
+                breakpoint()
             self.tracking_loss(index, loss, labels, classes, sample_manager, not_fars)
 
-        loss = (loss * mask).sum() / mask.sum() # 마스킹된 부분만 평균내기
-        
-        return loss
+        loss_sum = (loss * mask).sum()
+        loss_count = mask.sum().to(dtype=torch.float32)
+        return loss_sum, loss_count
 
     def forward(
             self, features, prototypes,
@@ -523,14 +542,14 @@ class RelationPrototypeContrastiveLoss(nn.Module):
                 
                 self.update_prototypes(features, prototypes, classes, logits)
 
-        loss = self._loss(
+        loss_sum, loss_count = self._loss(
             features, logits, prototypes, None,
             logit_scale, logit_bias, train,
             classes, same_class_weight,
             hards, centers, not_fars,
             index, sample_manager, sample_manager_update,
         )
-
+        loss = ddp_global_mean_from_local_sum(loss_sum, loss_count, self.world_size)
         return {"contrastive_loss": loss} if output_dict else loss
 
 def mse_loss(pred, label, mask):
@@ -561,7 +580,7 @@ def content_style_sim_loss(content_features, style_features):
 class BCELoss(nn.Module):
     def __init__(self, class_weights=None, pos_weights=None, device='cpu'):
         super().__init__()
-        self.class_weight = class_weights.to(device=device) if pos_weights is not None else None
+        self.class_weight = class_weights.to(device=device) if class_weights is not None else None
         self.pos_weights = pos_weights.to(device=device) if pos_weights is not None else None
 
     def forward(self, features, labels):

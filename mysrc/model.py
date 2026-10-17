@@ -955,9 +955,48 @@ def create_eva(name, pretrained: bool = False, **kwargs):
         model, model_args = eva02_base_patch14_224(pretrained, **kwargs)
 
     elif name == "eva02_base_patch14_448":
-            model, model_args = eva02_base_patch14_448(pretrained, **kwargs)
-    
+        model, model_args = eva02_base_patch14_448(pretrained, **kwargs)
 
+    elif name == "eva02_tiny_patch14_224":
+        model, model_args = eva02_tiny_patch14_224(pretrained, **kwargs)
+
+
+    return model, model_args
+
+def eva02_tiny_patch14_224(pretrained: bool = False, **kwargs) -> CustomEva:
+    model_args = dict(
+        img_size=224,
+        patch_size=14,
+        embed_dim=192,
+        depth=12,
+        num_heads=3,
+        mlp_ratio=4 * 2 / 3,
+        swiglu_mlp=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(16, 16),  # 224/14
+    )
+    pretrained_cfg = kwargs.pop("pretrained_cfg")
+
+    model_args.update(kwargs)
+    model = CustomEva(**model_args)
+    variant = "eva02_tiny_patch14_224"
+
+    pretrained_cfg = resolve_pretrained_cfg(
+        variant,
+        pretrained_cfg=pretrained_cfg,
+        # pretrained_cfg_overlay=pretrained_cfg_overlay
+    )
+    pretrained_cfg = pretrained_cfg.to_dict()
+    
+    load_pretrained(
+        model,
+        pretrained_cfg=pretrained_cfg,
+        num_classes=kwargs['num_classes'],
+        in_chans=kwargs.get('in_chans', 3),
+        filter_fn=checkpoint_filter_fn,
+        strict=False,
+        # cache_dir=cache_dir,
+    )
     return model, model_args
     
 def eva02_base_patch14_224(pretrained: bool = False, **kwargs) -> CustomEva:

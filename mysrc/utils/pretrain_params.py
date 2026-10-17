@@ -49,6 +49,26 @@ def setup_parser():
 
     ## train
     parser.add_argument(
+        "--device", 
+        choices=["cpu", "cuda"], 
+        default="cuda"
+    )
+    parser.add_argument(
+        "--rank", 
+        type=int, 
+        default=0
+    )
+    parser.add_argument(
+        "--local_rank", 
+        type=int, 
+        default=0
+    )
+    parser.add_argument(
+        "--world_size", 
+        type=int, 
+        default=1
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,

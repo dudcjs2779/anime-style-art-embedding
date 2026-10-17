@@ -14,12 +14,16 @@ from copy import deepcopy
 import albumentations as A
 from functools import partial
 from PIL import Image
+import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from open_clip import get_tokenizer
 
 from mysrc.utils.aug_preset import get_preset
+
 
 def pretrain_collate03(batch, mask_ratio_tuple, mask_probability, n_tokens=None, mask_generator=None):
     output = {}
@@ -240,7 +244,7 @@ def make_pretrain_dataset03(args):
 def make_pretrain_dataset04(args):
     dataset = {}
     train_df = pd.read_parquet(args.train)
-    train_df = train_df[train_df['target'].isin([i for i in range(15)])]
+    train_df = train_df[train_df['target'].isin([i for i in range(20)])]
 
     args.num_classes = train_df['target'].nunique()
     args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
@@ -296,7 +300,13 @@ def make_pretrain_dataset04(args):
         train_bboxes, train_bb_masks, train_bg_masks,
         transforms, hards=train_hards, centers=train_centers, not_fars=train_not_fars)
     
-    sampler = HardLossSampler(
+    # sampler = HardLossSampler(
+    #     train_dataset, batch_size=args.batch_size, 
+    #     rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
+    #     hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
+    # )
+
+    sampler = GHardLossSampler(
         train_dataset, batch_size=args.batch_size, 
         rel_real=args.rel_real.detach().cpu().numpy(), rel_pseudo=args.rel_pseudo.detach().cpu().numpy(), 
         hard_num=args.hard_num, same_num=args.same_num, accum=args.accum_freq,
@@ -316,7 +326,8 @@ def make_pretrain_dataset04(args):
         valid_labels = torch.tensor(valid_df.target.tolist(), dtype=torch.float32, device='cpu')
         valid_sty_feats = [torch.tensor(feats, dtype=torch.long, device='cpu') for feats in valid_df.style_feats_encoded.values]
         valid_dataset = PretrainValidBboxStyFeatDataset(valid_df.image.tolist(), valid_labels, transforms, valid_trans, valid_sty_feats, args.feat_len)
-        valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+        sampler = DistributedSampler(valid_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False) if args.distributed else None
+        valid_loader = DataLoader(valid_dataset, collate_fn=collate_fn, sampler=sampler, batch_size=args.valid_batch_size, pin_memory=True, num_workers=args.workers)
         valid_loader.num_samples = len(valid_dataset)
         valid_loader.num_batches = len(valid_loader)
 
@@ -330,7 +341,8 @@ def make_pretrain_dataset04(args):
 
         test_labels = torch.tensor(test_df.target.tolist(), dtype=torch.float32, device='cpu')
         test_dataset = PretrainValidBboxStyFeatDataset(test_df.image.tolist(), test_labels, transforms, valid_trans)
-        test_loader = DataLoader(test_dataset, collate_fn=collate_fn, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+        sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False) if args.distributed else None
+        test_loader = DataLoader(test_dataset, collate_fn=collate_fn, sampler=sampler, batch_size=args.valid_batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
         test_loader.num_samples = len(test_dataset)
         test_loader.num_batches = len(test_loader)
 
@@ -961,7 +973,7 @@ class CustomBatchSampler(Sampler[int]):
 
         return all_batches
 
-class HardLossSampler(Sampler[int]):
+class HardLossSampler(Sampler[list[int]]):
     """
     score가 높은 샘플을 우선적으로 기준 클래스로 설정하며 batch에 반드시 포함됩니다.
     score 샘플링 이후 모델이 잘 맞추지 못하는 클래스 일수록 기준 클래스로 선택됩니다.
@@ -981,7 +993,7 @@ class HardLossSampler(Sampler[int]):
         self.accum = accum
         self.rel_real = rel_real if rel_real is not None else np.eye(n_classes)
         self.rel_pseudo = rel_pseudo if rel_pseudo is not None else np.eye(n_classes)
-        self.gt_mask = rel_real != 0
+        self.gt_mask = self.rel_real != 0
         self.hard_num = hard_num
         self.same_num = same_num
         self.cls_diff_weights = np.ones(n_classes)
@@ -1179,9 +1191,313 @@ class HardLossSampler(Sampler[int]):
         random.shuffle(selected_samples)
         # self.all_batches.append(selected_samples)
         # self.all_classes.append(classes)
+        # self.classes = classes
         # self.remain_class.append(np.array(self.unique_labels)[self.available_mask])
 
         return selected_samples
+
+class GHardLossSampler(Sampler[list[int]]):
+    """
+    score가 높은 샘플을 우선적으로 기준 클래스로 설정하며 batch에 반드시 포함됩니다.
+    score 샘플링 이후 모델이 잘 맞추지 못하는 클래스 일수록 기준 클래스로 선택됩니다.
+    기준 클래스에서 샘플하나, 그리고 hard_num 만큼 잘 못 맞추고 있는 클래스,
+    나머지는 유니폼 샘플링을 합니다.
+
+    모델이 잘 맞추지 못하는 클래스 및 샘플에 집중하도록 의도했습니다.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        rel_real: np.ndarray = None,
+        rel_pseudo: np.ndarray = None,
+        hard_num=(1, 2),
+        same_num=(1, 2),
+        accum=1,
+        num_replicas=None,
+        rank=None,
+    ):
+        self.dataset = dataset
+        self.indices = list(range(len(dataset)))
+        labels = dataset.labels.to(dtype=int).tolist()
+        self.unique_labels = dataset.labels.unique().to(dtype=int).tolist()
+        n_classes = len(self.unique_labels)
+
+        # DDP 정보
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+
+        if rank is None:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+        # batch_size는 GPU당 batch 크기
+        self.local_batch_size = batch_size
+        self.batch_size = batch_size * num_replicas
+        self.accum = accum
+
+        self.rel_real = rel_real if rel_real is not None else np.eye(n_classes)
+        self.rel_pseudo = rel_pseudo if rel_pseudo is not None else np.eye(n_classes)
+        self.gt_mask = self.rel_real != 0
+
+        self.hard_num = hard_num
+        self.same_num = same_num
+
+        self.cls_diff_weights = np.ones(n_classes)
+        self.sample_diff_weights = np.ones((n_classes))
+        self.sample_gauss_weights = np.ones((n_classes))
+
+        self.sample_score = np.zeros(len(self.dataset))
+        self.score_sampling_limit = 0
+
+        data_by_class = defaultdict(list)
+        for idx, label in zip(self.indices, labels):
+            data_by_class[label].append(idx)
+
+        self.data_by_class = dict(data_by_class)
+        self.data_to_class = {idx: label for idx, label in zip(self.indices, labels)}
+
+        # 클래스 라벨이 배열의 인덱스로 사용 가능한지 확인
+        if sorted(self.unique_labels) != list(range(n_classes)):
+            raise ValueError(
+                "현재 가중치 배열은 클래스 라벨이 "
+                "0부터 n_classes-1까지 연속된 정수라고 가정합니다. "
+                "비연속 라벨은 클래스 인덱스로 매핑해야 합니다."
+            )
+
+        if self.local_batch_size <= 0 or self.num_replicas <= 0:
+            raise ValueError("batch_size와 num_replicas는 양수여야 합니다.")
+
+        if self.accum <= 0:
+            raise ValueError("accum은 양수여야 합니다.")
+
+        if self.batch_size < max(self.same_num) + max(self.hard_num):
+            raise ValueError(
+                "Global Batch 크기가 same_num과 hard_num의 "
+                "최대 합보다 작습니다."
+            )
+
+    def __iter__(self):
+        distributed = dist.is_available() and dist.is_initialized() and self.num_replicas > 1
+
+        if self.rank == 0:
+            self.data_by_class_copy = deepcopy(self.data_by_class)
+            self.available_mask = np.ones(len(self.unique_labels), dtype=bool)
+            self.sample_available_mask = np.ones(len(self.indices), dtype=bool)
+
+            if self.sample_score.sum() > 0:
+                self.score_sampling_limit = (len(self) * 0.1 // self.accum)
+            else:
+                self.score_sampling_limit = 0
+
+        for step in range(len(self)):
+            if self.rank == 0:
+                # Global Batch 생성
+                global_batch = self.make_one_batch(step)
+            else:
+                global_batch = None
+
+            if distributed:
+                # rank 0의 Global Batch를 모든 rank에 전달
+                payload = [global_batch]
+                dist.broadcast_object_list(payload, src=0)
+                global_batch = payload[0]
+
+            # 각 rank는 자신의 구간만 사용
+            start = self.rank * self.local_batch_size
+            end = start + self.local_batch_size
+
+            local_batch = global_batch[start:end]
+
+            if len(local_batch) != self.local_batch_size:
+                raise RuntimeError(
+                    f"Rank {self.rank}: local batch 크기가 "
+                    f"{len(local_batch)}입니다."
+                )
+            
+            yield local_batch
+
+    def __len__(self) -> int:
+        return len(self.dataset) // self.batch_size
+        
+    def cls_diff_weight(self, rel_real, rel_pseudo, eps, temp):
+        # axis=1 기준 평균 절대 오차
+        diff_weight = np.abs(rel_real - rel_pseudo).sum(axis=1, where=self.gt_mask) / self.gt_mask.sum(axis=1)
+
+        weights = np.power(diff_weight + eps, temp)
+        weights /= weights.sum()
+
+        return weights
+
+    def sample_diff_weight(self, rel_real, rel_pseudo, mask, eps, temp):
+        diff_weight = np.abs(rel_real - rel_pseudo)
+
+        weights = np.where(
+            mask,
+            np.power(diff_weight + eps, temp),
+            1e-6
+        )
+
+        weights /= weights.sum(axis=1, keepdims=True)
+        return weights
+        
+    def asymmetric_gaussian_weight(self, similarity, center=0.55, left_sigma=0.15, right_sigma=0.1):
+        """
+        center를 중심으로 한 비대칭 정규분포
+        args:
+            similarity: 분포
+            center: 중심, 최빈값
+            left_sigma: 왼쪽 분포의 sigma
+            right_sigma: 오른쪽 분포의 sigma
+        """
+        weights = np.zeros_like(similarity)
+
+        left_mask = similarity < center
+        right_mask = ~left_mask
+
+        weights[left_mask] = np.exp(-((similarity[left_mask] - center) ** 2) / (2 * left_sigma ** 2))
+        weights[right_mask] = np.exp(-((similarity[right_mask] - center) ** 2) / (2 * right_sigma ** 2))
+
+        return weights
+
+    def update_weights(self):
+        self.cls_diff_weights = self.cls_diff_weight(self.rel_real, self.rel_pseudo, 0.1, 1.0)
+        self.sample_diff_weights = self.sample_diff_weight(self.rel_real, self.rel_pseudo, self.gt_mask, 0.1, 1.2)
+        self.sample_gauss_weights = self.asymmetric_gaussian_weight(self.rel_pseudo, center=0.75, left_sigma=0.20, right_sigma=0.15) + 0.1
+
+    def update_score(self, scores, top_p=10):
+        scores = torch.as_tensor(scores, dtype=torch.float32).detach().reshape(-1)
+        if scores.numel() != len(self.dataset):
+            raise ValueError(
+                f"Expected one hard score per sample ({len(self.dataset)}), "
+                f"got {scores.numel()}"
+            )
+
+        # Every rank contributes its sample statistics. SampleManager normally
+        # synchronizes these first, but reducing here keeps sampler state global
+        # even when another caller supplies rank-local score vectors.
+        if dist.is_available() and dist.is_initialized() and self.num_replicas > 1:
+            device = torch.device("cpu")
+            if dist.get_backend() == "nccl":
+                device = torch.device("cuda", torch.cuda.current_device())
+            scores = scores.to(device=device)
+            dist.all_reduce(scores, op=dist.ReduceOp.SUM)
+            scores /= self.num_replicas
+            scores = scores.cpu()
+
+        scores = scores.numpy()
+        k = max(1, int(len(scores) * top_p / 100))
+        indices = np.argpartition(scores, -k)[-k:]
+
+        result = np.zeros_like(scores)
+        result[indices] = scores[indices]
+        self.sample_score = result
+
+    def make_one_batch(self, step):
+        selected_samples = []
+        classes = []
+
+        if step % self.accum == 0:
+            same_k = random.randint(*self.same_num)
+
+            if self.score_sampling_limit > 0:
+                weights = self.sample_score * self.sample_available_mask
+
+                if not np.any(weights):
+                    self.score_sampling_limit = 0
+                    weights = self.sample_available_mask
+
+                score_sample = random.choices(self.indices, weights=weights, k=1)[0]
+                cls = self.data_to_class[score_sample]
+                self.score_sampling_limit -= 1
+
+                self.cls = cls
+
+                samples = self.data_by_class_copy[cls]
+                samples.remove(score_sample)
+                selected_samples.append(score_sample)
+                self.sample_available_mask[score_sample] = False
+                classes.append(cls)
+
+                if not samples:
+                    self.available_mask[cls] = False
+                    same_k = len(selected_samples)
+
+                for _ in range(same_k-1):
+                    samples = self.data_by_class_copy[cls]
+
+                    idx = random.randrange(len(samples))
+                    selected_sample = samples.pop(idx)
+                    selected_samples.append(selected_sample)
+                    self.sample_available_mask[selected_sample] = False
+                    classes.append(cls)
+
+                    if not samples:
+                        self.available_mask[cls] = False
+                        same_k = len(selected_samples)
+                        break
+
+            else:
+                cls = random.choices(self.unique_labels, weights=self.cls_diff_weights * self.available_mask, k=1)[0]
+                self.cls = cls  
+
+                for _ in range(same_k):
+                    samples = self.data_by_class_copy[cls]
+
+                    idx = random.randrange(len(samples))
+                    # selected_samples.append(samples.pop(idx))
+                    selected_sample = samples.pop(idx)
+                    selected_samples.append(selected_sample)
+                    self.sample_available_mask[selected_sample] = False
+                    classes.append(cls)
+
+                    if not samples:
+                        self.available_mask[cls] = False
+                        same_k = len(selected_samples)
+                        break
+        else:
+            same_k = 0
+            cls = self.cls
+
+
+        while len(selected_samples) < self.batch_size:
+            hard_k = random.randint(*self.hard_num)
+            gaus_k = self.batch_size - same_k - hard_k
+
+            selected_cls = (
+                # random.choices(self.unique_labels, weights=self.sample_gauss_weights[cls] * self.available_mask, k=gaus_k)
+                random.choices(self.unique_labels, k=gaus_k)
+                + random.choices(self.unique_labels, weights=self.sample_diff_weights[cls] * self.available_mask, k=hard_k)
+            )
+
+            for sel_cls in selected_cls:
+                samples = self.data_by_class_copy[sel_cls]
+
+                if samples:
+                    idx = random.randrange(len(samples))
+                    # selected_samples.append(samples.pop(idx))
+                    selected_sample = samples.pop(idx)
+                    selected_samples.append(selected_sample)
+                    self.sample_available_mask[selected_sample] = False
+                    classes.append(sel_cls)
+
+                    if not samples:
+                        self.available_mask[sel_cls] = False
+
+                    if len(selected_samples) >= self.batch_size:
+                        break
+
+        random.shuffle(selected_samples)
+        # self.all_batches.append(selected_samples)
+        # self.all_classes.append(classes)
+        self.classes = classes
+        # self.remain_class.append(np.array(self.unique_labels)[self.available_mask])
+
+        return selected_samples
+
     
 class MaskingGenerator:
     def __init__(
