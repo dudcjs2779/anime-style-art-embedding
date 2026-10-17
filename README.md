@@ -1,1 +1,1 @@
-# anime-art-quality-assessment
+# anime-style-art-embedding
