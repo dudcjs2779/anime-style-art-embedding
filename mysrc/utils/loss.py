@@ -5,7 +5,6 @@ import torch.distributed as dist
 from torch.autograd import Function
 from torch.nn import functional as F
 from mysrc.utils import function
-import debugpy
 
 try:
     import torch.distributed.nn
@@ -512,8 +511,6 @@ class RelationPrototypeContrastiveLoss(nn.Module):
         loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
 
         if train and sample_manager_update:
-            if self.rank == 0:
-                breakpoint()
             self.tracking_loss(index, loss, labels, classes, sample_manager, not_fars)
 
         loss_sum = (loss * mask).sum()
