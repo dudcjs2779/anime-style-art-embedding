@@ -1325,7 +1325,9 @@ def main(args):
         assert wandb is not None, 'Please install wandb.'
         logging.debug('Starting wandb.')
 
-        wandb.login(key=os.getenv("WANDB_API"))
+        if os.getenv("WANDB_API"):
+            wandb.login(key=os.getenv("WANDB_API"))
+            
         wandb.init(
             dir="logs",
             project=args.wandb_project_name,
