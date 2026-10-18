@@ -621,7 +621,7 @@ class StyleFeatVisual(nn.Module):
         self.output_dict = output_dict
         model_kargs.update({"num_classes": 0, "global_pool": ""}) # head와 pooling 방식은 직접 정의
         self.visual, visual_args = create_eva(model_name, pretrained=True, **model_kargs)
-
+        
         lshape = [1] if nonscalar_logit_scale else []
         self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
         if init_logit_bias is not None:
@@ -629,13 +629,13 @@ class StyleFeatVisual(nn.Module):
         else:
             self.logit_bias = None
 
-        self.self_style_head = nn.Linear(visual_args['embed_dim'], 512)
+        self.self_style_head = nn.Linear(visual_args['embed_dim'], visual_args['output_embed_dim'])
         self.feat_head = nn.Linear(visual_args['embed_dim'], feat_head['num_classes'])
-        self.style_head = nn.Linear(512 + feat_head['num_classes'], 512)
-        self.content_head = nn.Linear(visual_args['embed_dim'], 512)
+        self.style_head = nn.Linear(visual_args['output_embed_dim'] + feat_head['num_classes'], visual_args['output_embed_dim'])
+        self.content_head = nn.Linear(visual_args['embed_dim'], visual_args['output_embed_dim'])
 
-        self.register_buffer('prototypes', torch.zeros(num_classes, 512))
-        self.register_buffer('self_prototypes', torch.zeros(num_classes, 512))
+        self.register_buffer('prototypes', torch.zeros(num_classes, visual_args['output_embed_dim']))
+        self.register_buffer('self_prototypes', torch.zeros(num_classes, visual_args['output_embed_dim']))
         
 
     def encode_image(self, image, mask=None, normalize: bool = False):
@@ -960,6 +960,9 @@ def create_eva(name, pretrained: bool = False, **kwargs):
     elif name == "eva02_tiny_patch14_224":
         model, model_args = eva02_tiny_patch14_224(pretrained, **kwargs)
 
+    elif name == "eva02_large_patch14_448":
+            model, model_args = eva02_large_patch14_448(pretrained, **kwargs)
+
 
     return model, model_args
 
@@ -979,6 +982,7 @@ def eva02_tiny_patch14_224(pretrained: bool = False, **kwargs) -> CustomEva:
 
     model_args.update(kwargs)
     model = CustomEva(**model_args)
+    model_args['output_embed_dim'] = 128
     variant = "eva02_tiny_patch14_224"
 
     pretrained_cfg = resolve_pretrained_cfg(
@@ -1018,6 +1022,7 @@ def eva02_base_patch14_224(pretrained: bool = False, **kwargs) -> CustomEva:
 
     model_args.update(kwargs)
     model = CustomEva(**model_args)
+    model_args['output_embed_dim'] = 512
     variant = "eva02_base_patch14_224"
 
     pretrained_cfg = resolve_pretrained_cfg(
@@ -1056,6 +1061,7 @@ def eva02_base_patch14_448(pretrained: bool = False, **kwargs) -> CustomEva:
     pretrained_cfg = kwargs.pop("pretrained_cfg")
     model_args.update(kwargs)
     model = CustomEva(**model_args)
+    model_args['output_embed_dim'] = 512
     variant = "eva02_base_patch14_448"
 
     pretrained_cfg = resolve_pretrained_cfg(
@@ -1075,6 +1081,46 @@ def eva02_base_patch14_448(pretrained: bool = False, **kwargs) -> CustomEva:
         # cache_dir=cache_dir,
     )
     return model, model_args
+
+def eva02_large_patch14_448(pretrained: bool = False, **kwargs) -> CustomEva:
+    """EVA02 Base https://arxiv.org/abs/2303.11331"""
+    model_args = dict(
+        img_size=448,
+        patch_size=14,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4 * 2 / 3,
+        qkv_fused=False,
+        swiglu_mlp=True,
+        scale_mlp=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(16, 16),  # 224/14
+    )
+    pretrained_cfg = kwargs.pop("pretrained_cfg")
+    model_args.update(kwargs)
+    model = CustomEva(**model_args)
+    model_args['output_embed_dim'] = 768
+    variant = "eva02_large_patch14_448"
+
+    pretrained_cfg = resolve_pretrained_cfg(
+        variant,
+        pretrained_cfg=pretrained_cfg,
+        # pretrained_cfg_overlay=pretrained_cfg_overlay
+    )
+    pretrained_cfg = pretrained_cfg.to_dict()
+
+    load_pretrained(
+        model,
+        pretrained_cfg=pretrained_cfg,
+        num_classes=kwargs['num_classes'],
+        in_chans=kwargs.get('in_chans', 3),
+        filter_fn=checkpoint_filter_fn,
+        strict=False,
+        # cache_dir=cache_dir,
+    )
+    return model, model_args
+
 
 def eva_decoder(**kwargs):
     model_args = dict(
