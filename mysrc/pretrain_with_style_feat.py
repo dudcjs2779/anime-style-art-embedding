@@ -7,10 +7,13 @@ from datetime import datetime
 import time
 import math
 import torch
+import torch.nn.functional as F
 import numpy as np
 import random
 import copy
 import wandb
+from dotenv import load_dotenv
+load_dotenv()
 
 import torch.utils.tensorboard as tensorboard
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1190,9 +1193,23 @@ def main(args):
     # 대표벡터 불러오기
     if args.prototype_path is not None:
         prototypes = torch.load(args.prototype_path)
+
         if prototypes.shape == model.prototypes.shape:
             model.prototypes = prototypes.to(device=device, dtype=torch.float32)
             logging.info(f"Loaded prototypes from {args.prototype_path} with shape {prototypes.shape}")
+
+        elif prototypes.size(0) == model.prototypes.size(0) and prototypes.size(1) != model.prototypes.size(1):
+            logging.info(f"Prototpyes will scaled to fit model.prototpyes. {prototypes.shape} => {model.prototypes.shape}")
+
+            diff = model.prototypes.size(1) - prototypes.size(1)
+            if diff > 0:
+                prototypes = F.pad(prototypes, (0, diff), mode="constant", value=0.0)
+            else:
+                prototypes = F.interpolate(prototypes.unsqueeze(1), size=model.prototypes.size(1), mode='linear', align_corners=False).squeeze(1)
+
+            model.prototypes = prototypes.to(device=device, dtype=torch.float32)
+            logging.info(f"Loaded prototypes from {args.prototype_path}")
+
         else:
             logging.warning(f"Loaded prototypes shape {prototypes.shape} does not match model prototypes shape {model.prototypes.shape}. Skipping prototype loading.")
 
@@ -1308,6 +1325,7 @@ def main(args):
         assert wandb is not None, 'Please install wandb.'
         logging.debug('Starting wandb.')
 
+        wandb.login(key=os.getenv("WANDB_API"))
         wandb.init(
             dir="logs",
             project=args.wandb_project_name,
