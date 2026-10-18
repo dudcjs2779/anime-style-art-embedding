@@ -4,12 +4,15 @@ import numpy as np
 from PIL import Image
 import pandas as pd
 
-def get_files(directory, ext_type=(".jpg", ".png", ".jpeg")):
+def get_files(directory, ext_type=(".jpg", ".png", ".jpeg"), absolute_path=False):
     images = []
     for root, dirs, files in os.walk(directory):
         for file in files:
             if file.lower().endswith(ext_type):
-                image_path = os.path.abspath(os.path.join(root, file))
+                if absolute_path:
+                    image_path = os.path.abspath(os.path.join(root, file))
+                else:
+                    image_path = os.path.relpath(os.path.join(root, file))
                 images.append(image_path)
 
     print(f"{len(images)} images")
