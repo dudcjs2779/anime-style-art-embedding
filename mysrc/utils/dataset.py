@@ -20,7 +20,6 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from open_clip import get_tokenizer
 
 from mysrc.utils.aug_preset import get_preset
 
