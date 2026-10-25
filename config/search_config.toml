@@ -1,0 +1,20 @@
+[data]
+ref_path = "my_reference" # path/to/reference_arts
+data_path = "my_data" # path/to/data_arts
+output_path = "similares"   # save path
+transform = "simple_center_crop"    # "simple_center_crop", "long_max_pad_valid"
+batch_size = 8
+num_workers = 0
+result_path = ""
+
+[feat]
+threshold = 0.6
+how = "copy"            # "move", "copy", "None"
+save_result = true
+sfg = true
+sfg_threshold = 0.4
+center = "median"   # "mean", "median"
+
+[model]
+precision = "amp"       # "amp" or null
+# input_dtype = fp16    # "fp16" or null
