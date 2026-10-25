@@ -89,7 +89,7 @@ def parse_args():
     parser.add_argument(
         "--center", 
         choices=["mean", "median"], 
-        default='mean', 
+        default='median', 
         help="How calculate center of reference images."
     )
     parser.add_argument(
