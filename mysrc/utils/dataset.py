@@ -1494,7 +1494,7 @@ class GHardLossSampler(Sampler[list[int]]):
 
         return selected_samples
 
-    
+# https://github.com/facebookresearch/dinov2/blob/main/dinov2/data/masking.py
 class MaskingGenerator:
     def __init__(
         self,
