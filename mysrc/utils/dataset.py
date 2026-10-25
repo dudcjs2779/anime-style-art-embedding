@@ -2,7 +2,6 @@ import logging
 import pandas as pd
 import cv2
 import math
-import json
 import torch
 import numpy as np
 import random
@@ -18,8 +17,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
 from mysrc.utils.aug_preset import get_preset
 
@@ -243,7 +240,7 @@ def make_pretrain_dataset03(args):
 def make_pretrain_dataset04(args):
     dataset = {}
     train_df = pd.read_parquet(args.train)
-    train_df = train_df[train_df['target'].isin([i for i in range(20)])]
+    # train_df = train_df[train_df['target'].isin([i for i in range(20)])]
 
     args.num_classes = train_df['target'].nunique()
     args.rel_real = make_relation_label(args.relation, train_df, torch.float32)
@@ -334,7 +331,7 @@ def make_pretrain_dataset04(args):
 
     if args.test:
         test_df = pd.read_parquet(args.test)
-        test_df = test_df[test_df['target'].isin([i for i in range(10)])]
+        # test_df = test_df[test_df['target'].isin([i for i in range(10)])]
 
         args.text_num_classes = test_df['target'].nunique()
 

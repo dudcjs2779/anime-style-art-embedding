@@ -620,7 +620,11 @@ class StyleFeatVisual(nn.Module):
         super().__init__()
         self.output_dict = output_dict
         model_kargs.update({"num_classes": 0, "global_pool": ""}) # head와 pooling 방식은 직접 정의
+        output_embed_dim = model_kargs.pop('output_embed_dim', None)
         self.visual, visual_args = create_eva(model_name, pretrained=True, **model_kargs)
+
+        if output_embed_dim is None:
+            output_embed_dim = visual_args['output_embed_dim']
         
         lshape = [1] if nonscalar_logit_scale else []
         self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
@@ -629,13 +633,13 @@ class StyleFeatVisual(nn.Module):
         else:
             self.logit_bias = None
 
-        self.self_style_head = nn.Linear(visual_args['embed_dim'], visual_args['output_embed_dim'])
+        self.self_style_head = nn.Linear(visual_args['embed_dim'], output_embed_dim)
         self.feat_head = nn.Linear(visual_args['embed_dim'], feat_head['num_classes'])
-        self.style_head = nn.Linear(visual_args['output_embed_dim'] + feat_head['num_classes'], visual_args['output_embed_dim'])
-        self.content_head = nn.Linear(visual_args['embed_dim'], visual_args['output_embed_dim'])
+        self.style_head = nn.Linear(output_embed_dim + feat_head['num_classes'], output_embed_dim)
+        self.content_head = nn.Linear(visual_args['embed_dim'], output_embed_dim)
 
-        self.register_buffer('prototypes', torch.zeros(num_classes, visual_args['output_embed_dim']))
-        self.register_buffer('self_prototypes', torch.zeros(num_classes, visual_args['output_embed_dim']))
+        self.register_buffer('prototypes', torch.zeros(num_classes, output_embed_dim))
+        self.register_buffer('self_prototypes', torch.zeros(num_classes, output_embed_dim))
         
 
     def encode_image(self, image, mask=None, normalize: bool = False):

@@ -161,14 +161,13 @@ def load_pretrain(model, path):
                 logging.info(f"The model of the prototpye shape not matches pretrain prototype shape. {model.prototypes.shape}(model) != {checkpoint['state_dict']['prototypes'].shape}(pretrained). Therefore, the prototype vector is excluded.")
                 del checkpoint['state_dict']['prototypes']
 
-            if checkpoint['state_dict']['content_head.weight'].shape != model.content_head.weight.shape:
-                checkpoint['state_dict']['content_head.weight'] = checkpoint['state_dict']['content_proj.weight']
-                checkpoint['state_dict']['content_head.bias'] = checkpoint['state_dict']['content_proj.bias']
+            if checkpoint['state_dict']['self_style_head.weight'].shape != model.self_style_head.weight.shape:
+                del checkpoint['state_dict']['self_style_head.weight']
+                del checkpoint['state_dict']['self_style_head.bias']
 
-            checkpoint['state_dict']['self_style_head.weight'] = checkpoint['state_dict']['style_head.weight']
-            checkpoint['state_dict']['self_style_head.bias'] = checkpoint['state_dict']['style_head.bias']
-            del checkpoint['state_dict']['style_head.weight']
-            del checkpoint['state_dict']['style_head.bias']
+            if checkpoint['state_dict']['content_head.weight'].shape != model.content_head.weight.shape:
+                del checkpoint['state_dict']['content_head.weight']
+                del checkpoint['state_dict']['content_head.bias']
 
             if model.visual.pos_embed.shape != checkpoint['state_dict']['visual.pos_embed'].shape:
                 model.visual.pos_embed, checkpoint['state_dict']['visual.pos_embed']

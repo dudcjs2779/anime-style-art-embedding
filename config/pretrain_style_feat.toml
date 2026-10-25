@@ -1,35 +1,38 @@
 [model]
-model_name = 'eva02_tiny_patch14_224.mim_in22k' # eva02_tiny_patch14_224.mim_in22k, eva02_small_patch14_336.mim_in22k_ft_in1k, eva02_base_patch14_224.mim_in22k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+# eva02_tiny_patch14_224.mim_in22k, eva02_small_patch14_336.mim_in22k_ft_in1k
+# eva02_base_patch14_224.mim_in22k, eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+# eva02_large_patch14_448.mim_m38m_ft_in22k_in1k
+model_name = 'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k'
 precision = 'amp'  # amp, float16
 # resume = 'pretrain_log/26-10-12_12-22-04_eva02_base_patch14_448.mim_in22k_ft_in22k/checkpoint/epoch_5.pt'
-# pretrain = 'pretrain_log/26-07-26_13-38-41_eva02_base_patch14_224.mim_in22k_1u164phs/checkpoint/epoch_29.pt' # pretrain/my_eva_decoder_512.pt
-# pretrain = 'pretrain/tag_pretrain.pt' # pretrain/my_eva_decoder_512.pt
+pretrain = 'pretrain/tag_pretrain_for_stylefeat.pt' # pretrain/my_eva_decoder_512.pt
 save_frequency = 1
 max_save_count = 10
 
 [model_kargs]
 drop_path_rate = 0.1
+output_embed_dim = 256
 
 [distributed]
 horovod = false
 
 [train]
-device = 'cpu'
+device = 'cuda'
 seed = 42
 epochs = 15
-batch_size = 3
+batch_size = 6
 accum_freq = 1
 grad_clip_norm = 1.0
-topk_rate = 1.0
+topk_rate = 0.3
 
 [validation]
-valid_batch_size = 16
+valid_batch_size = 12
 val_frequency = 1
 
 [optimizer]
 opt_name = 'adamw8bit'  # adamw, adamw8bit, dadaptation, prodigy
 lr = 1e-04
-wd = 1e-04
+wd = 1e-03
 beta1 = 0.9
 beta2 = 0.95
 esp = 1e-8
@@ -58,14 +61,14 @@ relation = 'datasets/pretrain01_640/class_similarity_weight_list.yaml'
 feat_label = 'datasets/pretrain01_640/style_featrue_group2.yaml'
 feat_class_weight_path = 'datasets/pretrain01_640/weight/feat_class_weights02.npy'
 feat_pos_weight_path = 'datasets/pretrain01_640/weight/feat_pos_weights02.npy'
-workers = 4
+workers = 0
 
 [dataset]
-image_size = [224, 224]
+image_size = [448, 448]
 patch_size = 14
 train_aug = "bbox_crop_pretrain"    # pretrain_global_loacl, bbox_crop_pretrain
 valid_aug = "simple_center_crop"
-prototype_path = "pretrain_log/26-09-19_02-33-02_eva02_base_patch14_448.mim_in22k_ft_in22k_ye2tg6ik/26-09-20_22-47-35_prototypes_add04_bbox_crop_cs_cos_loss_all_class_448.pt" # datasets/pretrain01_640/proto_vectors/proto_484_01.pt
+prototype_path = "datasets/pretrain01_640/weight/26-10-13_23-54-01_prototypes_add04_bbox_stlye_feat_final.pt" # datasets/pretrain01_640/proto_vectors/proto_484_01.pt
 
 [sampler]
 # num_postive = [2, 3]
