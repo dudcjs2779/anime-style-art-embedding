@@ -557,16 +557,6 @@ def train_one_epoch(
 
                     del inputs
 
-                    # ## Reconstruction loss
-                    # pred = model_out['im_pred']
-                    # masks = model_out['masks']
-                    # label = model.decoder.patchify(images[mask_samples])
-
-                    # loss = mae_loss(pred, label, masks, norm_pix_loss=args.norm_pix_loss)
-                    # # loss /= args.accum_freq
-                    # # loss = loss * args.mae_weight
-                    # losses['mae_loss'] = loss
-
                     losses["loss"] = (
                         losses['style_loss'] * clip_scheduler[step] 
                         + losses['proto_loss'] * proto_scheduler[step] 
@@ -576,7 +566,6 @@ def train_one_epoch(
                         + losses['self_style_loss'] * clip_scheduler[step] 
                         + losses['self_proto_loss'] * proto_scheduler[step] 
                         # losses['mse_loss'] * 1.0 + 
-                        # (losses['mae_loss'] * 0.5 / args.accum_freq)
                     )
 
                 backward(losses["loss"], scaler)
@@ -598,7 +587,6 @@ def train_one_epoch(
                 + losses['self_style_loss'] * clip_scheduler[step] 
                 + losses['self_proto_loss'] * proto_scheduler[step] 
                 # losses['mse_loss'] * 1.0 + 
-                # (losses['mae_loss'] * 0.5 / args.accum_freq)
             )
 
         if scaler is not None:
@@ -1286,6 +1274,13 @@ def main(args):
         logging.info(f"wandb run_id: {args.run_id}")
 
         checkpoint = pt_load(args.resume, map_location='cpu')
+        breakpoint()
+    if args.resume is not None:
+        logging.info(f"Resume training")
+        logging.info(f"Resume checkpoint: {args.resume}")
+        logging.info(f"wandb run_id: {args.run_id}")
+
+        checkpoint = pt_load(args.resume, map_location='cpu')
         if 'epoch' in checkpoint:
             # resuming a train checkpoint w/ epoch and optimizer state
             start_epoch = checkpoint["epoch"]
@@ -1295,13 +1290,22 @@ def main(args):
                 optimizer.load_state_dict(checkpoint["optimizer"])
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
-        
-        if 'proto_mean' in checkpoint:
-            proto_loss.statics.mean = checkpoint["proto_mean"].to(device=device)
-        
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
+        
+        if 'proto_mean' in checkpoint:
+            proto_loss.statics.mean = checkpoint["proto_mean"].to(device=device)
+
+        if 'sample_manager' in checkpoint:
+            sample_manager.loss = checkpoint['sample_manager']['loss']
+            sample_manager.count = checkpoint['sample_manager']['count']
+            sample_manager.seen = checkpoint['sample_manager']['seen']
+            sample_manager.total_count = checkpoint['sample_manager']['total_count']
+        
+
+        logging.info(f"Resume checkpoint is loaded successfully")
+        logging.info(f"Training begins at epoch {start_epoch}.")
 
         logging.info(f"Resume checkpoint is loaded successfully")
         logging.info(f"Training begins at epoch {start_epoch}.")
@@ -1394,6 +1398,7 @@ def main(args):
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "proto_mean": proto_loss.statics.mean,
+            "sample_manager": {"loss": sample_manager.loss, "count": sample_manager.count, "seen": sample_manager.seen, "total_count": sample_manager.total_count},
             'torch_rng_state': torch.random.get_rng_state(),
             'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
             'numpy_rng_state': np.random.get_state(),
