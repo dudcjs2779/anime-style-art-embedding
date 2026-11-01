@@ -633,9 +633,8 @@ class StyleFeatVisual(nn.Module):
         else:
             self.logit_bias = None
 
-        self.self_style_head = nn.Linear(visual_args['embed_dim'], output_embed_dim)
         self.feat_head = nn.Linear(visual_args['embed_dim'], feat_head['num_classes'])
-        self.style_head = nn.Linear(output_embed_dim + feat_head['num_classes'], output_embed_dim)
+        self.style_head = nn.Linear(visual_args['embed_dim'] + feat_head['num_classes'], output_embed_dim)
         self.content_head = nn.Linear(visual_args['embed_dim'], output_embed_dim)
 
         self.register_buffer('prototypes', torch.zeros(num_classes, output_embed_dim))
@@ -649,24 +648,18 @@ class StyleFeatVisual(nn.Module):
     def inference(
             self,
             images: Optional[torch.Tensor] = None,
-            mask=None,
     ):
         im_feats = self.encode_image(images, normalize=False) if images is not None else None
 
-        self_style_feat = F.normalize(self.self_style_head(im_feats), dim=-1)
         sfg_feat = self.feat_head(im_feats)
 
-        style_feat = torch.cat((self_style_feat, sfg_feat), dim=-1)
+        style_feat = torch.cat((im_feats, sfg_feat), dim=-1)
         style_feat = F.normalize(self.style_head(style_feat), dim=-1)
-
-        # if mask is not None:
-        #     pred = self.decoder(im_feats)
 
         if self.output_dict:
             out_dict = {
                 "style_cls": style_feat[:, 0],
                 "sfg_cls": sfg_feat[:, 0],
-                "self_style_cls": self_style_feat[:, 0],
                 "logit_scale": self.logit_scale.exp(),
             }
             if self.logit_bias is not None:
@@ -694,19 +687,16 @@ class StyleFeatVisual(nn.Module):
     ):
         im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
 
-        self_style_feat = F.normalize(self.self_style_head(im_feats), dim=-1)
         sfg_feat = self.feat_head(im_feats)
 
-        style_feat = torch.cat((self_style_feat, sfg_feat), dim=-1)
+        style_feat = torch.cat((im_feats, sfg_feat), dim=-1)
         style_feat = F.normalize(self.style_head(style_feat), dim=-1)
-
 
         eval_im_feats = self.encode_image(image_eval, normalize=False) if image_eval is not None else None
 
-        eval_self_style_feat = F.normalize(self.self_style_head(eval_im_feats), dim=-1)
         eval_sfg_feat = self.feat_head(eval_im_feats)
 
-        eval_style_feat = torch.cat((eval_self_style_feat, eval_sfg_feat), dim=-1)
+        eval_style_feat = torch.cat((eval_im_feats, eval_sfg_feat), dim=-1)
         eval_style_feat = F.normalize(self.style_head(eval_style_feat), dim=-1)
 
         content_feat = F.normalize(self.content_head(im_feats), dim=-1)
@@ -714,14 +704,9 @@ class StyleFeatVisual(nn.Module):
         if self.output_dict:
             out_dict = {
                 "style_cls": style_feat[:, 0],
-                "self_style_cls": self_style_feat[:, 0],
                 "content_cls": content_feat[:, 0],
                 "eval_style_cls": eval_style_feat[:, 0],
-                "eval_self_style_cls": eval_self_style_feat[:, 0],
                 "eval_sfg_cls": eval_sfg_feat[:, 0],
-                # "im_feats_cls": im_feats[:, 0],
-                # "im_feats_patches": im_feats[:, self.visual.num_prefix_tokens:],
-                # "im_eval_feats_cls": im_eval_feats[:, 0],
                 "logit_scale": self.logit_scale.exp(),
             }
 
@@ -753,10 +738,9 @@ class StyleFeatVisual(nn.Module):
 
         im_feats = self.encode_image(images, masks, normalize=False) if images is not None else None
         
-        self_style_feat = F.normalize(self.self_style_head(im_feats), dim=-1)
         sfg_feat = self.feat_head(im_feats)
 
-        style_feat = torch.cat((self_style_feat, sfg_feat), dim=-1)
+        style_feat = torch.cat((im_feats, sfg_feat), dim=-1)
         style_feat = F.normalize(self.style_head(style_feat), dim=-1)
 
         content_feat = F.normalize(self.content_head(im_feats), dim=-1)
@@ -765,10 +749,7 @@ class StyleFeatVisual(nn.Module):
             out_dict = {
                 "style_cls": style_feat[:, 0],
                 "sfg_cls": sfg_feat[:, 0],
-                "self_style_cls": self_style_feat[:, 0],
                 "content_cls": content_feat[:, 0],
-                # "im_feats_cls": im_feats[:, 0],
-                # "im_feats_patches": im_feats[:, self.visual.num_prefix_tokens:],
                 "logit_scale": self.logit_scale.exp(),
             }
 
