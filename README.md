@@ -2,7 +2,9 @@
 
 A style embedding model for anime-style artwork.
 
-This project provides a model that extracts style-related embeddings from anime-style artwork and helps identify visually similar images in a dataset.
+This project provides a model that extracts style-related embeddings from anime-style artwork and helps identify visually similar images in a dataset.  
+
+Model: https://huggingface.co/dudcjs2779/anime-style-art-embedding
 
 > **Note:** This model offers modest performance and is intended as a lightweight tool for filtering similar images, rather than a highly accurate style recognition system.
 
